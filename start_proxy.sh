@@ -10,14 +10,25 @@
 # PPID should be 1.
 #
 # Usage:
-#   ./start_proxy.sh                 # clean observer, port 7800 -> logs_live
-#   PORT=7801 LOG_DIR=logs_inject INJECT='...text...' ./start_proxy.sh
+#   ./start_proxy.sh                 # THE proxy: port 7800 -> logs_main, all levers on
+#   PORT=7802 LOG_DIR=logs_scratch STRIP_COMPACT_CACHE=0 ./start_proxy.sh   # experiment arm
+#
+# Bare invocation = the one canonical proxy. Every feature is an env var
+# (see the flag table in CLAUDE.md); any var you set overrides the default
+# below, including set-to-empty/0. Code defaults already cover RELOCATE_*,
+# SORT_TOOLS, CANARY, STRIP_SYSTEM_SECTIONS, WARMTH_LEDGER, WARMTH_PINGER.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 PORT="${PORT:-7800}"
-LOG_DIR="${LOG_DIR:-logs_live}"
+LOG_DIR="${LOG_DIR:-logs_main}"
 OUT="${OUT:-proxy_${PORT}.out}"
+
+# Canonical defaults for flags that are off in code ("-" not ":-" so an
+# explicit empty/0 from the caller is respected):
+export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
+export WARMTH_BLOCK_COLD_PING="${WARMTH_BLOCK_COLD_PING-1}"
+export WARMTH_LOG_FILE="${WARMTH_LOG_FILE-1}"
 
 # Refuse to double-bind the port.
 if lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then

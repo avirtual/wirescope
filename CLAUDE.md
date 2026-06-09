@@ -18,6 +18,9 @@ on the live ports:
   relaunched via `./start_proxy.sh` — new SQLite/two-state code is live;
   `warmth.sqlite` created; `/_warm`/`/_ping` smoke-checked on :7813 (clean
   not-found on a bogus session). `_LAST_REQUEST` started empty as expected.
+  **Superseded the same evening by the ONE-PROXY consolidation** (user: "one
+  proxy to rule them all") — zoo decommissioned, `:7800 → logs_main` is the only
+  proxy now; see Operational state.
   **DISCREPANCY FOUND during restart (`ps -E` on the old pids):** the OLD :7813
   process had NO `RELOCATE_*/SORT_TOOLS/CANARY/STRIP_SYSTEM_SECTIONS` overrides
   in its environment — i.e. it ran with those transforms at their DEFAULTS (ON),
@@ -267,21 +270,30 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   survives /clear + CLI exit). A Claude Code `run_in_background` Bash job is a
   CHILD of the CLI and gets reaped on exit — never launch the proxy that way.
   Kill a port: `kill $(lsof -nP -tiTCP:<port> -sTCP:LISTEN)`.
-- **Live proxies (PPID 1):** ALL restarted 2026-06-09 late evening onto the
-  SQLite/two-state build (incl. non-JSON fail-open fix). Restart caveat for the
-  future: restarting wipes in-memory `_LAST_REQUEST` (pings 404 until each
-  session's next real turn); the SQLite ledger itself survives restarts now, so
-  the "strips once after restart" overpay only applies if `warmth.sqlite` is
-  deleted. Don't restart mid-experiment.
-  - **`:7813` → `logs_compact_warmth`** — the ACTIVE thread. `STRIP_COMPACT_CACHE=1
-    WARMTH_LEDGER=1 WARMTH_PINGER=1 WARMTH_BLOCK_COLD_PING=1 WARMTH_SWEEP_INTERVAL=300
-    WARMTH_LOG_FILE=1`, vanilla transforms OFF (RELOCATE_*/SORT_TOOLS/STRIP_SYSTEM_SECTIONS/CANARY=0),
-    NO STRIP_COMPACT_FORCE. (start_proxy.sh forwards exported env to the nohup'd uvicorn.)
-  - `:7810 → logs_opus` — all new transforms default-on.
-  - `:7811 → logs_compact_strip`, `:7812 → logs_forkcache` — prior compact/fork threads.
-  - `:7800` clean observer → logs_live; `:7801` marker-inject → logs_inject;
-    `:7802` experiment-managed (scenarios kill/relaunch); `:7803` SC test port.
+- **ONE PROXY (consolidated 2026-06-09, late evening — user decision):** the
+  organic 8-port zoo (7800–7803, 7810–7813) is DECOMMISSIONED. Bare
+  `./start_proxy.sh` = THE proxy: **`:7800` → `logs_main`**, all levers on —
+  code defaults (RELOCATE_*, SORT_TOOLS, CANARY, STRIP_SYSTEM_SECTIONS,
+  WARMTH_LEDGER, WARMTH_PINGER) + script defaults (`STRIP_COMPACT_CACHE=1
+  WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1`). Features are env vars; an
+  experiment arm is just an override on a scratch port:
+  `PORT=7802 LOG_DIR=logs_scratch <flags> ./start_proxy.sh`. The script uses
+  `${VAR-default}` so an explicit `=0`/empty from the caller sticks.
+  - This config has all transforms ON. For a transform-free warmth arm
+    (the retired `:7813` config): `STRIP_COMPACT_CACHE=1` + warmth stack, but
+    `RELOCATE_ENV_TO_TAIL=0 RELOCATE_CLAUDEMD_PATHSTAMP=0 SORT_TOOLS=0 CANARY=0
+    STRIP_SYSTEM_SECTIONS=`.
+  - Retired port→corpus map (for provenance; dirs kept): 7800→logs_live (clean
+    observer), 7801→logs_inject (INJECT_MARKER=Math:), 7802→logs_chatty,
+    7803→logs_inject (SC: SYSPATCH+DONE), 7810→logs_opus (defaults),
+    7811→logs_compact_strip, 7812→logs_forkcache, 7813→logs_compact_warmth.
+  - Restart caveat: restarting wipes in-memory `_LAST_REQUEST` (pings 404 until
+    each session's next real turn); the SQLite ledger survives restarts. Don't
+    restart mid-experiment.
   - (`:7799` and `8080` are the human's — leave alone.)
+- **Git: repo initialized 2026-06-09** (first commit = post-rework code).
+  `.gitignore` excludes `logs*/`, `*.out`, `warmth.sqlite*`, `_canary/`. Commit
+  after meaningful changes — the lab finally has undo.
 - **Key captures:** `logs_live/` (38× carriage data + subagent spawns) ·
   `logs_chatty/` (tool-trim, fat 4bcf519f / lean a0f0c609) · `logs_compact_warmth/`
   (warm fork cdcd1b7e / cold f5c27104) · split/reloc A/B pairs (`logs_split5m_on|off`,
