@@ -425,6 +425,27 @@ WIRE (captures: `logs_compact_warmth/7bc2d1d6-*/`):
   claiming to be X. Self-reports are context text, not weight introspection; trust
   the wire (`resolved_model`), not the label.
 
+### fable's control-plane keys (2026-06-10, capture key-diff; user-prompted)
+
+Fable requests carry body keys with SERVER-side semantics we can't see
+structurally — "reacts to unknown keys" (user). Key diff across captures:
+- `thinking: {"type": "adaptive"}` — FABLE-ONLY (haiku: enabled+31999 budget,
+  opus: disabled). Unknown trigger semantics; likely implicated in SC defer
+  behavior; coupled to `context_management` (clear_thinking edits 400 without
+  thinking — the pinger bug). **Rule: mutate `thinking`/`context_management`
+  together or not at all.**
+- `output_config: {"effort":"high"}` — fable+opus (haiku none); materializes
+  `CLAUDE_EFFORT` via beta `effort-2025-11-24`. If effort modulates output
+  depth it scales the 5×-priced side silently. **Rule: pin CLAUDE_EFFORT in
+  every A/B arm; re-derive fable output economics with effort in mind.**
+- `context_management: clear_thinking_20251015, keep:"all"` — all models,
+  currently a no-op that CONSTRAINS request shape (see coupling above).
+- **CANARY GAP #2:** none of these keys are fingerprinted (betas/tools/system
+  only) — a default flip of `effort`/`thinking.type` would never fire. Cheap
+  fix alongside the heading-list idea: fingerprint control-plane keys
+  (`thinking.type`, `output_config` sans schemas, `context_management` edit
+  types).
+
 ### fable-probe (2026-06-09, first experiment on THE consolidated proxy)
 
 Scenario `fable-probe` in proxy-experiments (`--session <uuid>` re-verdicts free).
