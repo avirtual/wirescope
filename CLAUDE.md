@@ -420,13 +420,14 @@ Capture: `logs_main/b3618fc5-*`. Procedure: seed `logs_main/_canary` from the ol
 `logs_compact_warmth/_canary` baselines (canary state is per-LOG_DIR and
 lazy-loads on first messages request — seed BEFORE first traffic), then one
 headless 4-tool fable-5 Write task through `:7800`. Verdicts:
-- **No new prompt for fable.** Headless main agent = same 3-block structure as
-  the seeded interactive baseline and as haiku: billing-header / "You are a
-  Claude agent, built on Anthropic's Claude Agent SDK." (62 ch) / interactive-
-  agent block (~6.7k ch), same 3-marker layout, 1h ttl on the headless main
-  agent too. Only deltas (offline fp diff): headless beta set DROPS
-  `context-1m-2025-08-07`, and the billing-header build stamp differs
-  (interactive `cc_version=2.1.170.3` vs headless `2.1.170.ba7`).
+- **Structure unchanged, TEXT IS NOT — see "Prompt families" below.** The
+  canary verdict ("same 3-block structure, same 3-marker layout, 1h ttl on the
+  headless main agent") is STRUCTURE-ONLY: hdr-prefix + coarse size buckets,
+  and it never compares ACROSS models (namespace = model|beta). The USER then
+  eyeballed the capture and found a real model-gated text difference the
+  fingerprint is blind to. Beta deltas vs interactive baseline (offline fp
+  diff): headless DROPS `context-1m-2025-08-07`; build stamp differs
+  (`cc_version=2.1.170.3` vs `2.1.170.ba7`).
 - **Detector works end-to-end:** new (model|beta) namespaces fired `baseline`
   exactly once, the follow-up request fired `match`; the offline
   `_fp_diff_offline` (in experiments.py) pinpointed the deltas above.
@@ -441,3 +442,29 @@ headless 4-tool fable-5 Write task through `:7800`. Verdicts:
 - **Open item (e) root cause confirmed:** headless sys[1] says "Claude Agent
   SDK", not "Claude Code" — that's the exact header `_classify_role` should also
   accept to stop logging headless parents as `ext/unknown`.
+
+### Prompt families are MODEL-GATED (2026-06-09, user-spotted, verified on wire)
+
+User noticed `# Communicating with the user` in the fable capture — absent from
+opus-4.8. Verified by running opus-4.8 through `:7800` the SAME day, same CLI,
+plus heading-diffs of old main-agent captures:
+- **classic family** (~13–14k ch): `# System / # Doing tasks / # Executing
+  actions with care / # Using your tools / # Tone and style / # Text output /
+  # Session-specific guidance / # Environment / # Context management` —
+  sonnet-4-6 (Jun 3) AND haiku-4-5 interactive on Jun 9 (same CLI era as fable).
+- **harness family** (~2.3–3.1k ch): `# Harness / # Context management`
+  (+ guidance) — opus-4.8, both Jun 6 captures and TODAY's live probe
+  (`logs_main/aeea8dcd-*`). No `# Communicating with the user`.
+- **harness + `# Communicating with the user`** (~6.3k ch post-strip): fable-5
+  ONLY — a big new output-style/communication section (lead-with-outcome,
+  readable-over-concise…). Same day, same CLI, haiku still classic ⇒ the family
+  is keyed on MODEL, not CLI version. Relevant to SC prompt-strength priors
+  (output-composition directives!) — re-validate SC on fable with this in mind.
+- **SAMPLING TRAP (burned us in this very analysis):** the first request of a
+  `claude -p` session is the 1,213-ch TITLE-GENERATOR side-call (0 tools, flat
+  prompt). Naively sampling "first request per session dir" reads the title
+  prompt, not the main-agent prompt — filter `tools > 0` first.
+- **Canary gap exposed:** size buckets + 48-ch hdr prefix missed a multi-kchar
+  section swap (and cross-model diffs are out of scope by design). CHEAP FIX
+  CANDIDATE: add the `^# heading` list of each sys block to the fingerprint —
+  section-level rewrites within a namespace would then fire drift.
