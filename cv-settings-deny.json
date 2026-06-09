@@ -1,0 +1,5 @@
+{
+  "permissions": {
+    "deny": ["Workflow","SendMessage","TeamCreate","TeamDelete","CronCreate","CronDelete","CronList","ScheduleWakeup","EnterPlanMode","ExitPlanMode","EnterWorktree","ExitWorktree","NotebookEdit","AskUserQuestion","TaskCreate","TaskGet","TaskList","TaskOutput","TaskStop","TaskUpdate"]
+  }
+}

@@ -1,0 +1,1329 @@
+# proxy-lab — working memory / handoff
+
+> This is a HANDOFF note to a fresh context. We were deep in an investigation;
+> read this first, then continue. Author: previous session, for "post-/clear me".
+
+> **★★★ PREFIX-WARMTH LEDGER + WARMTH-GATED COMPACT-STRIP — BUILT, WIRED, MEASURED
+> ON THE WIRE (2026-06-08). This is the real bust-detector the STRIP_COMPACT_CACHE
+> gate was missing; the `_compact_condition_met` STUB is now retired.** Context: a
+> forked keep-warm ping refreshes the ORIGINAL session's content-addressed prefix
+> cache, but that never lands in the original's JSONL — so warmth lives on the
+> PREFIX LINEAGE, not the session_id. We proved a fork ping resets the sliding TTL
+> (prior `fork_cache_ttl.py`, logs_forkcache: fork at +4min read=26533 WARM, S1
+> resumed at +6min STILL WARM past its 5m window while the un-pinged control S2 came
+> back COLD — RESCUE CONFIRMED). The proxy can't know warmth from a request alone, so
+> it now LEARNS it from responses and stores it.
+>  · **WHAT'S IN logproxy.py (all new, gated, default-on for measurement):**
+>    - In-memory `_WARMTH: hash → (last_ts, ttl)` ledger (chosen over 10k files:
+>      no syscall churn, bounded by lineages-within-TTL, soft-state = lost-on-
+>      restart reads cold = safe). `_SESSION_HEAD: session_id → latest head hash`
+>      (convenience index for by-session queries). Env: `WARMTH_LEDGER`(1),
+>      `WARMTH_LOG_FILE`(1 → per-turn `<stem>.warmth.json`), `WARMTH_PING_SENTINEL`
+>      (unset; if a tail user-msg contains it → keep-warm ping, hash EXCLUDES its
+>      throwaway tail), `WARMTH_LEDGER_MAX`(50000, sweep trigger).
+>    - WRITE side: `_record_warmth(obj,usage)` runs on the WRITER THREAD (off the
+>      hot path) after each messages response — hashes the just-cached prefix +
+>      stamps now/ttl. `_prefix_hash`/`_prefix_hashes` = blake2b chain over
+>      `_sys_tools_fingerprint` + messages, each `_strip_cache_control`'d. `_marker_ttl`
+>      reads the message-tail cc (3600 if ttl:'1h' else 300). Wired via a new
+>      `"ledger"` writer-kind + `_enqueue_ledger`. Hashes the POST-TRANSFORM `obj`
+>      (= exactly what the backend content-addresses). Prints `[warmth] <h12> ttl=…`.
+>    - READ side: `warmth_state(h) → warm|cold|unknown` (three-state; cold = SEEN &
+>      ttl lapsed = provably busted, vs unknown = never recorded). `warmth_warm`
+>      delegates. HTTP `GET /_warm?h=<hash>` or `?session=<id>` (intercepted at top
+>      of handler, never forwarded) → `{found,warm,age_s,ttl_s,remaining_s}`.
+>  · **★ THE PAYOFF — STRIP_COMPACT_CACHE now self-gates on PROVABLE bust.**
+>    `_compact_condition_met` → strip IFF the history prefix is `cold`; `warm`
+>    (marker is a cheap read, keep it) and `unknown` (can't confirm) both DECLINE
+>    (asymmetry: warm-strip loses ~10× what busted-strip saves). `STRIP_COMPACT_FORCE`
+>    still overrides for experiments. `_compact_history_warmth` returns
+>    `(state,hash,depth)`. Safe to leave STRIP_COMPACT_CACHE=1 on in production now.
+>  · **★★ TWO NON-OBVIOUS FIXES the experiment forced (both shipped, don't regress):**
+>    (1) **DEPTH-SCAN, not "drop one msg".** The reused cache breakpoint sits SEVERAL
+>    messages back from the tail (the trailing compaction prompt PLUS the assistant
+>    reply that grew history since the last request are not yet a recorded
+>    breakpoint). `_compact_history_warmth` scans cumulative prefixes from just-
+>    before-the-compact-prompt DOWNWARD and takes the deepest the ledger knows
+>    (matched at depth 3 in the run). (2) **EXCLUDE THE ATTRIBUTION BLOCK from the
+>    fingerprint.** `sys[0]` = `x-anthropic-billing-header: …cch=N…` carries a
+>    per-turn counter (cch=1→3) that changes EVERY turn but is out-of-band and does
+>    NOT cache → including it via `_sys_text` guaranteed a ledger MISS. New
+>    `_stable_sys_text` drops any block starting `x-anthropic-billing-header`. (This
+>    is the same turn-variant attribution block noted elsewhere — don't fold it into
+>    any cache-identity hash.)
+>  · **★ EXPERIMENT `proxy-experiments/compact_warmth_ab.py` — VERDICT CONFIRMED ON
+>    WIRE (haiku, 5m TTL, vanilla transforms off, real gate no-force).** Build a
+>    session over the **stream-json channel** (build turns + /compact must share the
+>    same system prefix — a text-mode-build vs stream-json-compact diverges in system
+>    and misses the ledger; that's a headless artifact, a real in-session /compact
+>    shares). Two arms:
+>      - **WARM** (compact immediately): `warmth_state=warm` → DECLINED strip
+>        (removed 0) → **cache_read=7086** (history reused), input=1361.
+>      - **COLD** (idle 360s > 5m): `warmth_state=cold` → STRIPPED (removed 1) →
+>        **input=23748** (history shipped 1×), **cache_read=0**, no wasted history
+>        re-cache. condition_met False→True, dominant bucket moved cache_read→input.
+>    Captures logs_compact_warmth/ (warm fork cdcd1b7e, cold fork f5c27104). Re-verdict
+>    free: `compact_warmth_ab.py --analyze-only --warm <id> --cold <id>`.
+>  · **DESIGN CONCLUSIONS from the long thread (no code, but decided):** key the
+>    ledger by PREFIX-HASH not session_id (fork-proof); a fork is invisible AS a fork
+>    — the proxy only recognizes "this request's leading bytes == a segment I already
+>    catalogued from a prior marker-write + confirmed warm via response usage"; it
+>    CANNOT discover a boundary from one request (needs the prior observation; unknown
+>    ⇒ cold/conservative). For a FILE store the write op is `rename_old_or_create_new`
+>    + touch (one file per lineage walks forward; ttl-in-name → lazy GC), but we chose
+>    the in-MEMORY map (+ /_warm endpoint on the existing server) since the proxy is
+>    already HTTP and external statusline/hook can query it. Recompute the hash each
+>    turn (blake2b sub-ms off-thread); add per-message-digest caching only if a timing
+>    log proves it. PING ECONOMICS: at **1h** TTL one ping ≈ one warm read (0.10·H)
+>    buys a full hour, avoiding a 2× cold rewrite = **~19:1 per ping** (break-even
+>    ~5% chance of return); at 5m you'd need ~12 pings for the same hour → bad bet.
+>    So keep-warm is a 1h-main-agent move; CAP the ping count (forgotten-session
+>    bleed is the only downside). Deliverable idea (unbuilt): a no-proxy `hold-warm`
+>    pinger (fork-ping at ~55min, hard cap, writes a heartbeat the statusline reads).
+>  · **OPERATIONAL:** proxy `:7813` UP (PPID 1) → `LOG_DIR=logs_compact_warmth`,
+>    config `STRIP_COMPACT_CACHE=1 WARMTH_LEDGER=1` + vanilla transforms OFF
+>    (RELOCATE_*/SORT_TOOLS/STRIP_SYSTEM_SECTIONS/CANARY=0), NO STRIP_COMPACT_FORCE.
+>    Kill: `kill $(lsof -nP -tiTCP:7813 -sTCP:LISTEN)`. New harness
+>    `proxy-experiments/compact_warmth_ab.py`; prior `fork_cache_ttl.py` +
+>    logs_forkcache stand.
+>  · **★ NEXT / OPEN:** (a) the CLAUDE.md handoff itself is now huge — PRUNE/compact
+>    it (many superseded blocks below). (b) wire `WARMTH_PING_SENTINEL` end-to-end
+>    with a real pinger; (c) statusline snippet rendering `/_warm` (🔥 warm·58m vs ❄️);
+>    (d) consider the SQLite swap behind the touch/warm/sweep interface only if
+>    durability/multi-proc is needed.
+
+> **████ HANDOFF / OPERATIONAL STATE for the COMPACT thread (2026-06-07, written
+> right before a /clear; "we'll run a couple of tests" next). READ THIS FIRST, then
+> the detailed COMPACT blocks below.**
+>  · **WHERE WE LANDED (the conclusion, don't re-derive):** on a BUSTED 1h cache,
+>    `/compact` is cheaper than continuing from ~op 1 ON THE CONVERSATION LAYER
+>    (the only layer that matters — tools/system are identical in both arms and MUST
+>    be subtracted). Rule: compact wins turn-1 iff summary `S < 0.20·H` at 1h
+>    (`<0.05·H` at 5m), H=history. Typical compaction (5-15%) ⇒ wins ~immediately.
+>    The earlier "op 6 / op 9" numbers were TOOLS/SYSTEM CONTAMINATION + arm-order
+>    skew + a harness bug, all biased toward resume. See the ★★★ BIGGEST CORRECTION
+>    block below for the math.
+>  · **CODE SHIPPED (keep):** `logproxy.py` has `STRIP_COMPACT_CACHE` (off by
+>    default) — `_is_compact_request` (signature match on `_COMPACT_ANCHORS`),
+>    `_compact_condition_met` (STUB returns True = assume busted; `STRIP_COMPACT_FORCE`
+>    overrides), `_strip_compact_cache` (drops MESSAGE-level cache_control, keeps
+>    system markers), wired in the handler transform block (logs `strip_compact_cache`).
+>    Harness: `proxy-experiments/compact_economics.py` (`--strip`, `--log-dir-suffix`,
+>    `--quick`, `--analyze-only --base/-arm-a/-arm-b`).
+>  · **★ HARNESS BUGS TO FIX BEFORE THE NEXT CLEAN RUN (known, not yet done):**
+>    (1) `compact_turn` passes NO `--tools` → the /compact call ships a LARGER tool
+>    set than the ops (bloated system write, breaks prefix sharing). FIX: pass the
+>    same `--tools "Read Edit Bash Glob Grep"` to the compact call. (2) ARM-ORDER
+>    skew: Arm A runs first and warms the shared tools/system prefix that Arm B then
+>    reads free → skews toward resume. FIX: subtract the tools/system prefix P in
+>    analysis (isolate the conversation layer), or isolate prefixes per arm.
+>    (3) Optionally drive /compact in the SAME mode as ops so prefixes share.
+>  · **OPEN NEXT STEP:** wire `_compact_condition_met` to a real bust signal — chosen
+>    approach = in-memory idle-gap gate `{prefix-lineage→(last_ts,ttl)}`, strip iff
+>    `now−last_ts>ttl`, conservative default when lineage unseen; optional hook-verdict
+>    override; response-usage self-audit log. NOT yet built.
+>  · **RUNNING PROXIES:** `:7811` is UP with `STRIP_COMPACT_CACHE=1 LOG_DIR=logs_compact_strip`
+>    (PPID-1, survives /clear). `:7810` logs_opus (default-on transforms), `:7800/01/02/03`
+>    older. Kill 7811 via `kill $(lsof -nP -tiTCP:7811 -sTCP:LISTEN)`.
+>  · **CAPTURES:** `logs_compact/` (no-strip A/B: base 10c7965e, armA 2a4c45d6, armB
+>    49670227) · `logs_compact_strip/` (strip A/B: base b7955f11, armA 6a8a929e, armB
+>    594e4f59). Re-verdict free with `compact_economics.py --analyze-only`.
+>  · **MEASURED FACTS (sonnet, the deterministic stub repo): base built to ~69k tok;
+>    /compact pre_tokens 69370 → post 2523 (S≈2.5k, H≈62k); strip moved compact's
+>    history 87,135 cw→63,080 input, call $0.369→$0.320 (−13%); /compact channel =
+>    `--input-format stream-json` line `{"type":"user","message":{"role":"user","content":"/compact"}}`;
+>    `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100` disables auto-compact; FORCE_PROMPT_CACHING_5M=1
+>    used so the cache busts in ~6min (5m TTL).**
+
+> **★★★ COMPACT-ON-BUSTED-CACHE ECONOMICS — BUILT + MEASURED ON THE WIRE
+> (2026-06-07). Answers item-7's open cold-wakeup question with real numbers.
+> Backstory: a PreUserPrompt hook (human built it in another session) detects an
+> evicted prompt-cache and suggests `/compact` before the user re-writes the cold
+> context. But /compact ITSELF costs an API call + discards the cache it writes —
+> so when is it worth it? Harness: `proxy-experiments/compact_economics.py`
+> (self-contained; imports readers from experiments.py). Captures: `logs_compact/`.**
+> MECHANISM (all confirmed): `/compact` is NOT a text-`-p` command — it must go via
+> `--input-format stream-json --output-format stream-json`, sending one line
+> `{"type":"user","message":{"role":"user","content":"/compact"}}`. It emits a
+> `system/compact_boundary` event (`trigger:manual`, `pre_tokens`, `post_tokens`)
+> and PERSISTS to the session; `--resume`/`--fork-session` after it continue from
+> the SUMMARY. Control auto-compaction with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100`
+> (never fires) — there is no explicit disable flag. Fork the busted base TWICE
+> (`--resume BASE --fork-session`) to get two independent arms from the identical
+> cache-busted state. Ran VANILLA proxy (all default-on transforms OFF:
+> RELOCATE_*/SORT_TOOLS/STRIP/CANARY=0) so this is NATIVE CLI economics.
+> SETUP: sonnet, FORCE_PROMPT_CACHING_5M=1, built a base to **69,370 tok** over 4
+> Read+explain turns on a 140KB scratch repo, idled **390s** (busts the 5m cache),
+> then Arm A=`/compact`→10 ops vs Arm B=same 10 ops (no compact). Ops = short
+> reasoning Qs answerable from context (no re-reads), identical both arms.
+> **RESULTS (n=1, on the wire):**
+>  · **Compaction ratio:** 69,370 → **2,523 tok** summary (−96.4%).
+>  · **Cost of /compact on a busted cache = 91,120 billed tok / $0.369 (sonnet).**
+>    Breakdown: it COLD-WROTE **cw5m=87,135** (full history+tools at the 5m write
+>    premium) + emitted a **2,524-tok summary OUTPUT** + in=1,461. **That entire
+>    87k cache write is DISCARDED** — the next op read=0 from it (the compacted
+>    prefix diverges right after tools; even tools weren't reused). So "discarded
+>    caching" is real and quantified: ~87k written, ~0 reused.
+>  · **Per-op steady-state carriage:** Arm A (compacted) ≈ **11k tok / $0.0065** per
+>    turn; Arm B (continuing) ≈ **70k tok / $0.0235** per turn — B re-ships the full
+>    ~70k EVERY turn = **3.6× the $ / 6.4× the tokens** of the compacted turn.
+>  · **★ TWO DIFFERENT CROSSOVERS (the key nuance — tokens ≠ dollars):**
+>    **TOKEN crossover = op #2** (compacted cumulative tokens dip below continuing
+>    almost immediately; by op10 B shipped 702k vs A's 204k = 3.4×). **DOLLAR
+>    crossover ≈ op #11–12** (at op10 continuing is STILL $0.028 cheaper; Δ$ closes
+>    ~$0.018/op). WHY the lag: /compact's $ is front-loaded into an expensive
+>    summary OUTPUT ($15/M) + a WASTED cache WRITE (writes bill 12.5× reads), while
+>    the savings drip in as cheaper reads. So compaction crushes TOKENS (context-
+>    window pressure / attention / latency) at once but the BILLING payback needs
+>    ~a dozen substantial turns.
+> **VERDICT for the hook:** suggesting /compact on a busted cache is a DOLLAR win
+> only if the user will run ≳10–12 more substantive turns in that session (and a
+> TOKEN/context-window win after ~2). For short continuations, just eat the one
+> cold re-write — compacting costs more. The hook's advice is sound for long-lived
+> sessions, premature for short ones; ideally gate it on session-age/expected
+> remaining turns, not just on cache-bust detection.
+> **QUALITY:** compaction was NOT lossy here — Arm A's answers matched Arm B's
+> full-context answers (the 2.5k summary even retained "98 functions/~1,180 lines,
+> ledger+scheduler tied"). General caveat: lossy for DETAIL-specific Qs that the
+> summary drops (would force re-reads = extra cost, not modeled here).
+> **CAVEATS:** n=1, sonnet (crossover-in-turns generalizes across models in TOKENS;
+> the $ crossover is the same order ~10–12 on opus by rate math). Arm A ran before
+> B, so B's op1 read the ~7k tool prefix WARM (would've been a cold write solo) →
+> slightly UNDERcounts B → real dollar crossover is, if anything, marginally
+> EARLIER. OPERATIONAL: vanilla proxy still listening on **:7811 → logs_compact**
+> (kill via `kill $(lsof -nP -tiTCP:7811 -sTCP:LISTEN)`). Re-run:
+> `python3 compact_economics.py --model claude-sonnet-4-6 --wait 390 --ops 10`
+> (`--quick` = haiku pipeline check, no real wait; `--analyze-only --base/-arm-a/
+> -arm-b <id>` re-verdicts captures for free). NEXT idea: rerun with more ops to
+> nail the exact $ crossover, and a DETAIL-heavy op set to price compaction's
+> lossy-reread tax.
+>
+> **★ STRIP-COMPACT-CACHE TRANSFORM — BUILT + MEASURED (2026-06-07). Reclaims the
+> discarded-write premium the CLI pays on a busted-cache /compact.** Mechanism (see
+> Q&A reasoning): a /compact request re-ships the whole history so the model can
+> summarize it, and the CLI stamps its rolling MESSAGE-level cache_control marker on
+> it — but compaction discards that history, so on a BUSTED cache the marker only
+> forces a wasteful COLD WRITE (1.25×/2×) that's never read again. New gated
+> transform `_strip_compact_cache` (logproxy.py, `STRIP_COMPACT_CACHE=1`, off by
+> default): detect the compaction request by its prompt signature
+> (`_is_compact_request`: ≥2 of the anchors in `_COMPACT_ANCHORS`, e.g. "create a
+> detailed summary of the conversation so far" + "wrap your analysis in <analysis>
+> tags" — version-fragile, canary-watched), and if `_compact_condition_met` (STUB:
+> assumes busted; override `STRIP_COMPACT_FORCE=0/1`; REAL gate TBD = idle-gap>ttl
+> per prefix-lineage or a hook verdict), remove cache_control from MESSAGE blocks
+> ONLY — **keep the system markers** (tools+system is legitimately reused by the
+> post-compact turns + fleet). Wired into the handler transform block; logs a
+> `strip_compact_cache` record. Stripping all markers is structurally safe (no
+> markers → no 1h-after-5m ordering 400). **A/B on the wire (sonnet, same
+> deterministic repo, busted cache; logs_compact_strip vs logs_compact):**
+>   · compact call: cw5m **87,135 → 25,197**, input **1,461 → 63,080** (the ~62k
+>     history moved WRITE→INPUT; the 25k residual write = the kept system prefix).
+>     Token count unchanged (pure reclassification). **Call cost $0.369 → $0.320 =
+>     −13.2% (sonnet).** Summary produced normally, content untouched.
+>   · **$ crossover ~op 11–12 → op #9** (~2–3 turns earlier); TOKEN crossover stays
+>     op #2 (token count identical).
+> **WHY ONLY 13%, not more:** we KEEP system markers, and compact's dominant cost is
+> IRREDUCIBLE — the input pass over the history (63k×$3/M=$0.189) + the summary
+> OUTPUT (2,447×$15/M=$0.037). The reclaimable bit is just the write premium on the
+> history (~62k×$0.75/M=$0.047). The proxy makes /compact un-stupid, not free.
+> **WARM-CACHE FOOTGUN (the whole reason for the gate):** the cache_control marker
+> does double duty — on BUSTED it WRITES (strip = −25% on that chunk, win); on WARM
+> the same history is a 0.10× cache_READ (strip = 1.0× input = ~+900%, big loss).
+> Auto-compaction fires at ~95% on a WARM session → must NOT be stripped. So the
+> strip is intrinsically a busted-cache move; `_compact_condition_met` MUST gate it.
+> Asymmetry: warm-strip loses ~10× what busted-strip saves → default conservative
+> (don't strip) whenever bust can't be confirmed. **CONDITION DETECTION (open, next):**
+> the request is stateless re: cache; sources of truth = (1) RESPONSE usage
+> (definitive read-vs-creation but too late → LEARNING signal for the next call
+> only); (2) PROXY MEMORY of `{prefix-lineage→(last_ts,ttl)}`, strip iff
+> `now−last_ts>ttl` (sound only in that direction; BLIND on fresh/forked/post-restart
+> sessions → default no-strip); (3) the HOOK's verdict (cleanest — it already
+> detected the bust; pass it out-of-band, file/env, since a PreUserPrompt hook can't
+> add an HTTP header). Lineage = (session,role,toolset-hash), NOT raw session_id.
+> HARNESS NOTE: in the A/B, Arm A's post-compact op1 read=0 even for system — an
+> artifact of stream-json-compact vs text-mode-op (different system prefix → no
+> share); a REAL in-session /compact shares+reuses the system prefix, so keeping the
+> system markers is correct for production (if system were truly never reused,
+> stripping it too adds only ~$0.019). Run with: `compact_economics.py … --strip
+> --log-dir-suffix _strip`.
+>
+> **★★ THE 5m EXPERIMENT UNDERSTATES THE WIN — at the REAL 1h main-agent TTL the
+> strip+compact crossover is MUCH earlier, AND the strip is what FLIPS 1h from a
+> liability to an asset (2026-06-07, re-priced from captured tokens; token counts
+> are TTL-invariant, only the write RATE changes 5m $3.75/M → 1h $6/M, so this is a
+> sound projection without a 1h-idle run).** We forced 5m only so the cache expires
+> in ~6min; but 5m has the SMALLEST write premium (1.25× → +0.25), which is the
+> WORST case for compaction. Re-pricing the SAME captures at the 1h rate (2× →
+> +1.0):
+>   ```            5m TTL        1h TTL
+>     no-strip   ~op 11-12     ~op 16-17   (1h WORSE)
+>     strip        op 9          op 6      (1h BETTER) ```
+> KEY INSIGHT (why): the cost /compact ADDS over continuing = summary handling
+> (output ~$0.037 + tiny write), OFFSET by paying **1× (input)** for the history
+> instead of the write premium. Continuing must cold-REWRITE the busted history at
+> the write premium, THEN drag it forward at 0.10×/turn. So the offset = H ×
+> (premium − 1): **5m → H×0.25, 1h → H×1.0** (4× bigger). Mental model: *at 1h,
+> continuing pays 2×H to re-cache history it'll only keep carrying; the stripped
+> compact pays 1×H to read it once and drop it* — half the first-turn history cost,
+> before the per-turn read savings. WITHOUT the strip, 1h is WORSE (the discarded
+> write is now 2× → overhead $0.369→$0.565 → crossover slides to ~op 16); WITH the
+> strip the compact's history pays 1× (TTL-independent) while continue pays 2× →
+> they COMPOUND. So strip is not just a 13% trim — it's the lever that makes the
+> real (1h) economics favor compaction by ~op 6. CORRECTION to the block above: the
+> "op 9 / op 11-12" figures are the 5m worst case; quote ~op 6 (strip) for the real
+> interactive 1h path. Ground-truth 1h run (`--wait 3700`, default caching) still
+> UNRUN — projection only, but token-invariance makes it reliable.
+>
+> **★★★ BIGGEST CORRECTION (2026-06-07) — ISOLATE THE CONVERSATION LAYER; the op-6/
+> op-9 crossovers were DOMINATED BY TOOLS/SYSTEM NOISE, not the actual compact-vs-
+> continue economics. On the clean layer, compacting a busted 1h cache wins from
+> ~op 1.** The tools+system prefix is IDENTICAL in both arms and orthogonal to the
+> question → MUST be subtracted. Three contaminations inflated the earlier numbers,
+> all in RESUME's favor / against compact: (1) ARM-ORDER — Arm A runs first and
+> cold-writes the tools/system prefix; Arm B then reads it WARM (`B op1 read=6967`)
+> when a solo resume would cold-write it → skews toward resume. (2) HARNESS BUG —
+> `compact_turn` passed NO `--tools`, so the /compact call shipped a LARGER untrimmed
+> tool set than the ops (the bloated `cw=25197` system write) → inflated compact
+> overhead + broke prefix sharing. (3) stream-json-compact vs text-op = different
+> prefix → no share (the read=0 noted above). **CLEAN conversation-layer math**
+> (measured H=62k history [the write→input delta]; S=2.5k summary [post_tokens];
+> mult input1×/read0.1×/out5×/write 1.25×@5m,2×@1h), cost to get through op1:
+>   · continue = cold-write busted history = `write_premium·H` = 124k (1h) / 77.5k (5m)
+>   · compact  = `H + 5S` (read + summary OUTPUT) + op1 summary write `2S`
+>              = 62k+12.5k+5k = **79.5k (1h)**, ~77.6k (5m)
+>   → compact ALREADY cheaper by end of op1 at 1h (79.5k<124k); ~tied at 5m, then
+>     the per-turn read gap (continue re-reads 62k@0.1× vs 2.5k) wins it in 1-2 ops.
+> **GENERAL RULE — compact wins the FIRST turn iff `read + 5S < premium·H`:**
+>   · 1h: `H+5S < 2H` → **S < 0.20·H** (summary <20% of history → op1; typical
+>         compaction is 5-15%, so nearly always immediate).
+>   · 5m: `H+5S < 1.25H` → **S < 0.05·H** (needs <5%, else recouped over op1-3).
+> The OUTPUT cost of the summary (5× input) is the ONLY thing keeping it off op1 —
+> at 1h it's covered by the 2× write premium continue pays. So the headline answer
+> to "after how many turns is compact cheaper": **on a busted 1h cache, ~immediately
+> (op1) as long as the summary is <20% of the history** — the op-6/op-9 numbers were
+> tools/system artifacts. TODO clean wire run: pass identical `--tools` to the
+> compact call, and either subtract P in analysis or isolate prefixes to kill the
+> arm-order skew.
+
+> **★★★ TTL ECONOMICS & CACHE-LIFECYCLE — analysis/design thread (2026-06-07).
+> No new code yet; this is the decision framework + an empirical fleet result.
+> NEXT: we're about to run another experiment (likely the deterministic transcript
+> CLEANER, item 8). Operational state at handoff at the very bottom of this block.**
+>  1. **MENTAL MODEL (verified on wire): 5m is the DEFAULT, 1h is an OVERRIDE the
+>     CLI adds ONLY to the main agent.** A bare `{type:ephemeral}` marker = 5m;
+>     `ttl:'1h'` is an explicit field. The CLI stamps 1h onto the MAIN agent's
+>     markers and leaves SUBAGENTS bare (=5m). `FORCE_PROMPT_CACHING_5M=1` works by
+>     *dropping* the 1h field (not "switching modes") → confirms it's an override.
+>     WIRE CHECK across all captures: every subagent request (Plan×2, general-
+>     purpose×1) = bare 5m marker + response `cw5m`; parent = `ttl:1h`. Unanimous
+>     but SMALL sample (n=3, ~one session) — treat as "every spawn we've seen,"
+>     not ironclad; could be model/version-dependent. TTL is a SLIDING idle timer
+>     (resets on every read), not fixed-from-creation.
+>  2. **5m-vs-1h decision (per cached SEGMENT, driven by gaps between reuses):**
+>     Region A `gap≤5m` (both warm; reads equal → 5m wins on cheaper write) ·
+>     Region B `5–60m` (only 1h stays warm → 1h saves the rewrite) · Region C
+>     `>60m` (both evict → 5m cheaper, or don't cache). EXACT: **1h cheaper iff
+>     `1.15·n_B − 0.75·n_C > 0.75`** (n_B/n_C = #gaps in B/C). +1.15 per B-gap
+>     rescued, −0.75 per C-gap (wasted premium), 0.75 = cold-write premium to clear.
+>     HOMOGENEOUS shortcut: typical gap in 5–60m → 1h; shorter OR longer → 5m
+>     (both ends collapse to 5m for different reasons).
+>  3. **NO-CACHE beats caching when warm-reads k=0:** true single-round-trip calls
+>     (CLI title-gen), or gaps reliably >TTL (region C). Break-even: 5m beats
+>     no-cache at k≥1; 1h needs k≥2. Lever = strip `cache_control` markers → pay
+>     1.0× input instead of the 1.25×/2× write. Cost is ~token-count, NOT message
+>     structure (caching is prefix-based, indifferent to message boundaries —
+>     collapsing q1,a1,q2,a2 into one block buys ~nothing and breaks tool/thinking
+>     structure; the real lever is shrinking tokens, not restructuring).
+>  4. **EMPIRICAL FLEET RESULT (workbench replay by another agent):** ephemeral
+>     one-shot agents → 5m overwhelmingly (decomposers 96%/255 favor 5m, 1h would
+>     cost +22%/+$49.75; auto-workers +12%; combined ~$69 wasted on 1h over 497
+>     sessions). Persistent brains (scout/tl/opus, long clones) → 1h (only they
+>     accrue enough region-B idle gaps). **RULE: ephemeral one-shot → 5m, persistent
+>     brain → 1h. ASYMMETRY → default to 5m when unsure** (mis-5m on a borderline
+>     agent cost <$1; mis-1h on the ephemeral majority wastes +12–22%).
+>  5. **RETROSPECTIVE replay method (have the data):** captures carry per-request
+>     ISO `ts` (second granularity) + `session_id` + `cache_read`/`cw5m`/`cw1h`.
+>     **`Net_5m = 0.75·W_1h − 1.15·R_B`** (W_1h=Σ all 1h-write tokens; R_B=Σ
+>     cache_read tokens on requests whose intra-lineage gap ∈(5,60]m); >0 → 5m would
+>     have been cheaper. CAVEATS: (a) per-REQUEST granularity (catches mid-turn
+>     eviction); (b) **MUST group by PREFIX-LINEAGE = (session,role,toolset-hash),
+>     NOT session_id** — subagents SHARE the parent's session_id but are SEPARATE
+>     cache lineages (parent↔subagent busts at tools/segment-1, share zero bytes);
+>     (c) per-session scoping undercounts 1h's cross-session warm reads (biases
+>     toward 5m). Ground-truth eviction visible: `logs_live/0aa00dbb` req012→016 =
+>     6-min gap → `cw5m=20200` rewrite. A correct replay shows SOME 1h-favorable
+>     sessions (proves the region-B penalty term is modeled, not just the discount).
+>  6. **ARCHITECTURE: enforce TTL in the ORCHESTRATOR, not the proxy** (same lesson
+>     as tool-trimming). `FORCE_PROMPT_CACHING_5M` is a native per-process env var
+>     set AT SPAWN, keyed on the agent's lifecycle class — the class knowledge lives
+>     at the spawn site; the proxy would have to INFER it from lossy wire signals
+>     (and `_classify_role` already mislabels opus). Proxy marker-surgery also risks
+>     invalid payloads (we hit the `1h-after-5m` 400). Use the proxy ONLY for what
+>     env can't express: per-SEGMENT juggling (head@1h/tail@5m) or selectively
+>     forcing one recurring background subagent to 1h. DIVISION OF LABOR:
+>     orchestrator = CONTROL, proxy = MEASUREMENT (TTL rollup + canary catches the
+>     day the CLI changes its tier-detection).
+>  7. **COLD-WAKEUP optimization:** when a sleeping agent wakes after idle > TTL the
+>     cache is PROVABLY dead → the cold write is unavoidable, so SHRINK what you
+>     cold-write. Orchestrator should DISCARD the old session, clean/compact its
+>     history, and seed a FRESH session (loses no cache — it's already evicted;
+>     cold-writes a smaller payload + every future read is smaller). Prefer
+>     fresh-session-with-SEED over transcript surgery (CLI transcript format is
+>     version-fragile). The fresh session also UNLOCKS aggressive stripping (no
+>     thinking-signature / readFileState / tool-pairing constraints bind a NEW
+>     session). This substitutes YOUR compaction trigger (the wakeup event) for the
+>     CLI's token-threshold auto-compact.
+>  8. **★ NEXT EXPERIMENT — DETERMINISTIC transcript CLEANER (before any AI
+>     compaction), rule tiers, NO LLM:** Tier-1 provably-dead/lossless (bookkeeping-
+>     noise regexes per the borrowed content-strip catalog: `Token usage:`/`USD
+>     budget:`/`Messages until auto-compact:`/`[Old tool result … cleared at <ts>]`/
+>     `Continue from where you left off.`; keep only the LATEST env/date/reminder/
+>     CLAUDE.md snapshot; drop old thinking — safe in a fresh session). Tier-2
+>     provably-stale by SUPERSESSION (the big win on code sessions: `Read(X)` before
+>     a later `Edit/Write(X)` → stub the stale read; multiple `Read(X)` keep last;
+>     superseded edit args; exact-dup outputs). Tier-3 heuristic "old & likely
+>     useless" (age+size stub; consumed large outputs). AI summarization = residual
+>     only. EDGES: stubs must stay NON-EMPTY + keep tool_use/tool_result PAIRED (or
+>     remove as a unit; empty text block → 400); a "stale" read may have been
+>     reasoned over (mitigate: verbatim-recent-window + the conclusion usually sits
+>     in the following assistant text). Deterministic ⇒ auditable/reversible. PLAN:
+>     prototype Tier 1–2, run over a REAL heavy code session, report % reclaimed —
+>     our chatty captures are tool-LIGHT (logs_chatty richest req: tool_use+result+
+>     thinking ≈71% of body, 1 file touched 9×) so they UNDER-sell it; generate a
+>     heavy edit session through the proxy to measure properly.
+>  9. **KNOWN BUG (cosmetic): `_classify_role` mislabels OPUS parents as `unknown`**
+>     — opus's headless system prompt lacks the `"Claude Code"` signature the
+>     classifier keys on (445 `unknown` reqs at 1h in captures = mostly opus
+>     parents). Under-counts opus in per-role analysis. Fix = add the opus/SDK
+>     system-prompt signature to `_classify_role`.
+> **OPERATIONAL STATE (verify, then likely reset for the next experiment):**
+> proxy `:7810` is RUNNING (PPID 1) → `LOG_DIR=logs_opus`, with ALL new transforms
+> DEFAULT-ON (canary + tool-sort + system-strip + RELOCATE_ENV_TO_TAIL +
+> pathstamp). Scratch repo `/tmp/opus-demo` (branch `feature/opus-test`, has a
+> CLAUDE.md, magic word `FALCON-9`). Kill via `kill $(lsof -nP -tiTCP:7810 -sTCP:LISTEN)`
+> and `rm -rf /tmp/opus-demo logs_opus proxy_7810.out` to start clean. Other
+> persistent proxies 7799–7803 are the human's — leave them.
+
+> **★★★ NEW DEFAULT-ON PROXY FEATURES (2026-06-06) — borrowed from
+> `cnighswonger/claude-code-cache-fix` (audit lives in
+> `~/projects/ai/claude-code-cache-fix-research/`). The observer proxies are NO
+> LONGER pure pass-through once restarted — three transforms now run BY DEFAULT
+> (each opt-out by env). Existing detached proxies (7799/7800/...) only pick these
+> up after a `start_proxy.sh` restart.**
+>  1. **Version-drift CANARY (read-only, default-on; `CANARY=0` to disable;
+>     `CANARY_DIR=<path>`).** `_canary_check`/`_request_fingerprint`/`_fp_diff`.
+>     Builds a content-light STRUCTURAL fingerprint per `(model, anthropic-beta)`
+>     namespace — tool count+names, system block count, per-block `(hdr[:48],
+>     log2-size-bucket, cc type/ttl)`, and cache_control MARKER COUNTS
+>     (tools/system/messages/total). Runs on the ORIGINAL request BEFORE our
+>     transforms (so it flags CLI/wire changes, not our own mutations). Message
+>     count/content are EXCLUDED from the diff so normal convo growth never fires.
+>     On drift: persists new baseline + appends `_canary/changes.jsonl` + prints
+>     the diff. **This is our early-warning for every version-fragile lever** (the
+>     `# Environment` split marker, tool names, env layout). Specifically tracks
+>     total marker count → when the CLI ever ships the 4th cache marker (it does
+>     NOT today; baseline=3) the print gets `*** CACHE-MARKER COUNT CHANGED ***`
+>     and the record carries `marker_count_changed:true`. Verified offline (3→4
+>     fires; matching shape = `match`; baseline persisted).
+>  2. **TOOL SORT (default-on; `SORT_TOOLS=0` to disable).** `_sort_tools`
+>     alphabetizes `body.tools`. IDEMPOTENT — already-sorted → returns None, no
+>     body touch, no cache bust. First contact with a non-alphabetical roster
+>     reorders once (busts marker-1 once, then stable). Value is purely
+>     predictability (tools are first in cache order). NOTE we usually TRIM tools
+>     via native `--tools`, not sort a full roster — this is a cheap stabilizer,
+>     not a carriage win.
+>  3. **SYSTEM-SECTION STRIP (default-on; disable with `STRIP_SYSTEM_SECTIONS=`
+>     empty).** `_strip_system_sections` removes whole top-level `# Heading`
+>     sections (header line → next col-0 `# ` header / end of block). Default
+>     strips `# Session-specific guidance` (the ultrareview prose, ~527 chars/~130
+>     tok). ⚠ Unlike SPLIT_SYSTEM_REST (byte-identical, cache-only) this DELETES
+>     MODEL-VISIBLE text and busts the system prefix once (then stable). Marginal
+>     as a carriage win; its real role = the MECHANISM for system-prompt editing.
+>     Config `\x1f`-separated (`STRIP_SYSTEM_SECTIONS='# Foo\x1f# Bar'`).
+>     CAVEAT: if you ever proxy a session where that section matters, set it empty.
+>  4. **`RELOCATE_ENV_TO_TAIL` + `RELOCATE_CLAUDEMD_PATHSTAMP` NOW DEFAULT-ON
+>     (disable with `=0`), + TWO fixes (2026-06-06):**
+>     · **★ TTL BUG FOUND + FIXED.** The transform stamped the CLAUDE.md bundle
+>       with a BARE `{ephemeral}` (=5m) marker. Under normal parent caching (1h)
+>       that 5m marker sits BEFORE the CLI's 1h prompt/system markers in cache
+>       order (tools→system→messages) → HARD `400 ... a ttl='1h' block must not
+>       come after a ttl='5m' block`. It NEVER showed in the reloc2 validation
+>       because those runs used `FORCE_PROMPT_CACHING_5M=1` (everything 5m → no
+>       mismatch). FIX: the injected marker now MIRRORS the nearest preceding
+>       (last system) marker's ttl. So "reloc2 validated" was validated on a path
+>       that hid this — re-test reloc WITHOUT force-5m. (Caught live, haiku, no
+>       force-5m, the moment relocation ran on a real default-1h session.)
+>     · **★ GENERALIZED to NO-CLAUDE.md repos.** Old code early-returned if no
+>       `# claudeMd` bundle (so a repo without CLAUDE.md never relocated env —
+>       env kept busting the whole system prefix). New `_find_context_bundle`
+>       falls back to the userEmail/currentDate `<system-reminder>` bundle (which
+>       the CLI emits even with NO CLAUDE.md) as the anchor. A dedicated cache
+>       marker is added ONLY for the LARGE claudeMd segment (`has_claudemd`); the
+>       tiny userEmail-only bundle gets env relocated but NO extra marker (saves
+>       the 4-marker budget). The real win — env leaving `system` so the static
+>       system prefix is env-independent/shareable — now applies to EVERY repo.
+>     A/B verified on the wire (logs_reloc_gen, haiku, default-on, no force-5m):
+>     WITH CLAUDE.md → env in messages, 4 markers (sys1,sys2,claudeMd@1h,prompt@1h),
+>     answers magic-word+cwd correct; NO CLAUDE.md → env in messages, 3 markers (no
+>     extra), cwd correct. Behavior preserved both ways. `_relocate_env_to_tail`
+>     log now carries `has_claudemd` + `claudemd_ttl`.
+> Wiring: canary called at handler parse-time (read-only, gated on `/v1/messages`);
+> strip+sort added to the existing transform block (set `changed=True`). Writer
+> thread gained an `append` kind + `_enqueue_append` for the JSONL. From the same
+> audit, the still-UNBORROWED high-value items are: fingerprint-strip (cc_version
+> resume stabilization, version-pinned — wire behind the canary), the 4th-marker
+> INJECTION (we have DETECTION now, not injection), ttl subagent-detect +
+> thinking-block exclusion, deferred-tools-restore (MCP only). Their tool-SORT we
+> took; their tool-set we DON'T (we trim, they keep all ~31). See research files
+> 02/03 for the full steal-list.**
+
+> **★★★ CACHE-SEGMENT & CROSS-SESSION SHARING MECHANICS (2026-06-05) — new
+> thread, all proven on the wire (logs_live/). NEXT TEST is a proxy-side
+> `rest`-block split (bottom of this block). Read before continuing.**
+>
+> 1. **`FORCE_PROMPT_CACHING_5M=1` flips parent caching 1h→5m** (native CLI env,
+>    no proxy): the CLI drops `ttl:'1h'` from every `cache_control`
+>    (→ `{"type":"ephemeral"}` = 5m); response usage moves to
+>    `ephemeral_5m_input_tokens`. Default parent = 1h, subagents = 5m.
+> 2. **5m-vs-1h is PURELY the reuse-gap.** Reads cost the same (0.10×) in both;
+>    1h only buys a longer TTL at a higher write premium (2× vs 1.25×). Rule:
+>    gap <5min → 5m; 5min–1h → 1h; >1h → neither. TTL is a SLIDING/idle timer
+>    (reset on every read), NOT fixed-from-creation.
+> 3. **Mid-turn eviction is REAL.** A tool step LONGER than the TTL *between* the
+>    dispatch and continuation requests of ONE agentic turn evicts mid-turn
+>    (test: Bash `sleep 360/420` → Edit). 5m arm's session-private tail evicted &
+>    re-wrote ~20k; 1h survived 6min AND 7min. So 1h's real value = shielding a
+>    single in-flight task from a slow tool / approval-pause silently re-writing
+>    the prefix. Within ONE API request nothing expires (read is once, at prefill).
+>    Sessions: standard-5m 0aa00dbb, standard-1h 633780ba, trimmed-5m cddff66f,
+>    solo-standard 41181656, 7min e5868015.
+> 4. **The prefix = 3 NESTED breakpoints.** `cache_control` = "cache the cumulative
+>    prefix UP TO AND INCLUDING this block," not "cache this block." Canonical
+>    cache order is **tools → system → messages REGARDLESS of JSON key order**
+>    (the captured file lists keys messages,system,tools — misleading; tools are
+>    logically FIRST and carry NO marker of their own, cached by MARKER 1 because
+>    they precede it). ≤4 breakpoints.
+>    · **MARKER 1** (sys[1] "You are Claude Code…") = tools + sys[0] attribution +
+>      sys[1] = **SEGMENT A** (standard 31-tools ≈ 28,167 tok; trimmed 4 ≈ 2.9k).
+>    · **MARKER 2** (sys[2]) adds ~3.2k system prose + `# Environment`
+>      (cwd/git/dirs) + any `--append-system-prompt`, ALL one block = **SEGMENT B**.
+>    · **MARKER 3** (last msg, rolling) adds messages = prompt + injected CLAUDE.md
+>      + history = **SEGMENT C**.
+> 5. **CLAUDE.md is USER space, NOT system** — a text block in `messages[0]`
+>    wrapped in `<system-reminder>`/`# claudeMd` (looks systemy, is user-role).
+>    cwd's project CLAUDE.md auto-loads; the 11.5k proxy-lab handoff rode in
+>    segment C of every earlier experiment → run experiments from a NEUTRAL cwd to
+>    keep cache numbers clean.
+> 6. **`--append-system-prompt` IS in the system cache** — concatenated onto the
+>    TAIL of sys[2] (segment B, under MARKER 2), no own breakpoint. Per-agent
+>    identity there busts segment B (and downstream C, prefix-nesting) but PRESERVES
+>    segment A. A ~17-tok identity forfeits sharing of the whole ~3.2k sys[2] block.
+> 7. **Cross-session sharing is CONTENT-ADDRESSED, byte-exact, segment-by-segment.**
+>    (a) STANDARD tools survive 6–7min idle even SOLO and read warm AT COLD START
+>    (solo 41181656 cold cache_read=28,167 it never wrote) → external/FLEET warming
+>    of the content-identical standard prefix. (b) TRIMMED/unique tools cold=0,
+>    fully evict (nobody ships those bytes). (c) TWIN (writer eb07db7e → reader
+>    5aa9046b, 64s later, identical trimmed tools+cwd+prompt) read the ENTIRE prefix
+>    free (cache_read=20,835, write=0). So "standardness" isn't special — it's the
+>    prefix with constant identical fleet traffic; trim → you leave the crowd → tiny
+>    self-warmed pool.
+> 8. **The CLI STRANDS its own static prose:** `# Environment` (cwd/git-branch+
+>    commits/dirs) is welded into the SAME block as the ~3.2k static system prose →
+>    the prose busts cross-session sharing on ANY env change. Explains why our
+>    standard survivor was ALWAYS 28,167 (MARKER 1) and never 31,286 (MARKER 2):
+>    each run's different `--add-dir` lived in sys[2].
+> 9. **Global cache scope (`shouldUseGlobalCacheScope()`, 1P + no-MCP + boundary)
+>    WOULD split static(global, fleet-reusable) from dynamic(env)** via
+>    `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` — but a **custom `ANTHROPIC_BASE_URL` (our
+>    proxy) flips the client to 3P → ORG scope → boundary never inserted →
+>    static+dynamic BUNDLED.** Everything we measured is the degraded org path.
+>    Confirming global billing needs a TLS-intercept (CLI still thinks it's 1P),
+>    not a base-URL swap.
+> 10. **ORG-SCOPE reality (our proxied path):** 3 system blocks — block0
+>    attribution (cacheScope null, OUT-OF-BAND billing header, turn-variant but does
+>    NOT bust cache; DON'T reorder/fold it; drop via
+>    `CLAUDE_CODE_ATTRIBUTION_HEADER=false`), block1 preamble (org), block2 `rest` =
+>    ALL static + ALL dynamic mashed (org). `rest` reuse across restarts needs the
+>    WHOLE env snapshot identical — a **git commit busts it**, a **CLAUDE.md edit
+>    busts it**, + cwd/platform/MCP-set/CLI-version/model/effort. Only durable
+>    cross-restart hit = MARKER 1 (tools+preamble), tiny if trimmed. No protectable
+>    "system cache" independent of env.
+>
+> **★★★ RESOLVED (2026-06-05): PROXY-SIDE `rest` SPLIT — BUILT, SHIPPED, MEASURED
+> ON THE WIRE. Mechanism works perfectly; economics are marginal and fleet-gated.**
+> Implemented as `SPLIT_SYSTEM_REST=1` in logproxy.py (`_split_system_rest`, gated,
+> off by default; logs a `rest_split` record). It finds the env-bearing block (the
+> one containing `\n# Environment`, = sys[-1]) and MOVES the static head (everything
+> before `\n# Environment`) onto the END of the preceding MARKED block (sys[-2], the
+> "You are Claude Code" preamble). Proven properties: (a) concatenated system TEXT
+> byte-IDENTICAL (verified offline + on wire); (b) cache_control markers + block
+> count unchanged; (c) idempotent (post-split the marker sits at offset 0 of the
+> rest block → `idx<=0` no-op); (d) block0 untouched.
+> **CONTROLLED A/B (haiku `-p`, two ports 7804 split-ON / 7805 vanilla-OFF, each arm
+> = two sessions from DIFFERENT cwds so env varies; the decisive run was a FRESH,
+> never-seen cwd on each arm to equalize fleet warming):**
+>   · OFF/vanilla, fresh cwd: cache_WRITE=5403, read=28197 (static prose welded in
+>     block2 → busted by novel env → RE-WRITTEN every session).
+>   · ON/split,    fresh cwd: cache_WRITE=2669, read=30932 (static prose rides
+>     marker1 → READ; only dynamic env+messages written).
+>   · Δ is SYMMETRIC: write −2734, read +2735 = the ~2.73k static-prose tokens
+>     moved from WRITE(2×/1h) → READ(0.10×), exactly as designed. (This CLI/haiku
+>     layout: moved_chars=12,555 ≈ 2,735 tok; block1 62→12,617 chars, block2
+>     13,842→1,285. The 2,923-tok figure below was a different capture/agent.)
+> **THE CATCH (why it's marginal, quantified — this is the real lesson):** going
+> non-standard FORFEITS GLOBAL FLEET WARMING. The FIRST split session cold-WROTE the
+> WHOLE 33,591-tok prefix (read=0) because no fleet ships our layout; the equivalent
+> vanilla session gets marker1 (~28k) warm for free from the global crowd. So the
+> split only nets out AHEAD once YOUR OWN fleet keeps the (now bigger, non-standard)
+> marker1 warm within the TTL — global won't. Steady-state (≥1 prior same-layout
+> session warm in-window): save 2,734 tok write→read PER fresh-env session ≈
+> **$0.0052 haiku / $0.016 sonnet / $0.078 opus** per session, break-even ~1 session
+> AFTER the bigger cold-start. **VERDICT: ship it only for a LARGE private headless
+> fleet with high env churn (every CI job = novel cwd) AND enough in-window volume to
+> self-warm marker1; otherwise vanilla's free global warming beats it.** Confirms the
+> pre-registered caveats (fleet-local, fragile heuristic, write-only). Captures:
+> logs_split_on/ + logs_split_off/ (haiku, 2026-06-05). Tunable split point:
+> `SPLIT_SYSTEM_REST_MARKER` (default `\n# Environment`) — RE-VERIFY per CLI bump or
+> it silently stops matching.
+>
+> **★★ VERDICT FLIPS FOR TRIMMED TOOLS (2026-06-05) — the "marginal/fleet-gated"
+> conclusion above was an ARTIFACT of the standard 28k-tool layout freeloading on
+> GLOBAL fleet warming. We never run full tools, so it never applied. Re-ran the A/B
+> with `--tools "Read Edit Write Bash Glob Grep"` (6 tools on wire) +
+> `FORCE_PROMPT_CACHING_5M=1` + `CLAUDE_CODE_DISABLE_WORKFLOWS=1`, fresh never-seen
+> cwd per session (logs_split5m_on / logs_split5m_off, haiku):**
+>   · session1 (cold): split write=7913 / vanilla write=7912 — **IDENTICAL cold-start
+>     (Δ=1 tok).** BOTH cold-wrote (read=0): **trimmed layouts get NO global fleet
+>     warming** (confirms #7b on the wire — vanilla-trimmed is just as non-standard as
+>     the split, so the split forfeits NOTHING). 5m confirmed (all writes ephemeral_5m,
+>     1h=0).
+>   · session2 (fresh cwd, marker1 self-warm): vanilla write=3518 read=4394 vs split
+>     write=983 read=6930 → Δwrite −2535 / Δread +2536 (symmetric; the ~2.5k static
+>     prose, write→read).
+>   · COST (system-prefix carriage, base-tok-equiv @5m: write 1.25×, read 0.10×):
+>     vanilla 4837 → split 1922 = **−60.3% per fresh-env session.** Big relative win
+>     BECAUSE trimming shrank the payload so the static prose is now a LARGE fraction
+>     of it. Per-session $ saved: ~$0.003 haiku / $0.009 sonnet / $0.044 opus, ×N
+>     fresh-env sessions in-window.
+> **NEW VERDICT (trimmed-tools reality): the split is a CLEAN WIN — NEVER worse
+> (cold-start identical) and ~60% cheaper on system-prefix carriage whenever your own
+> fleet keeps marker1 warm within the 5m gap (which vanilla-trimmed needs EQUALLY).
+> Both layouts are non-standard so neither gets global warming → the split is strictly
+> dominant.** Use it together with tool-trimming + 5m. The earlier "ship only at full
+> fleet scale" caveat was about the FULL-tool layout; for the trim+5m setup we actually
+> run, just turn it on.
+> **★ CONFIRMED ALL 3 MODELS (2026-06-05, trimmed+5m, fresh-cwd A/B; split fired on
+> wire for each). Cold-start IDENTICAL every model (Δ≤2 tok → split never worse):**
+>   · HAIKU : warm split w=983/r=6930 vs vanilla w=3518/r=4394 → −60.3%, ~$0.0029/sess.
+>   · SONNET: warm split w=815/r=6867 vs vanilla w=3353/r=4331 → −63.1%, ~$0.0088/sess.
+>   · OPUS  : warm split w=724/r=4643 vs vanilla w=1509/r=3860 → −39.7%, ~$0.0135/sess.
+> **NEW FACT: the CLI ships a MODEL-SPECIFIC system prompt — OPUS's is far more
+> COMPACT.** Opus static prose ≈2,474 chars (~600 tok) / block2 vanilla 3,684 chars,
+> vs haiku/sonnet ≈11,768 chars (~2,940 tok) / block2 ~12,981. So opus moves fewer
+> tokens (smaller %), but at 15× rate it saves the MOST $/session. (logs_split5m_on/off
+> contain haiku+sonnet+opus captures, filter by model in the response filename.)
+>
+> **★★★ DESIGN-2 SHIPPED & VALIDATED (2026-06-05): RELOCATE ENV TO TAIL + MARK
+> CLAUDE.md — makes CLAUDE.md an env-independent, cross-session-shared cache segment.**
+> Motivation: CLAUDE.md rides in `messages[0]` (a CLI-assembled `<system-reminder>`
+> bundle: wrapper + on-disk file + CLI-injected `# userEmail`/`# currentDate` + an
+> absolute `Contents of <path>/CLAUDE.md` stamp). Since cache order is tools→system→
+> messages, CLAUDE.md is ALWAYS downstream of `# Environment` (in `system`) → any env
+> change re-WRITES the (often huge) CLAUDE.md every session, and a marker on it is
+> useless (env busts the prefix upstream). FIX (`_relocate_env_to_tail`, gated by
+> `RELOCATE_ENV_TO_TAIL=1`): peel the two volatile header-delimited sections
+> (`# Environment` out of system, `# currentDate` out of the bundle) DOWN into a new
+> tail `<system-reminder>` block inserted right before the prompt, and give the now-
+> static CLAUDE.md bundle its OWN cache_control marker (4th breakpoint). Final layering:
+>   M1 tools+preamble+static | M2 contextmgmt+append | M4 CLAUDE.md | M3 env+date+prompt
+> `RELOCATE_CLAUDEMD_PATHSTAMP=1` also rewrites `Contents of <abspath>/CLAUDE.md` →
+> `Contents of CLAUDE.md` (DEDUPE, not forge — cwd already lives authoritatively in the
+> relocated env) so the segment shares across WORKTREES too.
+> **PROPERTIES (all verified):**
+>   · LOSSLESS reorder: env+date moved verbatim, identical word-multiset (offline test);
+>     NOT byte-identical like the rest-split (it's a reorder) → model-visible.
+>   · BEHAVIOR PRESERVED (sonnet, live): with env relocated below CLAUDE.md, the model
+>     still returned the CLAUDE.md-defined magic word `BANANA47`, its correct cwd
+>     `/private/tmp/...`, and git status `yes`. Relocation did NOT break env-awareness or
+>     CLAUDE.md obedience.
+>   · CACHE WIN (A/B across a cwd/worktree change, identical CLAUDE.md ~22k chars/~5.5k
+>     tok, 5m, trimmed): control session2 (diff cwd) re-WROTE 5958; relocate+pathstamp
+>     session2 WROTE 354 / read 12469 → CLAUDE.md write→read, **−94% claudeMd write,
+>     ~−79% session carriage.** Scales with CLAUDE.md size (real ones 10k+ tok).
+> **KEY FACTS FROM THE RUN:** (a) this CLI's `# Environment` does NOT carry git
+> branch/commits — only cwd / additional-dirs / platform / model / cutoff. So the real
+> buster is CWD (worktree), NOT an in-place branch switch (that was a no-op, both
+> session2s came back write=0). (b) pathstamp dedupe is REQUIRED for cross-cwd sharing
+> (the `Contents of <abspath>` line alone busts the segment). (c) Marker budget now FULL
+> (4/4): M1,M2,CLAUDE.md,prompt — if the CLI ever adds its own intermediate marker on
+> long histories we'd exceed; monitor. (d) Cross-AGENT (parent↔subagent) still busts at
+> TOOLS (first segment) regardless — this wins cross-SESSION same-config sharing; pair
+> with common-tool-trimming for cross-agent. CAVEATS: gated off by default; transform
+> only fires when a `# claudeMd` bundle is present (else no value, skips). Idempotent
+> per-request (each request re-parsed fresh from the CLI's original). Captures:
+> logs_reloc2_on/ (+pathstamp) vs logs_reloc2_off/ (control). Ports 7804/7805 were
+> ad-hoc, now KILLED. Ports 7804/7805 were ad-hoc, now KILLED; relaunch split-ON via
+> `export SPLIT_SYSTEM_REST=1; PORT=7804 LOG_DIR=logs_split5m_on OUT=proxy_7804.out
+> ./start_proxy.sh` and drive with `--tools "Read Edit Write Bash Glob Grep"
+> FORCE_PROMPT_CACHING_5M=1 CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+>
+> **★ ORIGINAL PLAN (now executed; kept for rationale): PROXY-SIDE `rest` SPLIT.** logproxy
+> rewrites the system blocks to split `rest` at `\n# Environment`, moving the
+> **~2,923 tok static prose** (everything BEFORE `# Environment`) into a durable,
+> env-independent block (merge into block1's marked prefix → stay at 3 breakpoints),
+> leaving only ~334 tok volatile (`# Environment` + `# Context management` + append)
+> after. **SAFE: the concatenated system TEXT the model sees is byte-identical —
+> only a `cache_control` boundary moves; no reorder, no behavioral change.** Win =
+> a 2nd+ agent READS that ~2.9k at 0.10× instead of WRITING it at 1.25×/2× — i.e.
+> converts the static block's cold-start from WRITE→READ, amortized across the
+> fleet within the TTL window (one writes cold, all in-window read). **WRITE-ONLY**
+> — the 10% READ of the prose every turn is unavoidable (read lever = SIZE/trim,
+> which changes model-visible text; the split is the safe half). Measured split
+> (agent-test 41204d23): sys[2]=3257 tok → 2923 before / 334 after `# Environment`.
+> CAVEATS: (a) fleet-local only (non-standard layout matches only YOUR proxied
+> sessions, never vanilla/global); (b) FRAGILE — split point is a heuristic
+> (`# Environment` header) → version-pin + test per CLI bump + monitor hit-rate or
+> it silently stops matching; (c) relocate the 2.9k VERBATIM or it won't share;
+> (d) `# Context management` (static) is stranded after `# Environment` — leave it
+> volatile (pulling it forward = a model-visible reorder); (e) DON'T touch block0.
+> Worth it only at FLEET SCALE with env churn. GOVERNING TRUTH: under org/proxy
+> scope no system cache survives the env snapshot; org wins = (1) shrink per-turn
+> payload (tools/CLAUDE.md/MCP) — robust, helps the READ; (2) for headless FLEETS
+> pin cwd+git+config so `rest` shares cross-machine; (3) this `rest`-split to claw
+> back the static-prose WRITE. NEVER FORGE env via proxy (lying about cwd/git/date
+> corrupts the model's world-model). Captures: logs_live/ cache-expiry-* + agent-
+> test 41204d23 (append/CLAUDE.md/marker-structure).
+
+> **★ HEADLINE UPDATE (2026-06-03): SC NOW WORKS ON SUBSTANTIVE BUILDS — the
+> "doesn't generalize past trivial edits" verdict in #10 is OVERTURNED.** Two
+> independent fixes did it: (A) a STRONGER syspatch prompt (blunt prohibition +
+> "never emit a lone tool call" + ban forward-narration + a worked exemplar) makes
+> sonnet FRONT-LOAD text+sentinel at dispatch on every build step (3/3, vs the old
+> gentle prompt's 0/3); (B) RELAY mode is BUGGY on builds (the CLI rejects the
+> relay-stripped synthetic and re-sends the continuation → a duplicate upstream
+> turn → 0 net savings) — **use CANNED-ACK SC, not relay.** Result, spec-build
+> sonnet, 2 alternating reps, reproducible: 6→3 parent turns, SC 3/3 each rep,
+> **−49.5% tokens, build correct.** The winning prompt lives in
+> `_DEFAULT_SC_SYSPATCH` (logproxy.py). The deferral was prompt STRENGTH + a relay
+> bug, NOT a model capability wall. Details at the end of #8/#9/#10 below.
+> **★★ THE REAL LEVER (2026-06-03) — TOOL-SET TRIMMING beats short-circuit by a
+> mile on REALISTIC sessions.** SC optimizes the wrong slice (tool wrap-ups);
+> actual cost in a chatty interactive dev session is DEADWEIGHT TOOL SCHEMAS
+> re-shipped every turn. Measured on the wire: the default `claude` ships **33
+> tools ≈ 24k tokens EVERY turn**; a normal session uses ~4. Breakdown: `Workflow`
+> tool alone = **5,223 tok** (=`CLAUDE_CODE_DISABLE_WORKFLOWS=1`, confirms the
+> human's "5.5k/turn"); the Team/Task/Cron/Worktree/Monitor/Schedule orchestration
+> tools ~15k more — none used in a chat. NATIVE FIX (no proxy): `claude --tools
+> "Read Edit Write Bash Glob Grep"` (trims tools[] ON THE WIRE, unlike
+> `--allowedTools` which only gates permissions) + `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
+> `chatty-dev` scenario (14 conversational msgs incl. pure-chat turns → 26 API
+> round trips, identical convo both arms): FAT 929,182 tok / $0.37 vs LEAN 253,289
+> tok / $0.18 = **−72.7% tokens, −50% USD, SAME work done (same 4 tools used, no
+> errors).** Deadweight = 24,273 tok/turn × 26 = **631,098 tok re-shipped in one
+> 14-message chat** — and it SCALES with chattiness. Token saving (−72.7%) > USD
+> saving (−50%) because post-turn-1 deadweight is cache_read @ 10% — the thesis in
+> dollars: "cached" junk still bills 10% of something that should be 0, every turn.
+> Sessions: fat 4bcf519f / lean a0f0c609 (logs_chatty). Scenario: `experiments.py
+> chatty-dev`; `run_turn` now supports `tools=`(--tools) + `extra_env=`.
+> **★ SC GATE GENERALIZED to multi-tool / batched terminal turns (2026-06-03).**
+> The gate was `len(tool_uses)==1`; the principled criterion is TOOL TYPE, not
+> count: an authored mutation's result is info-free, so N parallel Writes are as
+> elidable as one — fire iff EVERY tool_use is in SHORTCIRCUIT_TOOLS (a Read/Bash
+> mixed in returns info the model must see → don't elide), every tool_result
+> succeeded, sentinel present. VALIDATED on tf-build: SC fired on a 3-parallel-
+> Write turn AND a 2-Write turn (`#3 x3 Write→SC!`, `#9 x2 Write→SC!`), no loop,
+> terraform validate passed, −32.9%. So SC now COMPOSES with batching instead of
+> competing. ⚠ Two fixes were needed to get here: (a) added an IDEMPOTENCY GUARD
+> (`_SC_FIRED`, fire-once per frozenset(tool_use_ids)) — the canned-ack gate is
+> stateless, so any CLI re-send would otherwise re-fire forever (observed a 10×
+> infinite loop, err=True); the guard caps a re-send at one upstream fall-through.
+> (b) FIXED A SELF-INFLICTED KeyError: the gate return key was renamed tool→tools
+> but the handler's log-`print` still read `sc['tool']`, throwing AFTER the log
+> files were written but BEFORE `return StreamingResponse` → CLI got a 500 and
+> re-sent. THAT (not any CLI race) was the "non-deterministic re-send" that broke
+> a spec-build run (SC fired 3× but parent_turns stayed 6, no saving). After the
+> fix spec-build is back to clean 6→3 / −49.5%. LESSON: a synthetic-response
+> handler that crashes post-log/pre-return looks exactly like flaky CLI behavior —
+> check your own exception path before blaming a race. (NOTE: this likely also
+> reframes the older "relay is buggy on builds" #8 note — relay's tid-pop was just
+> implicit idempotency absorbing the same re-send; revisit if relay is ever wanted.)
+> **SENTINEL CHANGED `<DONE>` → `<sc_done>` (2026-06-03)** — less likely to occur in
+> normal prose. It's env-driven (`SHORTCIRCUIT_DONE`), so set
+> `SHORTCIRCUIT_DONE='<sc_done>'`; scenarios + the logproxy prompt fallbacks now use
+> `<sc_done>`. Historical `<DONE>` mentions below are left as-is (those sessions
+> literally used the old token).
+
+## What this project is
+
+`logproxy.py` is a **transparent analytical forward-proxy** between the `claude`
+CLI and `https://api.anthropic.com`. The CLI is pointed at it via
+`ANTHROPIC_BASE_URL`. It forwards bytes verbatim and **captures** every
+request + response so we can study agentic traffic. **Primary mission: find and
+price context waste; stay non-intrusive (no visible overhead).** Secondary:
+reliable cost tracking; discover useful response data.
+
+## The thesis we proved (with live data)
+
+**Cost is context carriage, not "the model thinking."** Across an 18-turn
+trivial session: context carriage (input+cache_read+cache_write) = **$2.72**;
+actual model output (950 tokens) = **$0.07**. Carriage is **38× the cost / 618×
+the tokens** of the work. `cache_read` = the *same ~38k context re-shipped every
+turn* (the "sent over and over"). Steady-state warm turn: ~93% of cost is just
+re-reading cached context; ~62% of that is **deadweight** (loaded-but-unused
+tools + agent roster).
+
+Key corollaries, all measured:
+- **"Cached so it's cheap" is backwards.** The right baseline for junk context
+  is *zero*, not its uncached price — so cache bills you 10% of something that
+  should be 0, *every turn, forever*. Cached content is **still fully in the
+  payload** (we verified: a turn with `cache_read=38,261, input=2` still
+  physically ships all 31 tool schemas, ~105KB). Caching discounts compute
+  price only — NOT bandwidth, NOT context-window occupancy/attention.
+- **Deadweight is real:** a "2+2" turn loaded **31 tools (~23k tok), used 0**
+  (`tool_uses=[]`), plus a ~2.4k-tok "Available agent types" roster — all cached
+  & re-read every turn.
+
+## Code state (logproxy.py) — what's been built
+
+1. **Per-session output dirs.** `LOG_DIR/<session_id>/` for `messages`;
+   `LOG_DIR/_no-session/` for count_tokens/probes; `LOG_DIR/_totals.json`
+   global + `<session>/_session.json` per-session. Files:
+   `<seq>-<agent>-<role>-<model>-<HHMMSS>.{request.json,response.json,response.sse}`.
+2. **All disk I/O off the hot path** — single background daemon writer thread +
+   queue (`_writer_loop`, `_enqueue_json/_enqueue_bytes`). Handler only parses +
+   enqueues. `atexit` flush. This is the "non-intrusive" requirement.
+3. **session_id parsing** (`_session_ids`): it's nested — `metadata.user_id` is
+   itself a JSON string `{"device_id","account_uuid","session_id"}`.
+4. **Inbound transport capture**: `client` (host:port) + `request_headers`
+   (secrets redacted via `_SECRET_HEADERS` / `_safe_headers`).
+5. **EXPERIMENTAL injection** (off by default). `_decide_injection` picks what to
+   append to the last **user** message (scans backward — `messages[-1]` is often a
+   trailing system catalog, not the prompt). Two modes:
+   - `INJECT` set → **unconditional** append every turn (legacy piggyback testbed).
+   - `INJECT_MARKER` set → **marker-gated**: append `INJECT_TEXT` (default
+     "Also, what is 23 × 19?", sep `INJECT_SEP`) ONLY when the user's prompt
+     contains the marker substring (e.g. `Math:`). Lets the human opt a turn into
+     enhancement via a natural keyword; mundane turns pass through untouched.
+   - `INJECT_FILE=<path>` set → **volunteer-context**: append the file's CURRENT
+     on-disk contents (read fresh, ≤`INJECT_FILE_MAX_BYTES`) as an authoritative
+     `<system-reminder>` — but ONLY on genuine prompt turns (last user msg has
+     text), NOT on tool_result continuation hops. Priority: file > marker > INJECT.
+     `INJECT_FILE_NOTE` (optional) folds an operating instruction into that
+     system-reminder — e.g. "you have the exact bytes, edit via Bash not Edit" —
+     which is how `mutate-bypass` collapses the mutation Read (see SKIP-THE-READ).
+   Re-encodes only when it actually changes. Logs an `injection` record
+   (`reason`, `marker`, `original_last_user`, `final_last_user`) in request.json.
+   NOTE: the marker fires on EVERY request whose last user text contains it —
+   including the CLI's separate haiku "title generation" meta-call (it embeds the
+   prompt). Scope to `role==parent` downstream if a scenario needs only the main turn.
+
+6. **EXPERIMENTAL response mutation** (off by default) — edits what comes BACK,
+   not just the request. `RESP_APPEND` adds a text_delta into the LAST text block
+   (concatenates onto the visible answer); `RESP_REPLACE="old\x1fnew"` swaps text
+   inside every text_delta. Implementation: buffer the full SSE, rewrite at
+   event granularity (`_mutate_sse`/`_data_of`), emit once (loses streaming —
+   fine for experiments). Writes `<stem>.response.mutated.sse` + a
+   `response_injection` note. MUST target TEXT blocks, never THINKING (block 0
+   was thinking in tests; thinking blocks carry signatures — leave them alone).
+
+   **PROVEN (2026-06-02): the CLI accepts altered responses with ZERO pushback**
+   — no signature/integrity check on text. REPLACE: model said "Paris" → proxy
+   "LONDON" → CLI displayed "LONDON", is_error=false. APPEND: "hello world" →
+   "hello world [proxy-appended]". **And response edits PERSIST into the
+   transcript** (asymmetry vs request injection, which desyncs): a turn-2 resume
+   asked "what did you just tell me?" and the model answered "LONDON" — it
+   believes it said the altered text. So response mutation is DURABLE
+   conversation state, whereas request injection is transient. (This reopens the
+   transcript/readFileState-seed question we'd written off — the transcript now
+   reflects proxy-altered content.)
+
+7. **EXPERIMENTAL turn short-circuit** (off by default) — elides the post-edit
+   "wrap-up" round trip. Why it exists: a response containing a `tool_use` always
+   gets `stop_reason:"tool_use"` (= "run this, I'll continue"), so even a
+   SUCCESSFUL TERMINAL edit STILL costs a whole turn just to hear the model say
+   "Done." The wire format has NO "last action" flag — that trailing turn
+   re-ships the full context (~one cache_read carriage, ~34.9k tok) to produce a
+   ~20-tok ack. We supply the missing affordance: `SHORTCIRCUIT_DONE=<sentinel>`
+   (e.g. `<DONE>`) enables it; `SHORTCIRCUIT_ACK` (default "Done.") is the
+   synthetic reply; `SHORTCIRCUIT_TOOLS` is the terminal-tool allowlist.
+   `_shortcircuit_decision` fires ONLY when the request is the tool_result
+   continuation of a single SUCCESSFUL terminal tool_use whose preceding
+   assistant message carries the sentinel in TEXT, with matching tool_use_id.
+   Then `_synth_end_turn_sse` builds a valid end_turn SSE and the handler RETURNS
+   IT WITHOUT CALLING UPSTREAM (logs a `shortcircuit` record, `response.json`
+   has `billing:null`). The edit already happened client-side before this
+   request, so nothing is lost but the round trip. Refuses to fire on an ERROR
+   tool_result (model must react). **VALIDATED (2026-06-02, `shortcircuit`
+   scenario):** CLI transparently accepts the fully-synthetic end_turn (same as
+   the LONDON finding); fired 1/1 with the forceful prompt, docstring correct,
+   file intact, wrap-up turn = 0 tokens, API saw 1 parent turn not 2.
+
+   **VALIDATED INTERACTIVE (2026-06-02, live `claude` on :7803, 2-edit session):
+   it CHAINS.** Edit#1 → SC fired (synthetic "Done."); follow-up turn → model
+   (a) correctly RECALLED what it changed (synthetic "Done." did not corrupt its
+   history sense), (b) AUTO-CARRIED the `<DONE>` protocol from conversation
+   history without being re-instructed, so Edit#2 also emitted text+`<DONE>` →
+   **SC fired AGAIN, stacking on top of the prior synthetic turn**, no corruption.
+   Caching unharmed: the edit turn AFTER a short-circuit still hit the prefix
+   cache (`cache_read` = the cold prefix from the first edit). So: teach the
+   convention once, elide every terminal-edit wrap-up thereafter. Combined with
+   `@file` (collapses the Read), a plain 3-turn edit task (Read→Edit→Done) drops
+   to 1 real parent turn ≈ **−66% carriage** in this minimal session (each turn
+   re-ships ~equal ~35k; the absolute saving is "2 deleted round trips," so the
+   % shrinks as a session lengthens). NOTE the CLI fires its own tiny title-gen
+   meta call(s) that EMBED the prompt (out~16 tok) — constant overhead, ignore.
+
+   **THREE-WAY INTERACTIVE A/B MEASURED (2026-06-02, identical 2-task session:
+   docstring + comment-above-fn, haiku):**
+     - baseline (plain path, no SC): 2 Reads, 6 work turns (Read→Edit→Done ×2),
+       **206,170 tok**
+     - `@` only (no SC):             0 Reads, 4 work turns (Edit→Done ×2),
+       **137,807 tok**
+     - `@` + shortcircuit:           0 Reads, 2 work turns (Edit ×2),
+       **70,149 tok**
+   File correct in all three. The two levers are CO-EQUAL HALVES (each deletes 2
+   turns of ~34k):
+     - `@` removes the 2 Read turns:        206,170 → 137,807 = **−68,363 (−33.2%)**
+     - SC removes the 2 wrap-up turns (atop `@`): 137,807 → 70,149 = **−67,658
+       (−49.1% of the @-only cost; −32.8% of baseline)**
+     - combined: **−136,021 = −66.0%**.
+   Takeaway: `@` (free, native, zero-risk) buys the first ~33%; SC (proxy,
+   assume-success tradeoff) buys the second ~33%. `@`-only is the safe sweet spot;
+   SC is the extra third you pay a little correctness risk for. Sessions:
+   baseline 71bfe025, @-only 6aa81a3b, @+SC 2754aab8 (logs_inject).
+
+   **THE HARD PART IS THE SIGNAL TIMING, not the mechanism (key finding).** With
+   extended thinking on, the model emits `[thinking, BARE tool_use]` at edit time
+   — NO text block — and writes `<DONE>` only on the WRAP-UP turn (the very turn
+   we want to elide). I.e. **the model naturally REFUSES to declare "done" before
+   it sees the edit succeed** — empirically the same correctness boundary we
+   reasoned about. A light "say <DONE> when finished" note ⇒ 0 fires. To win you
+   must FORCE a text block carrying the sentinel in the SAME message as the Edit
+   AND tell it to ASSUME success (predict terminality, don't confirm it) — that's
+   the `_SC_NOTE` protocol prompt in experiments.py. Tradeoffs: (a) you're now
+   asking the model to predict success — safe only for atomic single edits; (b)
+   the sentinel shows in the user-visible text of the edit turn (cosmetic; a
+   production client would STRIP it while tracking the tool_use_id in memory to
+   keep detection — can't strip via wire-history since the CLI replays the
+   stripped text); (c) you replace the model's real post-edit SUMMARY with a
+   canned "Done." — ceremony for automation, mild value for an interactive user.
+   Also note: thinking blocks are STRIPPED from replayed history (the assistant
+   msg the detector sees on the wrap-up request is just `[tool_use]`), so the
+   sentinel MUST be in a real text block, never thinking.
+
+8. **RELAY mode** (`SHORTCIRCUIT_RELAY=1`, requires `SHORTCIRCUIT_DONE`) — instead
+   of a canned "Done.", REPLAY the model's OWN pre-written summary. Justified
+   because for an authored mutation like `Edit` the success result is
+   INFORMATION-FREE: the model already knows the post-edit file byte-for-byte
+   (it wrote old→new); the result is just a pass/fail bit (and we gate on it).
+   `_relay_capture_and_strip` (edit turn): if the response has one terminal
+   tool_use + a text block with the sentinel, STASH the cleaned prose keyed by
+   `tool_use_id` and REMOVE that text block (reindexing later blocks — must
+   REMOVE, not blank: an EMPTY text block → API 400 "text content blocks must be
+   non-empty" when replayed). `_shortcircuit_relay_decision` (wrap-up): on a
+   SUCCESS tool_result whose id we stashed, replay the prose; on ERROR, discard +
+   forward normally. This also lets us STRIP the sentinel cleanly (detection is
+   by id, not by reading `<DONE>` from history) → nothing leaks to the user.
+   VALIDATED interactively: clean past-tense summary appears once, 0 API trip.
+   **UX CHARACTERISTIC (live A/B, 2026-06-03):** the relayed text is the model's
+   DISPATCH-TIME summary (authored as it issued the Edit, BEFORE seeing the result),
+   whereas a non-proxy baseline summarizes on the wrap-up turn WITH the result in
+   hand. Observed: proxy "Added a module-level docstring to sample.py." vs baseline
+   "Added a module-level docstring … describing the helpers and the script's CLI
+   behavior." So relayed summaries skew TERSER / less final-state-grounded — a
+   plausibly SYSTEMATIC bias (pre-result authoring) on top of sampling noise; n=1
+   can't separate them. Cosmetic, both correct; if it ever matters, drop RELAY (use
+   canned ack) or let that one wrap-up run. Do NOT record as "proven identical."
+   **⚠ RELAY IS BUGGY ON MULTI-STEP / RESUMED BUILDS — DO NOT USE IT THERE; use
+   canned-ack SC (2026-06-03).** On the spec-build sonnet run, relay's edit-turn
+   STRIP (removing the sentinel-bearing text block from the dispatch response the
+   CLI sees) makes the CLI REJECT the subsequent relay-synthetic end_turn and
+   RE-SEND an IDENTICAL tool_result continuation (verified: requests 004 & 005 both
+   `last_role=user blocks=[tool_result] nmsgs=3`). The proxy already popped the
+   tid on the first fire, so the duplicate falls through UPSTREAM → a real wrap-up
+   turn anyway → SC "fired" 2× but parent_turns stayed 6 and tokens went UP +0.8%.
+   The CANNED-ACK path (no strip) does NOT duplicate: same build, relay OFF →
+   6→3 turns, 3/3 fired, −49.5% tok. ROOT CAUSE (unconfirmed but strongly implied):
+   the strip leaves the dispatch assistant msg as `[tool_use]`-only in the CLI's
+   view, and the relay-synthetic end_turn that follows is rejected/retried by the
+   headless CLI; the trivial single-`-p` canned path never strips so never trips it.
+   TODO if relay UX is ever wanted on builds: capture the duplicate-trigger (diff
+   the relay-synthetic SSE vs a real end_turn the CLI accepts) — but canned-ack is
+   the clean default and loses only the model's own-prose summary (cosmetic).
+
+9. **DELIVERY / UX of the protocol (how to make it invisible) — measured.** The
+   hard part is reliably getting the model to emit the summary+sentinel AT
+   DISPATCH (same message as the Edit). Governing principle: **the signal must be
+   framed as a THIS-TURN output-format directive, not a post-tool condition** —
+   anything that reads as "when the tool completes/ after it returns" makes the
+   model DEFER `<DONE>` to the wrap-up turn (too late, the turn we wanted to cut).
+   Fire rates (plain user prompt; protocol delivered via the named channel):
+     - `SHORTCIRCUIT_INSTRUCT` (tail-append to USER msg, imperative "in the SAME
+       msg, FIRST write past-tense summary + `<DONE>`, assume success"):
+       **sonnet 3/3. HAIKU 0/5 under the controlled harness (2026-06-03)** — the
+       earlier uncontrolled "haiku 2/4" does NOT reproduce; with adaptive thinking +
+       @-inlined + this phrasing, haiku emits a future-tense preamble ("I'll add…")
+       then a bare Edit, and only says "Done. Added…" on the wrap-up turn — the
+       sentinel is deferred every time. Generic/conditional phrasing: haiku 0/5 too.
+     - `SHORTCIRCUIT_TOOLPATCH` (append protocol to the Edit tool's DESCRIPTION
+       in tools[]): **DE-CONFOUNDED via a CONTROLLED A/B (2026-06-03): sonnet
+       toolpatch 0/3 vs instruct 3/3 — the tool description is NOT a viable home;
+       PLACEMENT is the cause, not phrasing.** I ran BOTH channels through the SAME
+       harness (`experiments.py shortcircuit-toolpatch --model claude-sonnet-4-6
+       --delivery {toolpatch|instruct}`): identical model, adaptive thinking,
+       @-inlined prompt, plain user prompt, SAME dispatch-imperative protocol text
+       (bullet: "- Whenever you use this tool, you MUST, in the SAME message as the
+       tool call, also write a one-line past-tense summary … end with `<DONE>`; do
+       NOT put it in a later message; assume the call will succeed"). The ONLY
+       variable was the channel. Both verified on the wire (`patched_on_wire=True`).
+         · toolpatch → **0/3**, ~69.4k tok/trial. Edit turn = `[thinking, BARE Edit]`,
+           text block EMPTY; summary+`<DONE>` deferred to the WRAP-UP turn (too late).
+           Decoded the edit-turn SSE: thinking was just "The user wants me to add a
+           docstring" — **the patched bullet never even registered in the model's
+           reasoning** (not deferred-on-purpose, simply unseen as an output rule).
+         · instruct → **3/3**, ~34.8k tok/trial (HALF — wrap-up elided). Edit turn
+           carries TEXT+`<DONE>` in the SAME message as the Edit; SC fires.
+       So a SAME-MESSAGE OUTPUT-COMPOSITION directive (emit a sibling text block +
+       sentinel) must live in the CONVERSATION channel (user/system msg, as INSTRUCT
+       does), NOT bound to a tool. ⚠ DROP the earlier "getPreReadInstruction proves
+       the description is a working channel" argument — it's WEAK: that read-first
+       bullet is obeyed because it's a CLIENT-ENFORCED HARD GATE (errorCode 6 if you
+       skip the Read), not because description prose compels soft behavior. The
+       description reliably carries tool MECHANICS / enforced PRECONDITIONS, not
+       unenforced output-format requests. Sessions: toolpatch 5e7a63f0/fb6ddbe9/
+       53a509fa, instruct 8edc86ff/f258ba1d/c04e9e7e (logs_inject);
+       `_sc_toolpatch_*.json`. (Code kept, off by default — toolpatch is now the
+       negative control.)
+     - `SHORTCIRCUIT_SYSPATCH` (append protocol to the SYSTEM prompt, stable
+       position / cache-riding, enumerating the terminal tools): **sonnet 3/3, AND
+       cache-stable — THE BEST DELIVERY (2026-06-03).** Same controlled harness
+       (`--delivery syspatch`), only the channel changed. Fired 3/3, ~34.8k tok
+       (halved, wrap-up elided), files correct. Cache proof (the whole point):
+       inject the SAME text in the SAME position every turn → it joins the prefix:
+       trial1 edit-turn `cw1h=5513` (one cold write of the new region) → trials 2&3
+       edit-turn `cache_read=34055, cw1h=0` (FULLY WARM, nothing rewritten). So a
+       stable system injection costs one cold write then rides as cache_read
+       forever — zero invalidation, exactly like all the re-shipped carriage.
+       Sessions: 4bde32ad/34aa43f5/dfaae95c (logs_inject). **HAIKU: syspatch 0/5
+       too (2026-06-03)** — same deferral as instruct; the system channel does NOT
+       rescue the weaker model. Sessions 1abca4f9/bef4fb60/0d9ed589/d9bdb11f/87caa4c8.
+   Two practical rules: **(a) it's NOT a simple capability ladder — it's whether the
+   model FRONT-LOADS the summary at dispatch vs DEFERS it.** Grid: sonnet syspatch
+   3/3, instruct 3/3, toolpatch 0/3; HAIKU syspatch 0/5 + instruct 0/5 (defers).
+   **⚠ OPUS DEFERS TOO (485ba3b3, live interactive, syspatch+relay, n=1, thinking
+   adaptive): SC fired 0×.** Opus emitted `[thinking, bare Edit]` then put
+   "Added… <DONE>" on the WRAP-UP turn (the `<DONE>` even showed to the user;
+   relay couldn't strip it — nothing captured at dispatch). 2 full ~38k turns,
+   ~78,027 tok, no saving. So COUNTERINTUITIVELY only SONNET reliably front-loads
+   under "assume success"; the more-careful opus (and weak haiku) both refuse to
+   declare done pre-result with extended thinking ON. LIKELY LEVER = THINKING MODE
+   (adaptive thinking → [thinking, bare tool_use] → deferral); thinking-OFF opus
+   is the obvious UNTESTED retry before concluding "opus can't." Don't assume the
+   sonnet win transfers up the ladder — VERIFY per model (and per thinking mode).
+   **(b) a miss is FREE** — no
+   `<DONE>` just yields the normal wrap-up,
+   no error/corruption, so partial fire-rate = partial savings, never breakage.
+   **SCOPING DECISION (2026-06-03): don't bother injecting on haiku — target
+   deep-thinking expensive models.** Savings scale with per-turn carriage cost: the
+   elided wrap-up turn re-ships the full context AND (on a thinking model) would
+   burn a thinking budget to produce a one-line "Done." On haiku a saved turn is
+   cheap, so least to gain; on Opus/extended-thinking it's where extra round trips
+   actually hurt. SC is a HIGH-END optimization. NOTE the haiku 0/5 may be an
+   ARTIFACT of `thinking:adaptive` in our headless harness (forces [thinking, bare
+   Edit] → deferral); the human's INTERACTIVE haiku sessions DID fire — likely
+   thinking-off and/or auto-carry from a multi-edit history and/or more forceful
+   hand-typed phrasing. So "haiku can't fire" is really "haiku-with-adaptive-
+   thinking-in-a-single-shot didn't"; thinking-OFF haiku is plausibly fine but
+   UNTESTED and not worth chasing (no savings there anyway).
+
+10. **⛔ SUPERSEDED (2026-06-03) — the "SC gain does NOT generalize to builds"
+    conclusion below is WRONG; it was under-prompting + a relay bug. With the
+    blunt-prohibition syspatch (see #9) + CANNED-ACK SC (relay OFF, see #8),
+    spec-build sonnet fires 3/3 on every step, 2 alternating reps, 6→3 turns,
+    −49.5% tokens, build correct (sessions da3b2b59/49c00818 baseline,
+    43d57a7f/1517f2ae optimized). The original #10 text is kept below as the
+    record of HOW we were fooled (it correctly nailed the cache-order USD trap and
+    the run-path variance — those lessons STAND; only the "inert on builds"
+    verdict is reversed). The NEXT-thread anchoring diagnosis at the bottom of #10
+    was RIGHT (it's anchoring, not capability) and is now RESOLVED by the prompt.**
+
+    **REALITY CHECK [HISTORICAL, NOW REVERSED] — the SC gain does NOT generalize to real multi-step builds
+    (2026-06-03, `spec-build` scenario, sonnet).** Same model, same 3-step build
+    (create bank.py [Write] → add transfer() [Edit] → create test_bank.py [Write]),
+    one resumed session, two arms (clean vs syspatch+relay SC). **SC fired 0/3 even
+    on SONNET** → total tokens FLAT (+0.4%, noise); both arms passed an objective
+    acceptance check. WHY: on a non-trivial step the model narrates intent in the
+    SAME message as the tool call ("Writing `bank.py`…", present tense, NO sentinel)
+    and defers the past-tense summary+`<DONE>` to the wrap-up turn — the same
+    deferral as opus/haiku. The toy single-edit 3/3 win fired only because the task
+    was trivial enough to front-load; **substantive steps re-trigger deferral.** So
+    the gentle default syspatch protocol buys ~nothing on realistic work; winning
+    there would need forceful front-load prompting (the `_SC_NOTE` style) + accepting
+    assume-success risk on multi-tool steps — diminishing returns, real risk.
+    **MEASUREMENT TRAP (important, burned us): never trust USD from a back-to-back
+    A/B.** First run = COLD prefix (cache_write_1h @ $6/Mtok); the second arm
+    inherits the warm shared prefix (cache_read @ $0.30/Mtok, 20×cheaper) → a fake
+    "−59% USD" with IDENTICAL tokens. Arms share the backend prefix cache; whoever
+    runs second freeloads. TOKENS are warmth-invariant = the truth; USD is
+    order-sensitive. Fix in `spec-build`: ALTERNATE arm order across reps (needs
+    reps≥2) + print cw/cr split + flag USD. Sessions 4c44b93c (baseline) / d14285d2
+    (optimized). RECONFIRMS the project mantra: token breakdown is truth, est_usd
+    misleads.
+    **OPUS run (f37597d2 vs 97de67ee) — SC 0/3 again, AND a textbook MIRAGE:** the
+    tool reported "−12.1% tok / −59.6% USD, optimized WINS" — ALL ARTIFACT. SC fired
+    0× (inert), so it can't be the optimization. The −12% was ONE extra turn the
+    baseline happened to take (it ran tests, fumbled `python` vs `python3` → TWO Bash
+    turns vs optimized's one = ~one ~40k-tok turn = the whole gap); the −59% USD piled
+    the cache-order artifact on top (baseline cold cw1=36878 vs optimized warm
+    cr=35260). LESSON: single-rep build A/B is dominated by run-path VARIANCE +
+    cache order; a "saving" with sc_fired==0 is ALWAYS noise. Verdict logic now
+    SC-AWARE: if 0 fires it declares the optimization INERT and the delta noise.
+    Need reps≥2 (alternating) AND nonzero fires before believing any build saving.
+    **NEXT (open thread) — SHARPENED DIAGNOSIS (don't repeat my "edit-only"
+    pessimism): on builds the model is NOT refusing to put text beside the tool
+    call — it puts the WRONG TENSE there.** Evidence (opt step1): Write turn text =
+    "Writing `bank.py`…" (FORWARD-looking intent, no `<DONE>`); wrap-up text =
+    "Created `bank.py`… `<DONE>`". (Step2 went bare.) So it's the model's native
+    "announce intent → act → confirm" rhythm out-anchoring our instruction — an
+    ANCHORING gap, NOT a capability wall (it front-loaded fine on the trivial edit).
+    It proved it CAN emit text+sentinel beside a tool_use. Levers to try, best-first:
+    (1) CO-OPT the narration — "whatever you'd say about this change, phrase it as
+    ALREADY-DONE, same message as the call, end `<DONE>`" (redirect, don't fight);
+    (2) explicitly BAN the forward preamble ("no 'I'll…'/'Writing…'; only the
+    past-tense summary + `<DONE>`"); (3) FEW-SHOT one example message
+    (text+`<DONE>`+tool_use) in the syspatch block — likely the biggest win;
+    (4) pin down THINKING's role (bare-tool variant smells like adaptive thinking
+    eating the text block; the proxy CAN rewrite the `thinking` field → test
+    thinking-off/low-budget as a controlled var, quality caveat). Then
+    `spec-build --trials 2` (alternating) for a clean number once it fires.**
+   **THE GOVERNING AXIS — CORRECTED (2026-06-03, full 3-channel controlled A/B on
+   sonnet, identical conditions, only channel varies): toolpatch 0/3, syspatch 3/3,
+   instruct 3/3.** My earlier "in-turn fires / standing-rule defers" axis is WRONG —
+   syspatch is a FRONT-OF-PREFIX STANDING rule and it fires 3/3. Recency, cache, and
+   prefix-position are NOT the discriminator (toolpatch and syspatch are both
+   front-of-prefix + cached; one fails, one wins). **The real axis: the model OBEYS
+   a behavioral directive delivered in a CONVERSATION CHANNEL (system prompt OR user
+   message) but IGNORES one bound to a TOOL'S DESCRIPTION** — it scopes a tool desc
+   to "how to use THIS tool" (mechanics/preconditions), not "how to compose this
+   assistant message." **WINNER = SYSPATCH (system-prompt delivery):** fires like
+   INSTRUCT, but ALSO (a) cache-rides (stable front-of-prefix, cache_read after the
+   first turn), (b) lives where behavioral rules belong (system, not jammed into the
+   user's question → no user-msg desync), (c) is invisible to the user, (d) states
+   the rule once/turn and enumerates the target tools. Use SYSPATCH; INSTRUCT is the
+   proven fallback; TOOLPATCH is the negative control. (A real client would ship
+   this in its system prompt — exactly what syspatch simulates.)
+   **★ PROMPT STRENGTH IS THE LEVER FOR BUILDS (2026-06-03), and the axis is BLUNT
+   PROHIBITION vs GENTLE RATIONALE — not politeness.** Controlled on sonnet, same
+   syspatch channel, ONLY the wording changed:
+     - GENTLE/RATIONALE prompt ("...right after the tool call... success tells you
+       nothing you don't already know, so there's no reason to wait; if it fails
+       you'll get the error and can act on it then") → **0/3 even on the TRIVIAL
+       single edit** (regressed the case that used to fire!). Why: "right after the
+       tool call" reads TEMPORALLY (= next message); "if it fails you can act then"
+       explicitly LEGITIMIZES a post-result turn (hands the model its escape hatch).
+       Gentle rationale = permission to defer.
+     - BLUNT-PROHIBITION prompt (the current `_DEFAULT_SC_SYSPATCH`): "every time you
+       call one of these tools the SAME assistant message MUST ALSO contain a text
+       block with a one-line PAST-TENSE summary ending `<DONE>`; NEVER send one of
+       these tool calls in a message by itself; NEVER put the summary in a later
+       message; do NOT wait for the result; do NOT write forward-looking narration
+       ('I'll add…'/'Now writing…'); assume success" + a worked EXEMPLAR (a text
+       block "Added … <DONE>" shown alongside an `Edit(...)` call) → **TRIVIAL 3/3
+       AND BUILD 3/3** (sonnet). The exemplar + the explicit "no lone tool call" +
+       "no forward narration" are what cracked the build (the old gentle prompt's
+       failure mode was forward-tense narration "Writing bank.py…" or a bare
+       tool_use; this prompt bans both and shows the target shape).
+   Takeaway: the model is fully CAPABLE of co-emitting text+tool_use on substantive
+   steps — earlier "it defers on builds" was UNDER-PROMPTING, not a wall. Phrase the
+   directive as a hard SAME-MESSAGE OUTPUT-COMPOSITION rule with an exemplar; never
+   give it temporal/"after"/"if-it-fails-react" language (that invites deferral).
+
+`analyze_tools.py` — offline tool-utilization ledger (keys off file CONTENT, so
+works on any layout/history). `python3 analyze_tools.py <dir> --by role|session
+[--min-turns N]`. Loaded-vs-called per tool, prices deadweight. Only 200
+responses count as "ran ok" (errors aren't evidence of disuse).
+
+## Hard technical facts we learned (don't re-derive)
+
+- **Message structure:** user's prompt is in `messages[0]` (a system-reminder
+  text block + the actual question text block). A `role:system` catalog
+  ("Available agent types…", ~7k chars / ~1.7k tok) is appended **after** it.
+- **New CLI (claude-cli 2.1.x) emits NO `count_tokens`** — only `messages`. So
+  `_no-session` is mostly just `/` health probes now (the historic 254
+  count_tokens were an older sonnet CLI).
+- **Cache tiers differ by lifecycle:** main agent caches at **1h** (2×, durable
+  for think-time); **subagents cache at 5m** (1.25×, cheaper, ephemeral). Set
+  via `cache_control` breakpoints in the payload (1h has `ttl:'1h'`; 5m omits
+  ttl).
+- **Caching is prefix-based.** Tail edits (last user msg) are cache-safe; system/
+  tools/history edits bust the cache downstream.
+- **Subagents share the parent's `session_id`** — a session dir is really a
+  *conversation tree* (parent + subagents). Distinguish them by `role`
+  (`_classify_role`) and tool set. So per-subagent analysis = group by
+  (session, role), NOT session alone.
+- **Subagent cache economics (measured):** 1st spawn of a type = COLD (writes
+  its own ~9–10k shell). Re-spawn SAME type within 5m = WARM (`cache_read` hit,
+  ~4.7× cheaper). New/different type = COLD again. Plan shell=9 tools, ~9,195
+  tok; general-purpose=12 tools, ~10,235 tok; `claude`/general-purpose grant
+  `*` (full ~31-tool set). Intermittent background spawns (>5m apart) cold-start
+  every time (5m TTL lapses) → cost-saving from cache reuse only happens for
+  bursty same-type spawns. Context-preservation benefit (main grows ~480 tok =
+  just the result) holds regardless.
+
+## Round-trip / injection findings (the active frontier)
+
+- **The real cost lever is round-trip reduction.** Agentic loops (read→edit→test)
+  re-ship the full growing context each hop. Two reducible classes:
+  - **Independent fan-out** → batchable as parallel `tool_use` in ONE response
+    (one response CAN carry multiple `tool_use` blocks; `meta.tool_uses` is a
+    list). The waste is when the model *serializes* independent calls.
+  - **Dependent chains** → NOT batchable (step N+1 needs step N's output); only
+    **speculation/injection** can cut these, at a correctness cost (the round
+    trip you delete *is* the verification step).
+- **PROVEN: payload piggyback works + the client does NOT police free-text
+  responses.** We injected "compute 3+3 → INJECTED-PROBE: 3+3=<result>" into a
+  "2+2" turn; model returned `2 + 2 = 4\n\nINJECTED-PROBE: 3+3=6`; the CLI
+  displayed it verbatim, no scrub/error. So: payload-inject → model-comply →
+  client-display is a clean pipeline (for the free-text path).
+- **State drift confirmed:** CLI's history keeps the original user text but
+  records the assistant's injected answer → conversation desyncs. Fine for
+  transient single-shot; compounds otherwise.
+
+## SKIP-THE-READ: RESOLVED (2026-06-02, `INJECT_FILE` + file-extract experiment)
+
+Built the `INJECT_FILE` "volunteer context" mode and ran it (proxy-experiments
+`file-extract`). Result splits by task type:
+- **Extraction/Q&A turn → WIN.** Volunteering the file as a tail system-reminder
+  let the agent answer with `meta.tool_uses == []` — it skipped `Glob`+`Read`
+  entirely. Clean round-trip collapse, no quality loss.
+- **Mutation turn → no win (can hurt).** Agent did `Edit`(fail)→`Read`→`Edit`.
+
+**The real gate (traced in CLI source, not the `old_string` match):**
+`FileEditTool.validateInput` checks `toolUseContext.readFileState.get(path)`
+BEFORE old_string — empty ⇒ `errorCode 6` "File has not been read yet" (behavior
+`ask`). `readFileState` is a **client-side cache written in 6 local spots
+(Read/Write/Edit/NotebookEdit/Bash/attachments), none on the API wire.** So a
+transparent proxy CANNOT forge it in a live session; the read-before-edit hop is
+a deliberate integrity invariant, not waste. The only bridge is
+`extractReadFilesFromMessages` on resume/seed paths (`restoreReadFileState`,
+headless `print.ts` "seed from transcript") — but it seeds from the CLI's LOCAL
+transcript, which (per our desync finding) never contains wire-injected content.
+⇒ **proxy-based forged-Read-pair is a predictable NULL; don't run it.** (Full
+mechanism + the exact forged-pair shape, for transcript-level use only, is in
+proxy-experiments/CLAUDE.md.)
+
+**BUT the mutation Read IS collapsible — by tool substitution, not wire forgery
+(`mutate-bypass` experiment, validated).** The gate is `FileEditTool`-specific;
+`Bash`/`Write` have no read-precondition. Volunteer byte-exact content +
+`INJECT_FILE_NOTE` = "you have the exact bytes, edit via Bash, no need to Read" →
+agent does `Bash`-only (0 Reads), edits correctly, **−32.6% tokens**. Cost: you
+trade away the read-before-edit integrity invariant (safe only while volunteered
+content is byte-exact & fresh) and must allow `Bash`.
+
+Even cleaner than the Bash-bypass: a **custom read-internally edit tool** (MCP
+`edit`, `proxy-experiments/mcp_update_server.py`) — the read-before-edit bounce is
+FileEditTool policy, so a tool that just reads the file itself removes the round
+trip AND keeps integrity (matches current bytes, fails loudly on mismatch).
+Initial run showed an edit-QUALITY regression, which I wrongly blamed on "tool
+unfamiliarity / missing-Read grounding." **RESOLVED: it was purely the tool
+DEFINITION.** A tool is just a name+description+schema the client ships (a prompt
+we control); there is nothing innate. We pulled the CLI's real `Edit` definition
+off the wire and gave our tool the same contract → **3/3 clean wins**: docstring
+correctly placed, file intact, 0 Reads, −31% tokens. The Read round trip is
+recoverable overhead, NOT load-bearing grounding.
+
+REFRAME: this is **prototyping a CLIENT optimization** (read buffer client-side,
+hand the edit tool the bytes, keep the checks, drop the model-facing Read turn).
+Proxy + MCP tool are stand-ins; conclusions transfer to a real client change.
+
+Mission takeaway: volunteering byte-exact context wins the round trip for BOTH
+read-only turns and mutation turns (~31-33%/turn) via tool substitution — no
+`readFileState` forgery needed. With a CLI-parity edit tool that reads its own
+buffer, mutation is a CLEAN win (no quality loss, no corruption risk); the Bash
+variant works too but trades the integrity invariant.
+
+**NATIVE ANSWER (use this, not the proxy): `@file`.** The CLI input pipeline
+reads `@path`, inlines it, AND writes `readFileState` (attachment processing is
+one of the 6 writers). So `@sample.py` → 0 Reads, Edit runs directly (gate
+satisfied), −33% tokens, fully safe. Validated (`at-mention`). Most of our
+injection backflips were reinventing `@`. Volunteering just the PATH (no `@`)
+does NOT help — the model still Reads. So: use native `@`/`!`/`/`/hooks for
+context & read-collapse; reserve the PROXY for what only a wire intermediary can
+do — turn-collapse (request piggyback) and DURABLE response mutation.
+
+## PROJECT SPLIT (2026-06-02)
+
+Driving experiments lives in a **separate sibling project**:
+`/Users/bogdan/projects/proxy-experiments/` (its own CLAUDE.md). proxy-lab = the
+mechanism (inspect + inject); proxy-experiments = scripts that drive `claude -p`
+through a proxy port and analyze the captures. Only coupling: the proxy port
+(`ANTHROPIC_BASE_URL`) and `LOG_DIR`. `experiments.py marker-inject|observe-baseline
+|reanalyze` is over there; it reads proxy-lab's `logs_inject/` by default.
+**FIRST live marker-inject result (session 36249f20, haiku):** LLM answered both
+Qs ✓; CLI didn't complain ✓; next-turn context DESYNCED (stored user msg kept
+original text, stored assistant msg kept injected answer); cache REUSED
+(cache_read=32390, tail injection did NOT bust the prefix). Details in the
+experiments project CLAUDE.md.
+
+## NEW WAY OF WORKING (do this instead of human-in-the-loop)
+
+The human was manually typing questions into a CLI = "slow proxy". **Self-drive
+with `claude -p` (headless)** pointed at the proxy:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:7800 claude -p "2+2" --model claude-haiku-4-5
+# tool-loop scenarios need permissions + a scratch dir, e.g.:
+#   --allowedTools "Read Edit Bash"  (or --permission-mode acceptEdits)
+#   --add-dir /tmp/scenario   and cd there / put a target file
+```
+- `claude -p` honors `ANTHROPIC_BASE_URL` and existing auth. **Real billed
+  calls** — use `--model claude-haiku-4-5` for cheap mechanic tests.
+- Each `claude -p` is its own session → its own `<session_id>` dir. Drive a
+  scenario, then read `logs_inject/<sid>/` + run `analyze_tools.py`.
+- Build a small scenario runner: write a target file in a scratch dir, fire
+  `claude -p "fix <file>"` through the inject-proxy, inspect whether the Read
+  was skipped.
+
+## Operational state at handoff (VERIFY before continuing)
+
+- **LAUNCH METHOD MATTERS (learned the hard way 2026-06-02):** a Claude Code
+  `run_in_background` Bash job is a CHILD of the CLI process — it is signaled
+  (SIGTERM) when the CLI exits ("Background work is running… will stop when you
+  exit"). 7800 was launched that way and got reaped on CLI exit (`proxy_inject.out`
+  ended in `Shutting down`). A proxy survives ONLY if detached into its own
+  session and reparented to launchd (PPID 1) — which is why 7799 lived.
+  **Always start proxies via `./start_proxy.sh`** (nohup + disown in a subshell);
+  it refuses to double-bind, then prints PID/PPID (PPID must be `1`). Do NOT
+  launch the proxy with the harness's background-run feature.
+- **Proxies (detached OS processes, PPID 1 — survive /clear + CLI exit):**
+  - `:7799` — OLD code (pre-session-split), the human's original. Leave alone.
+  - `:7800` — current code, **clean observer** (no injection), → `logs_live/`.
+  - `:7801` — current code, **marker injection** (`INJECT_MARKER='Math:'`), → `logs_inject/`.
+  - `:7802` — **experiment-managed dedicated port** (`--inject-port` default):
+    scenarios kill+restart it per-experiment via `start_proxy.sh`. As of 2026-06-03
+    the `chatty-dev`/`tf-build`/`spec-build` scenarios point it at **`logs_chatty/`**
+    (chatty) or `logs_inject/` and run it CLEAN (capture only, no injection).
+    Safe to kill anytime; scenarios relaunch it. Find/kill: `kill $(lsof -nP -tiTCP:<port> -sTCP:LISTEN)`.
+  - `:7803` — **SHORTCIRCUIT test port** (2026-06-02/03). WINNING config is now
+    `SHORTCIRCUIT_DONE='<sc_done>' SHORTCIRCUIT_SYSPATCH=1` (syspatch = system-prompt
+    delivery, best channel) with the STRONGER blunt-prohibition prompt baked into
+    `_DEFAULT_SC_SYSPATCH`. **DROP `SHORTCIRCUIT_RELAY` — it's buggy on builds
+    (duplicate continuation; see #8); canned-ack is the clean default.** → `logs_inject/`.
+    Relaunch: `PORT=7803 LOG_DIR=logs_inject SHORTCIRCUIT_DONE='<sc_done>' SHORTCIRCUIT_SYSPATCH=1 OUT=proxy_7803.out ./start_proxy.sh`.
+    (Prior INSTRUCT-delivery config also works; syspatch is preferred — see #9.
+    For relay-UX experiments only, add SHORTCIRCUIT_RELAY=1 — but expect 0 build savings.)
+    Use a CAPABLE model (sonnet/opus) — haiku does NOT fire. Safe to kill.
+  - All verified PPID 1 at session end.
+- **Dirs:** `logs/` (old historical, flat layout), `logs_live/` (clean multi-turn
+  session f0fe41c7 — the 38× carriage data, 3 subagent spawns), `logs_inject/`
+  (injection + SC tests), `logs_chatty/` (2026-06-03 — chatty-dev tool-trim
+  measurements + the 3-probe tool-size breakdown; fat 4bcf519f / lean a0f0c609).
+- **Scenarios added this session (in proxy-experiments/experiments.py):**
+  `chatty-dev` (THE headline tool-trim experiment — see ★★), `tf-build` (S3 module
+  multi-file build; shows native batching + SC-vs-batching), `spec-build`
+  (bank.py 3-step; the clean SC −49.5% case). `run_turn` gained `tools=`(→`--tools`,
+  trims wire tools[]) and `extra_env=`. `spec-build` gained `--relay` (opt-in;
+  off by default since relay is buggy on builds). Fire-rate: `shortcircuit-toolpatch
+  --delivery {toolpatch|instruct|syspatch}`.
+- Prices in `logproxy.PRICES` / `analyze_tools.PRICES` are approximate opus/
+  sonnet/haiku list rates; `est_usd` is derived, the token breakdown is truth.

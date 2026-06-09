@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+logs/
+logs_*/
+*.out
+warmth.sqlite*
+_canary/
