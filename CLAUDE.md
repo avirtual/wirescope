@@ -412,3 +412,32 @@ WIRE (captures: `logs_compact_warmth/7bc2d1d6-*/`):
   the already-in-context system prompt — a session started under model X keeps
   claiming to be X. Self-reports are context text, not weight introspection; trust
   the wire (`resolved_model`), not the label.
+
+### fable-probe (2026-06-09, first experiment on THE consolidated proxy)
+
+Scenario `fable-probe` in proxy-experiments (`--session <uuid>` re-verdicts free).
+Capture: `logs_main/b3618fc5-*`. Procedure: seed `logs_main/_canary` from the old
+`logs_compact_warmth/_canary` baselines (canary state is per-LOG_DIR and
+lazy-loads on first messages request — seed BEFORE first traffic), then one
+headless 4-tool fable-5 Write task through `:7800`. Verdicts:
+- **No new prompt for fable.** Headless main agent = same 3-block structure as
+  the seeded interactive baseline and as haiku: billing-header / "You are a
+  Claude agent, built on Anthropic's Claude Agent SDK." (62 ch) / interactive-
+  agent block (~6.7k ch), same 3-marker layout, 1h ttl on the headless main
+  agent too. Only deltas (offline fp diff): headless beta set DROPS
+  `context-1m-2025-08-07`, and the billing-header build stamp differs
+  (interactive `cc_version=2.1.170.3` vs headless `2.1.170.ba7`).
+- **Detector works end-to-end:** new (model|beta) namespaces fired `baseline`
+  exactly once, the follow-up request fired `match`; the offline
+  `_fp_diff_offline` (in experiments.py) pinpointed the deltas above.
+- **Transforms HOLD on fable headless:** `env_relocate` fired (`# Environment` +
+  `# currentDate` → tail reminder, userEmail-bundle fallback path — scratch cwd
+  has no CLAUDE.md), `system_strip` removed `# Session-specific guidance`
+  (528 ch), tool_sort idempotent no-op (already alphabetical). 3 markers, no 4th.
+- **NEW: per-session TITLE-GENERATOR side-call** (seq 2 of the session): 0 tools,
+  0 markers, own namespace (beta adds `structured-outputs-2025-12-15`), system =
+  "Generate a concise, sentence-case title (3-7 words)…", `cc_entrypoint=sdk-cli`.
+  Tiny but it's real traffic through the proxy — remember it when counting turns.
+- **Open item (e) root cause confirmed:** headless sys[1] says "Claude Agent
+  SDK", not "Claude Code" — that's the exact header `_classify_role` should also
+  accept to stop logging headless parents as `ext/unknown`.
