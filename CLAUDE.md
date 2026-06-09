@@ -92,6 +92,18 @@ Measured chatty 14-msg dev session: **−72.7% tokens, −50% USD, same work.**
 - **`@file`** — the CLI inlines it AND writes `readFileState`, so `@sample.py`
   → 0 Reads, Edit runs directly, −33% tokens, fully safe. Most injection tricks
   were reinventing `@`. (Volunteering just a PATH without `@` does NOT help.)
+- **`--system-prompt-file` / `--system-prompt`** — natively REPLACES the whole
+  Anthropic agent-prompt block (verified on the wire, sysprompt-probe
+  2026-06-09): the ~11.7k-ch block becomes your text (own 1h cache marker);
+  CLI still prepends the 85-ch billing header (uncached) + the 62-ch "You are
+  a Claude agent, built on Anthropic's Claude Agent SDK." preamble; msg0
+  context bundle (CLAUDE.md/userEmail/env) still ships. This outclasses
+  STRIP_SYSTEM_SECTIONS for headless drivers — whole-prompt control, no proxy.
+- **`--exclude-dynamic-system-prompt-sections`** — the CLI's NATIVE version of
+  our `RELOCATE_ENV_TO_TAIL` ("move per-machine sections from the system prompt
+  into the first user message; improves cross-user prompt-cache reuse"; ignored
+  with `--system-prompt`). Found 2026-06-09 in `--help`; NOT yet A/B'd against
+  our transform — do that before keeping ours on.
 - Use native `@`/`!`/`/`/hooks for context & read-collapse. Reserve the PROXY for
   what only a wire intermediary can do: turn-collapse (request piggyback) and
   DURABLE response mutation.
@@ -468,3 +480,23 @@ plus heading-diffs of old main-agent captures:
   section swap (and cross-model diffs are out of scope by design). CHEAP FIX
   CANDIDATE: add the `^# heading` list of each sys block to the fingerprint —
   section-level rewrites within a namespace would then fire drift.
+- **Family-map nuance (sysprompt-probe arm A):** headless haiku TODAY = classic
+  family too (11.9k ch, `# System/# Doing tasks/…`), so classic-vs-harness is
+  model-gated in BOTH modes. The "You are an interactive agent…" OPENING LINE is
+  shared by both families — it is NOT a family discriminator; use the heading
+  list. (Headless classic carries no `# Environment` in system — env rides the
+  msg0 bundle; interactive classic has it in system.)
+
+### sysprompt-probe (2026-06-09): --system-prompt-file + canary positive test
+
+Scenario `sysprompt-probe` (A=control vs B=`--system-prompt-file` sentinel,
+haiku, captures `logs_main/3cdb9570*/1e8a97c5*` + rerun `ce935492*`):
+- Replacement semantics: see the new bullet in "Native answers" above.
+- Our transforms coexist with a custom prompt: `env_relocate` still fired on
+  arm B; `system_strip` fired on the default prompt (headless classic also has
+  `# Session-specific guidance`, 528 ch).
+- **CANARY POSITIVE TEST PASSED, both directions:** B fired
+  `structural_change` (interactive-agent block → TESTBOT, size_bucket 13→7)
+  inside the namespace arm A had just touched; the RERUN's arm A then fired the
+  drift BACK (TESTBOT → default). Detect-and-rebaseline works as designed. A
+  deliberate prompt swap is now the canonical way to smoke-test the detector.
