@@ -460,6 +460,20 @@ structurally — "reacts to unknown keys" (user). Key diff across captures:
   fix alongside the heading-list idea: fingerprint control-plane keys
   (`thinking.type`, `output_config` sans schemas, `context_management` edit
   types).
+- **`mid-conversation-system` SEEN LIVE (2026-06-10, `logs_main/aac68362-*`):**
+  the CLI ships the Agent-tool roster as a trailing `role:"system"` message in
+  `messages[]`, appended AFTER the final user message of the turn where it
+  first materializes. Because the CLI's cache markers go on USER messages
+  only, such trailing system content is structurally uncacheable on its debut
+  turn: billed 1× input once, cache-written on the NEXT turn, cached
+  thereafter (verified by exact arithmetic: 007 read 6405 + wrote 657 = 7062
+  = 008's and 009's read). Not worth a proxy fix (a marker costs one of 4
+  breakpoints to save a one-time 1× ride). **CANARY GAP #3:** message roles
+  aren't fingerprinted — a CLI moving content into mid-conversation system
+  messages is invisible; cheap fix: add the set/count of non-user/assistant
+  roles to the fingerprint. Code that assumes user/assistant-only messages
+  (`_classify_role`, relocate, `/_session` renderer) should be audited
+  against this shape.
 
 ### fable's server-side refusal classifier (2026-06-10, caught live by the proxy)
 
