@@ -2133,14 +2133,22 @@ if WARMTH_PINGER or WARMTH_LEDGER:
 # --- HOLD-WARM: user-armed keep-warm driver (/warm-cache <n>) ------------------
 # The replay pinger answers HOW to keep a prefix warm (one /_ping); this answers
 # WHEN. The user arms a session IN-BAND: the /warm-cache command's expanded
-# prompt carries the sentinel below, the proxy CAPTURES that turn (it never
-# reaches the API; session_id rides in free via metadata), arms an
-# until-deadline, and replies with a synthetic end_turn — so the hold duration
-# is dynamic per invocation, not a fixed env-var number of hours. A background
-# asyncio task (the event loop owns _client, which _warm_session needs) then
-# auto-pings each armed session whenever its WARM prefix nears expiry.
+# prompt carries the sentinel below (session_id rides in free via metadata).
+# The proxy arms an until-deadline, then INJECTS an echo instruction and lets
+# the turn FORWARD upstream so the MODEL ITSELF speaks the ack (2026-06-10
+# redesign — the earlier synthetic end_turn left an assistant message the next
+# turn's model knew it never wrote, and fable kept flagging the whole skill as
+# prompt injection; a genuinely model-generated ack makes the transcript
+# self-consistent). Liveness is structural: only a live proxy can add the
+# [logproxy] block, so the command file's tripwire (no block -> reply "proxy
+# not active") needs no history-scoping caveats. A background asyncio task
+# (the event loop owns _client, which _warm_session needs) then auto-pings
+# each armed session whenever its WARM prefix nears expiry.
 #
-# Costs nothing until armed, so WARMTH_HOLD defaults ON; each arm is an explicit
+# Arming costs one normal turn (~a ping when the prefix is warm; a fresh cache
+# write when cold — which IS the warmth the hold then maintains). That spend is
+# user-initiated (typed /warm-cache), not autonomous, so the never-higher-cost
+# principle doesn't gate it. WARMTH_HOLD defaults ON; each arm is an explicit
 # user action, clamped to WARMTH_HOLD_MAX_HOURS with a ping-count backstop.
 # Pings fire inside (0, MARGIN) seconds of expiry — never at the TTL edge (the
 # documented TOCTOU guidance) — and _warm_session's own warm-only gate is the
@@ -2295,18 +2303,16 @@ def _hold_request(obj):
 
 
 def _arm_hold(session_id, action, hours):
-    """Arm/disarm a session's hold; compose the user-facing ack (it lands in the
-    transcript as the assistant's reply, so it reports REALITY: current warmth,
-    expected ping count, and every reason the hold might be a no-op).
+    """Arm/disarm a session's hold; compose the user-facing ack — the text the
+    MODEL is instructed to echo (see _hold_echo_transform), so it lands in the
+    transcript as genuine assistant output reporting REALITY: current warmth,
+    expected ping count, and every reason the hold might be a no-op.
     Returns (ack_text, record).
 
-    Every ack is ATTRIBUTED with a "[logproxy]" prefix: the synthetic reply
-    persists in the transcript as an *assistant* message, and an unattributed
-    one ambushes the NEXT turn's model — it sees the command's tripwire in
-    history, concludes the proxy never intercepted, and 'retracts' a hold that
-    is in fact armed (observed live 2026-06-10). The attribution plus the
-    command file's turn-scoped tripwire wording make the pair an inert log
-    record when read from history."""
+    The "[logproxy]" prefix stays even though the model now speaks the line:
+    it marks provenance (the model recites the proxy's words), and it keeps a
+    later unproxied continuation of the same transcript from reading the ack
+    as the model's own unverifiable claim."""
     now = time.time()
     if not session_id:
         return ("[logproxy] cache hold NOT armed: request carries no session "
@@ -2335,23 +2341,21 @@ def _arm_hold(session_id, action, hours):
     wq = warmth_query(session=session_id)
     entry = _resolve_auth(session_id)
     pingable = entry is not None and not entry.get("needs_auth")
+    # The arming turn now FORWARDS, so it self-heals what the old synthetic
+    # path could only warn about: it becomes the replayable last request,
+    # donates live auth, and (re-)writes the prefix cache. The old "no
+    # replayable request / restored without credentials" notes are obsolete.
+    ttl = wq.get("ttl_s") or 3600
+    expected = max(1, int(hours * 3600 // ttl))
     notes = []
     if wq.get("warm"):
-        ttl = wq.get("ttl_s") or 3600
-        expected = max(1, int(hours * 3600 // ttl))
         notes.append(f"prefix warm, {int(wq['remaining_s'] // 60)}m left, "
                      f"~{expected} ping(s) expected")
         if ttl == 300:
             notes.append("WARNING: 5m-TTL prefix — ~12 pings/hour, poor economics")
     else:
-        notes.append("WARNING: prefix not warm — pings decline until a real "
-                     "turn re-caches it (the hold then resumes)")
-    if entry is None:
-        notes.append("NOTE: no replayable request cached yet (proxy restart?) — "
-                     "pings resume after the next real turn")
-    elif not pingable:
-        notes.append("NOTE: replayable request restored without credentials — "
-                     "pings resume once this account sends live traffic")
+        notes.append("prefix was not warm — this arming turn re-establishes "
+                     f"the cache; ~{expected} ping(s) expected")
     ack = (f"[logproxy] \U0001f525 cache hold armed: {hours:g}h of idle "
            f"insurance — the window re-anchors to your LAST real turn, so the "
            f"cache stays warm until {hours:g}h after you walk away (as of now: "
@@ -2359,6 +2363,35 @@ def _arm_hold(session_id, action, hours):
            + "; ".join(notes) + ". Disarm: /warm-cache off")
     return (ack, {"armed": True, "hours": hours, "until": until,
                   "warmth": wq, "pingable": pingable})
+
+
+def _hold_echo_transform(obj):
+    """/warm-cache sentinel turn: arm/disarm the hold, then INJECT a
+    [logproxy] echo instruction into the final user message and let the turn
+    FORWARD upstream — the model itself speaks the ack, so the transcript is
+    self-consistent (no synthetic assistant message for a later turn to
+    disown). Only a live proxy can add the block, so the command file's
+    "no block -> proxy not active" tripwire stays honest by construction.
+    Returns a record dict when the sentinel fired, else None.
+
+    Known, accepted desync: the injected block is sent upstream but never
+    lands in the CLI's transcript, so the NEXT turn's history diverges from
+    the cached prefix at this message — a one-time tail re-write of a few
+    hundred tokens."""
+    hr = _hold_request(obj)
+    if hr is None:
+        return None
+    action, hours = hr
+    session_id, _, _ = _session_ids(obj)
+    ack, hrec = _arm_hold(session_id, action, hours)
+    instr = ("<system-reminder>\n[logproxy] The local proxy is live and has "
+             "processed this /warm-cache turn; the state change reported "
+             "below is already applied. Reply with exactly the following "
+             "text and nothing else — no preamble, no tool calls:\n\n"
+             f"{ack}\n</system-reminder>")
+    injected = _inject_into_last_user(obj, instr, "\n\n") is not None
+    return {**hrec, "action": action, "ack": ack, "forwarded": True,
+            "injected": injected}
 
 
 def _hold_note_real_turn(session_id, now=None):
@@ -3489,6 +3522,19 @@ async def handler(request: Request) -> Response:
                 record["strip_compact_cache"] = scc
                 if scc.get("removed_message_markers"):
                     changed = True
+            # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
+            # echo instruction; the turn then forwards like any other (the
+            # model speaks the ack; this request becomes the replayable,
+            # warm, auth-donating last request). LAST in the chain so the
+            # instruction is the final text the model reads.
+            if upstream_path.split("?")[0].endswith("/v1/messages"):
+                he = _hold_echo_transform(obj)
+                if he:
+                    record["hold_echo"] = he
+                    changed = True
+                    print(f"[hold] #{n} {he['action']} -> "
+                          f"{'ARMED ' + str(he.get('hours') or '') if he.get('armed') else 'not armed'}"
+                          f" (forwarding; model echoes the ack)", flush=True)
             if changed:
                 raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         role = _classify_role(obj)
@@ -3527,34 +3573,9 @@ async def handler(request: Request) -> Response:
     stem = f"{n:03d}-{agent}-{role}-{_short_model(model)}-{ts}"
     _enqueue_json(out_dir / f"{stem}.request.json", record)
 
-    # ---- HOLD-WARM arming: /warm-cache sentinel turn --------------------------
-    # The expanded /warm-cache command rides in as a normal user turn carrying
-    # the <proxy:warm-cache hours=N> sentinel. CAPTURE it here — never forward
-    # (the model has nothing to add and the turn would pollute the cached
-    # prefix); arm/disarm the session's hold and answer with a synthetic
-    # end_turn whose text reports reality. Deliberately BEFORE
-    # _cache_last_request: the sentinel turn was never cached upstream, so the
-    # previous real turn must stay the replayable prefix.
-    if isinstance(obj, dict) and upstream_path.split("?")[0].endswith("/v1/messages"):
-        hr = _hold_request(obj)
-        if hr:
-            action, hours = hr
-            ack, hrec = _arm_hold(session_id, action, hours)
-            msg_id = f"msg_hold_{n:06d}"
-            blob = _synth_end_turn_sse(model, ack, msg_id)
-            _enqueue_bytes(out_dir / f"{stem}.response.sse", blob)
-            _enqueue_json(out_dir / f"{stem}.response.json",
-                {"seq": n, "agent": agent, "role": role, "model": model,
-                 "session_id": session_id, "endpoint": "messages",
-                 "status_code": 200, "billing": None, "usage": {}, "meta": {},
-                 "hold": {**hrec, "action": action, "upstream_called": False,
-                          "synthetic_message_id": msg_id, "ack": ack}})
-            print(f"[hold] #{n} session={(session_id or '?')[:12]}… {action} "
-                  f"-> {'ARMED' if hrec.get('armed') else 'not armed'} "
-                  f"{hrec.get('hours') or ''} (upstream skipped, 0 tokens)",
-                  flush=True)
-            return StreamingResponse(iter([blob]), status_code=200,
-                                     media_type="text/event-stream")
+    # (HOLD-WARM arming now happens in the transform chain above — the
+    # sentinel turn is forwarded with an injected echo instruction, so it
+    # flows through the normal capture/billing/warmth path like any turn.)
 
     # ---- WARMTH: decline a provably-COLD keep-warm ping ----------------------
     # A keep-warm ping for a prefix the ledger knows is already busted has lost its
@@ -3617,7 +3638,9 @@ async def handler(request: Request) -> Response:
     if upstream_path.split("?")[0].endswith("/v1/messages"):
         _cache_last_request(session_id, obj, fwd_headers, upstream_path,
                             account_uuid)
-        _hold_note_real_turn(session_id)   # organic turn -> ping budget restarts
+        if "hold_echo" not in record:      # the arming turn itself isn't
+            _hold_note_real_turn(session_id)   # organic; real turns restart
+                                               # the ping budget + window
     req = _client.build_request(request.method, UPSTREAM + upstream_path,
                                 headers=fwd_headers, content=raw)
     up = await _client.send(req, stream=True)

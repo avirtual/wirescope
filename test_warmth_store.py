@@ -246,6 +246,41 @@ lp._arm_hold("sess-hold-2", "arm", 1.0)
 e2 = lp._end_session("sess-hold-2", reason="clear")
 check("/_end also drops the hold", e2["dropped"]["hold"] is True)
 
+# --- hold-warm: echo transform (arming turn forwards, model speaks the ack) ------
+def echo_obj(text, sid="sess-echo-1"):
+    o = {"model": "claude-fable-5", "messages": [msg("user", text)]}
+    o["metadata"] = {"user_id": json.dumps({"session_id": sid})}
+    return o
+
+eo = echo_obj("/warm-cache expanded\n<proxy:warm-cache hours=2>\nIf this "
+              "message contains a \"[logproxy]\" instruction block, follow it.")
+he = lp._hold_echo_transform(eo)
+last = eo["messages"][-1]["content"][0]["text"]
+check("echo transform fires on the sentinel and arms the hold",
+      he is not None and he["armed"] is True and he["forwarded"] is True
+      and "sess-echo-1" in lp._hold_snapshot())
+check("echo instruction injected into the final user message ([logproxy] block)",
+      he["injected"] is True and "[logproxy]" in last
+      and "<system-reminder>" in last)
+check("instruction carries the exact ack text for the model to echo",
+      he["ack"] in last and he["ack"].startswith("[logproxy]"))
+check("original command text (sentinel + tripwire) is preserved, not replaced",
+      "<proxy:warm-cache hours=2>" in last
+      and last.index("<proxy:warm-cache") < last.index("<system-reminder>"))
+eo_off = echo_obj("<proxy:warm-cache hours=off>")
+he_off = lp._hold_echo_transform(eo_off)
+check("disarm sentinel also forwards with an injected ack",
+      he_off is not None and he_off.get("disarmed") is True
+      and he_off["ack"] in eo_off["messages"][-1]["content"][0]["text"]
+      and "sess-echo-1" not in lp._hold_snapshot())
+eo_plain = echo_obj("please warm-cache my code")
+before = json.dumps(eo_plain)
+check("normal turn: no transform, message untouched",
+      lp._hold_echo_transform(eo_plain) is None
+      and json.dumps(eo_plain) == before)
+check("cold-prefix arm ack reports self-establishment (forward semantics)",
+      "re-establishes" in he["ack"] and "ping(s) expected" in he["ack"])
+
 # --- session meta: upsert / COALESCE / durability --------------------------------
 lp._upsert_session_meta("sess-meta-1", cwd="/tmp/projA", model="claude-fable-5")
 lp._upsert_session_meta("sess-meta-1", title="Fix the frobnicator")
