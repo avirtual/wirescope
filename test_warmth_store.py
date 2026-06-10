@@ -172,6 +172,122 @@ lp._bump(tot2, bill2)
 check("flat cache_creation lands in cache_write_tokens",
       tot2["cache_write_tokens"] == 100_000)
 
+# --- refusal counter -----------------------------------------------------------
+tot3 = lp._new_totals()
+lp._bump(tot3, bill2, stop={"stop_reason": "refusal",
+                            "stop_details": {"category": "reasoning_extraction"},
+                            "request_id": "req_test123"})
+lp._bump(tot3, bill2, stop={"stop_reason": "end_turn"})
+check("refusal bumps the counter once (end_turn doesn't)",
+      tot3["refusals"] == 1)
+check("refusal evidence recorded (category + request_id)",
+      tot3["refusal_events"][0]["category"] == "reasoning_extraction"
+      and tot3["refusal_events"][0]["request_id"] == "req_test123")
+
+# --- hold-warm: sentinel parse ---------------------------------------------------
+def hold_obj(text):
+    return {"messages": [msg("user", text)]}
+
+check("sentinel parses hours", lp._hold_request(hold_obj(
+    "<proxy:warm-cache hours=3>")) == ("arm", 3.0))
+check("fractional hours", lp._hold_request(hold_obj(
+    "<proxy:warm-cache hours=0.5>")) == ("arm", 0.5))
+check("hours clamp to WARMTH_HOLD_MAX_HOURS", lp._hold_request(hold_obj(
+    "<proxy:warm-cache hours=99>")) == ("arm", lp.WARMTH_HOLD_MAX_HOURS))
+check("off disarms", lp._hold_request(hold_obj(
+    "<proxy:warm-cache hours=off>")) == ("off", None))
+check("zero disarms", lp._hold_request(hold_obj(
+    "<proxy:warm-cache hours=0>")) == ("off", None))
+check("no sentinel -> None (normal turn untouched)",
+      lp._hold_request(hold_obj("please warm-cache my code")) is None)
+check("sentinel survives surrounding command prose", lp._hold_request(hold_obj(
+    "blah\n<proxy:warm-cache hours=2>\n(fallback line)")) == ("arm", 2.0))
+
+# --- hold-warm: decision matrix (pure) -------------------------------------------
+NOW = 1_000_000.0
+HOLD = {"until": NOW + 3600, "pings": 0, "failures": 0}
+warm_due = (NOW - 3400, 3600, NOW + 100)        # remaining 100s < margin 300
+warm_high = (NOW - 100, 3600, NOW + 3500)       # remaining 3500s
+cold_row = (NOW - 7200, 3600, NOW - 3600)
+
+check("due warm prefix -> ping",
+      lp._hold_decision(HOLD, True, warm_due, NOW)[0] == "ping")
+check("warm but not yet due -> skip",
+      lp._hold_decision(HOLD, True, warm_high, NOW)[0] == "skip")
+check("cold prefix -> skip (NOT disarm: warmth can come back)",
+      lp._hold_decision(HOLD, True, cold_row, NOW) == ("skip", "prefix already cold"))
+check("no ledger row -> skip",
+      lp._hold_decision(HOLD, True, None, NOW)[0] == "skip")
+check("no replayable request -> skip",
+      lp._hold_decision(HOLD, False, warm_due, NOW)[0] == "skip")
+check("hold period over -> disarm",
+      lp._hold_decision({**HOLD, "until": NOW - 1}, True, warm_due, NOW)[0] == "disarm")
+check("max pings -> disarm",
+      lp._hold_decision({**HOLD, "pings": lp.WARMTH_HOLD_MAX_PINGS},
+                        True, warm_due, NOW)[0] == "disarm")
+check("consecutive failures -> disarm",
+      lp._hold_decision({**HOLD, "failures": 2}, True, warm_due, NOW)[0] == "disarm")
+
+# --- hold-warm: arm/disarm bookkeeping -------------------------------------------
+ack, rec = lp._arm_hold("sess-hold-1", "arm", 2.0)
+check("arm registers hold state",
+      rec["armed"] is True and "sess-hold-1" in lp._hold_snapshot())
+check("arm ack warns when prefix is not warm",
+      "not warm" in ack)
+ack2, rec2 = lp._arm_hold("sess-hold-1", "off", None)
+check("disarm pops hold state",
+      rec2["disarmed"] is True and "sess-hold-1" not in lp._hold_snapshot())
+ack3, rec3 = lp._arm_hold(None, "arm", 2.0)
+check("no session metadata -> not armed", rec3["armed"] is False)
+lp._arm_hold("sess-hold-2", "arm", 1.0)
+e2 = lp._end_session("sess-hold-2", reason="clear")
+check("/_end also drops the hold", e2["dropped"]["hold"] is True)
+
+# --- session meta: upsert / COALESCE / durability --------------------------------
+lp._upsert_session_meta("sess-meta-1", cwd="/tmp/projA", model="claude-fable-5")
+lp._upsert_session_meta("sess-meta-1", title="Fix the frobnicator")
+lp._upsert_session_meta("sess-meta-1", model="claude-fable-5")  # last_seen bump
+con3 = sqlite3.connect(os.environ["WARMTH_DB"])
+row = con3.execute("SELECT title, cwd, model, first_seen, last_seen "
+                   "FROM session_meta WHERE session_id='sess-meta-1'").fetchone()
+con3.close()
+check("meta upserts merge (COALESCE keeps earlier fields) + survive restart",
+      row == (row[0], "/tmp/projA", "claude-fable-5", row[3], row[4])
+      and row[0] == "Fix the frobnicator" and row[4] >= row[3])
+
+# --- session meta: cwd extraction + title-call detection -------------------------
+check("cwd from system text", lp._extract_cwd(
+    {"system": [{"type": "text",
+                 "text": "# Environment\nPrimary working directory: /Users/x/proj\n"}],
+     "messages": []}) == "/Users/x/proj")
+check("cwd from msg0 bundle (headless)", lp._extract_cwd(
+    {"system": "You are an agent.",
+     "messages": [msg("user", "<system-reminder>\n# Environment\n"
+                              "Primary working directory: /tmp/headless\n")]})
+      == "/tmp/headless")
+check("no env block -> None", lp._extract_cwd(
+    {"system": "custom", "messages": [msg("user", "2+2")]}) is None)
+check("title call detected", lp._is_title_call(
+    {"tools": [], "system": [
+        {"type": "text", "text": "x-anthropic-billing-header: cch=1;"},
+        {"type": "text", "text": "Generate a concise, sentence-case title (3-7 words)…"}],
+     "messages": []}) is True)
+check("main-agent turn (has tools) is NOT a title call", lp._is_title_call(
+    {"tools": [{"name": "Bash"}],
+     "system": [{"type": "text", "text": "Generate a concise, sentence-case title"}],
+     "messages": []}) is False)
+
+# --- /_status shape ---------------------------------------------------------------
+st = lp._status_snapshot(session="sess-meta-1")
+check("/_status lists the session with its meta",
+      len(st["sessions"]) == 1
+      and st["sessions"][0]["title"] == "Fix the frobnicator"
+      and st["sessions"][0]["cwd"] == "/tmp/projA"
+      and st["sessions"][0]["warmth"]["state"] in ("warm", "cold", "absent"))
+check("/_status proxy block carries flags + totals",
+      st["proxy"]["flags"]["ledger"] in (True, False)
+      and "refusals" in st["proxy"]["totals"])
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

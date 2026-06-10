@@ -27,6 +27,7 @@ Point a CLI at it either way:
             (the /agent/<name>/anthropic prefix is stripped before forwarding;
              <name> is captured as the agent id in the dump filename)
 """
+import asyncio
 import atexit
 import collections
 import hashlib
@@ -56,6 +57,7 @@ _HOP = {"host", "content-length", "connection", "transfer-encoding",
         "trailers", "upgrade", "accept-encoding"}
 
 _counter = itertools.count(1)
+_START_TS = time.time()
 _client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), follow_redirects=False)
 
 # /agent/<name>/anthropic/<rest>  ->  (name, /<rest>)
@@ -1215,8 +1217,16 @@ def _writer_loop():
             if item is None:
                 return
             path, kind, data = item
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if kind == "bytes":
+            # path may legitimately be None (ledger with WARMTH_LOG_FILE=0,
+            # session-meta upserts) — the old unconditional mkdir crashed there
+            # and the bare except silently dropped the WHOLE item, ledger stamp
+            # included.
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            if kind == "meta":  # session_meta upsert (no file output)
+                sid, fields = data
+                _upsert_session_meta(sid, **fields)
+            elif kind == "bytes":
                 path.write_bytes(data)
             elif kind == "append":  # one JSON object per line (canary change-log)
                 with path.open("a") as fh:
@@ -1273,6 +1283,13 @@ def _enqueue_ledger(path, obj, usage):
     thread, which hashes the cacheable prefix and refreshes the warmth ledger.
     `path` (a <stem>.warmth.json) is written too when WARMTH_LOG_FILE is on."""
     _WRITE_Q.put((path, "ledger", (obj, usage)))
+
+
+def _enqueue_meta(session_id, **fields):
+    """Upsert session_meta (title/cwd/model/last_seen) on the writer thread —
+    the SQLite write never runs on the byte hot path."""
+    if session_id:
+        _WRITE_Q.put((None, "meta", (session_id, fields)))
 
 
 def _session_ids(obj):
@@ -1386,6 +1403,14 @@ def _warmth_db():
             con.execute("CREATE TABLE IF NOT EXISTS session_head ("
                         "session_id TEXT PRIMARY KEY, hash TEXT NOT NULL, "
                         "updated_at REAL NOT NULL)")
+            # human-useful session identity for /_status: the CLI's own session
+            # title (harvested from its title-generator side-call) + cwd + model.
+            # Durable so /_status is useful right after a restart, when the
+            # in-memory _LAST_REQUEST is empty.
+            con.execute("CREATE TABLE IF NOT EXISTS session_meta ("
+                        "session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
+                        "model TEXT, first_seen REAL NOT NULL, "
+                        "last_seen REAL NOT NULL)")
             con.commit()
             _DB = con
     return _DB
@@ -1411,6 +1436,108 @@ def _session_head_hash(session):
         r = con.execute("SELECT hash FROM session_head WHERE session_id=?",
                         (session,)).fetchone()
     return r[0] if r else None
+
+
+# --- session metadata (title / cwd / model) for /_status ----------------------
+# The CLI already tells us everything a session list needs; we just stop
+# discarding it: the per-session TITLE-GENERATOR side-call (0 tools, system
+# "Generate a concise, sentence-case title…", same wire session_id) answers with
+# the session title, and the `# Environment` section (system block interactive,
+# msg0 bundle headless, tail block after RELOCATE_ENV_TO_TAIL) carries the cwd.
+_CWD_RE = re.compile(r"Primary working directory:\s*(.+)")
+_TITLE_SYS_PREFIX = "Generate a concise, sentence-case title"
+_META_CWD_TRIES = collections.defaultdict(int)  # sid -> scans attempted
+_META_CWD_DONE = set()                          # sids whose cwd is stored
+_META_CWD_MAX_TRIES = 5    # env block shows up in the first turns or never
+
+
+def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None):
+    """Durable identity row; COALESCE keeps existing values when a field isn't
+    supplied, so the per-request last_seen bump never erases title/cwd."""
+    if not session_id:
+        return
+    now = now or time.time()
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute(
+                "INSERT INTO session_meta(session_id, title, cwd, model, "
+                "first_seen, last_seen) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "title=COALESCE(excluded.title, session_meta.title), "
+                "cwd=COALESCE(excluded.cwd, session_meta.cwd), "
+                "model=COALESCE(excluded.model, session_meta.model), "
+                "last_seen=excluded.last_seen",
+                (session_id, title, cwd, model, now, now))
+            con.commit()
+    except Exception as e:
+        print(f"[meta] session_meta upsert failed for {session_id[:12]}…: {e}",
+              flush=True)
+
+
+def _extract_cwd(obj):
+    """Find 'Primary working directory: …' wherever this CLI build put it:
+    system text, the msg0 context bundle, or the relocated tail block. Scans
+    only first user msg + last 3 messages (env never lives mid-history)."""
+    m = _CWD_RE.search(_sys_text(obj))
+    if m:
+        return m.group(1).strip()
+    msgs = obj.get("messages") or []
+    scan = msgs[:1] + msgs[-3:]
+    for mm in scan:
+        if mm.get("role") != "user":
+            continue
+        c = mm.get("content")
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                m = _CWD_RE.search(b.get("text") or "")
+                if m:
+                    return m.group(1).strip()
+    return None
+
+
+def _title_from_text(text):
+    """The title call answers plain text on some builds, structured-outputs
+    JSON ('{"title": …}', beta structured-outputs-2025-12-15) on others —
+    unwrap the latter."""
+    t = (text or "").strip()
+    if t.startswith("{"):
+        try:
+            d = json.loads(t)
+            if isinstance(d, dict) and d.get("title"):
+                return str(d["title"]).strip()
+        except Exception:
+            pass
+    return t
+
+
+def _is_title_call(obj):
+    """The CLI's per-session title-generator side-call: zero tools + the title
+    system prompt. Its response text IS the session title."""
+    if obj.get("tools"):
+        return False
+    sys = obj.get("system")
+    texts = ([b.get("text", "") for b in sys if isinstance(b, dict)]
+             if isinstance(sys, list) else [sys or ""])
+    return any(t.startswith(_TITLE_SYS_PREFIX) for t in texts)
+
+
+def _capture_session_meta(session_id, obj, model):
+    """Per-request meta hook (handler, post-parse): bump last_seen/model every
+    turn; hunt for the cwd only until found (capped attempts — sessions with a
+    custom system prompt may simply not carry an env block)."""
+    if not session_id:
+        return
+    cwd = None
+    if session_id not in _META_CWD_DONE and _META_CWD_TRIES[session_id] < _META_CWD_MAX_TRIES:
+        _META_CWD_TRIES[session_id] += 1
+        cwd = _extract_cwd(obj)
+        if cwd:
+            _META_CWD_DONE.add(session_id)
+            _META_CWD_TRIES.pop(session_id, None)
+    _enqueue_meta(session_id, cwd=cwd, model=model)
 
 # --- PINGER: keep a prefix warm by REPLAYING a session's last request ---------
 # The old keep-warm path made a caller reconstruct an entire `--resume
@@ -1772,6 +1899,8 @@ def _end_session(session_id, reason="unspecified"):
     row to expire on its own rather than risk blinding a concurrent sibling."""
     with _LAST_REQUEST_LOCK:
         dropped_lr = _LAST_REQUEST.pop(session_id, None) is not None
+    with _HOLD_LOCK:
+        dropped_hold = _HOLD_STATE.pop(session_id, None) is not None
     dropped_head = False
     try:
         con = _warmth_db()
@@ -1783,7 +1912,8 @@ def _end_session(session_id, reason="unspecified"):
     except Exception:
         pass
     return {"ok": True, "session": session_id, "reason": reason,
-            "dropped": {"last_request": dropped_lr, "session_head": dropped_head},
+            "dropped": {"last_request": dropped_lr, "session_head": dropped_head,
+                        "hold": dropped_hold},
             "remaining_sessions": len(_LAST_REQUEST)}
 
 
@@ -1847,6 +1977,191 @@ if WARMTH_PINGER or WARMTH_LEDGER:
     threading.Thread(target=_sweeper_loop, name="warmthsweeper", daemon=True).start()
 
 
+# --- HOLD-WARM: user-armed keep-warm driver (/warm-cache <n>) ------------------
+# The replay pinger answers HOW to keep a prefix warm (one /_ping); this answers
+# WHEN. The user arms a session IN-BAND: the /warm-cache command's expanded
+# prompt carries the sentinel below, the proxy CAPTURES that turn (it never
+# reaches the API; session_id rides in free via metadata), arms an
+# until-deadline, and replies with a synthetic end_turn — so the hold duration
+# is dynamic per invocation, not a fixed env-var number of hours. A background
+# asyncio task (the event loop owns _client, which _warm_session needs) then
+# auto-pings each armed session whenever its WARM prefix nears expiry.
+#
+# Costs nothing until armed, so WARMTH_HOLD defaults ON; each arm is an explicit
+# user action, clamped to WARMTH_HOLD_MAX_HOURS with a ping-count backstop.
+# Pings fire inside (0, MARGIN) seconds of expiry — never at the TTL edge (the
+# documented TOCTOU guidance) — and _warm_session's own warm-only gate is the
+# final arbiter. Ping economics (CLAUDE.md): ~19:1 at 1h TTL; a 5m prefix is a
+# bad bet (~12 pings/h) — allowed but warned about in the arming ack.
+WARMTH_HOLD = os.environ.get("WARMTH_HOLD", "1") not in ("0", "no", "off", "false")
+WARMTH_HOLD_MAX_HOURS = float(os.environ.get("WARMTH_HOLD_MAX_HOURS", "12"))
+WARMTH_HOLD_MARGIN = int(os.environ.get("WARMTH_HOLD_MARGIN", "300"))
+WARMTH_HOLD_INTERVAL = int(os.environ.get("WARMTH_HOLD_INTERVAL", "60"))
+WARMTH_HOLD_MAX_PINGS = int(os.environ.get("WARMTH_HOLD_MAX_PINGS", "24"))
+WARMTH_HOLD_MAX_FAILURES = 2   # consecutive ping FAILURES (not declines) -> disarm
+
+_HOLD_RE = re.compile(r"<proxy:warm-cache\s+hours=([0-9.]+|off)\s*>")
+_HOLD_STATE = {}   # sid -> {until, armed_at, pings, failures, last_ping_ts, last_result}
+_HOLD_LOCK = threading.Lock()
+
+
+def _hold_request(obj):
+    """Parse a /warm-cache sentinel out of the last user message.
+    ('arm', hours) | ('off', None) | None (no sentinel)."""
+    m = _HOLD_RE.search(_last_user_text(obj) or "")
+    if not m:
+        return None
+    v = m.group(1)
+    if v == "off":
+        return ("off", None)
+    try:
+        hours = float(v)
+    except ValueError:
+        return ("off", None)
+    if hours <= 0:
+        return ("off", None)
+    return ("arm", min(hours, WARMTH_HOLD_MAX_HOURS))
+
+
+def _arm_hold(session_id, action, hours):
+    """Arm/disarm a session's hold; compose the user-facing ack (it lands in the
+    transcript as the assistant's reply, so it reports REALITY: current warmth,
+    expected ping count, and every reason the hold might be a no-op).
+    Returns (ack_text, record)."""
+    now = time.time()
+    if not session_id:
+        return ("cache hold NOT armed: request carries no session metadata.",
+                {"armed": False, "reason": "no_session"})
+    if action == "off":
+        with _HOLD_LOCK:
+            prev = _HOLD_STATE.pop(session_id, None)
+        if prev:
+            return (f"cache hold disarmed ({prev['pings']} ping(s) had fired).",
+                    {"armed": False, "disarmed": True, "pings": prev["pings"]})
+        return ("no cache hold was armed for this session.",
+                {"armed": False, "disarmed": False})
+    if not (WARMTH_HOLD and WARMTH_PINGER and WARMTH_LEDGER):
+        return ("cache hold NOT armed: hold-warm is disabled on this proxy "
+                "(needs WARMTH_HOLD + WARMTH_PINGER + WARMTH_LEDGER).",
+                {"armed": False, "reason": "disabled"})
+    until = now + hours * 3600
+    with _HOLD_LOCK:
+        _HOLD_STATE[session_id] = {"until": until, "armed_at": now, "pings": 0,
+                                   "failures": 0, "last_ping_ts": None,
+                                   "last_result": None}
+    wq = warmth_query(session=session_id)
+    with _LAST_REQUEST_LOCK:
+        pingable = session_id in _LAST_REQUEST
+    notes = []
+    if wq.get("warm"):
+        ttl = wq.get("ttl_s") or 3600
+        expected = max(1, int(hours * 3600 // ttl))
+        notes.append(f"prefix warm, {int(wq['remaining_s'] // 60)}m left, "
+                     f"~{expected} ping(s) expected")
+        if ttl == 300:
+            notes.append("WARNING: 5m-TTL prefix — ~12 pings/hour, poor economics")
+    else:
+        notes.append("WARNING: prefix not warm — pings decline until a real "
+                     "turn re-caches it (the hold then resumes)")
+    if not pingable:
+        notes.append("NOTE: no replayable request cached yet (proxy restart?) — "
+                     "pings resume after the next real turn")
+    ack = (f"\U0001f525 cache hold armed for {hours:g}h "
+           f"(until {time.strftime('%H:%M', time.localtime(until))}); "
+           + "; ".join(notes) + ". Disarm: /warm-cache off")
+    return (ack, {"armed": True, "hours": hours, "until": until,
+                  "warmth": wq, "pingable": pingable})
+
+
+def _hold_decision(hold, has_last_request, warmth_row, now):
+    """One tick's verdict for an armed session — PURE (offline-testable).
+    warmth_row = (stamped_at, ttl, expires_at) | None.
+    Returns ('disarm'|'ping'|'skip', reason). Not-warm only SKIPS (never
+    disarms): warmth can come back with the user's next real turn, and a
+    skipping hold costs nothing — it self-bounds at `until`."""
+    if now > hold["until"]:
+        return ("disarm", "hold period over")
+    if hold["pings"] >= WARMTH_HOLD_MAX_PINGS:
+        return ("disarm", f"max pings ({WARMTH_HOLD_MAX_PINGS}) reached")
+    if hold["failures"] >= WARMTH_HOLD_MAX_FAILURES:
+        return ("disarm", f"{hold['failures']} consecutive ping failures "
+                          "(stale credentials?)")
+    if not has_last_request:
+        return ("skip", "no replayable request cached")
+    if not warmth_row:
+        return ("skip", "prefix not in ledger")
+    remaining = warmth_row[2] - now
+    if remaining <= 0:
+        return ("skip", "prefix already cold")
+    if remaining >= WARMTH_HOLD_MARGIN:
+        return ("skip", "not yet due")
+    return ("ping", "due")
+
+
+async def _hold_tick(now=None):
+    now = now or time.time()
+    with _HOLD_LOCK:
+        armed = {sid: dict(h) for sid, h in _HOLD_STATE.items()}
+    for sid, hold in armed.items():
+        with _LAST_REQUEST_LOCK:
+            entry = _LAST_REQUEST.get(sid)
+        row = None
+        if entry:
+            try:
+                msgs = entry["obj"].get("messages") or []
+                h = _prefix_hash(entry["obj"], len(msgs))
+                row = _warmth_rows([h]).get(h)
+            except Exception:
+                row = None
+        action, reason = _hold_decision(hold, entry is not None, row, now)
+        if action == "disarm":
+            with _HOLD_LOCK:
+                _HOLD_STATE.pop(sid, None)
+            print(f"[hold] session={sid[:12]}… disarmed: {reason}", flush=True)
+        elif action == "ping":
+            code, res = await _warm_session(sid)
+            warmed = bool(res.get("warmed"))
+            declined = bool(res.get("skipped"))   # clean warm-only decline (race
+            with _HOLD_LOCK:                      # to cold) — not a failure
+                cur = _HOLD_STATE.get(sid)
+                if cur:
+                    cur["pings"] += 1
+                    cur["last_ping_ts"] = now
+                    if warmed:
+                        cur["failures"] = 0
+                        cur["last_result"] = "warmed"
+                    elif declined:
+                        cur["last_result"] = f"declined:{res.get('skipped')}"
+                    else:
+                        cur["failures"] += 1
+                        cur["last_result"] = f"fail:{code}"
+            print(f"[hold] session={sid[:12]}… auto-ping -> "
+                  f"{'WARMED' if warmed else res.get('skipped') or f'FAILED ({code})'} "
+                  f"pings={hold['pings'] + 1}", flush=True)
+
+
+async def _hold_loop():
+    while True:
+        await asyncio.sleep(max(5, WARMTH_HOLD_INTERVAL))
+        try:
+            await _hold_tick()
+        except Exception as e:
+            print(f"[hold] tick error: {e}", flush=True)
+
+
+async def _start_hold_loop():
+    if WARMTH_HOLD and WARMTH_PINGER and WARMTH_LEDGER:
+        asyncio.create_task(_hold_loop())
+        print(f"[hold] driver up: interval={WARMTH_HOLD_INTERVAL}s "
+              f"margin={WARMTH_HOLD_MARGIN}s clamp={WARMTH_HOLD_MAX_HOURS}h "
+              f"max_pings={WARMTH_HOLD_MAX_PINGS}", flush=True)
+
+
+def _hold_snapshot():
+    with _HOLD_LOCK:
+        return {sid: dict(h) for sid, h in _HOLD_STATE.items()}
+
+
 def _parse_usage_from_sse(raw_bytes):
     """Pull usage out of the captured SSE stream (message_start + message_delta)."""
     usage = {"input_tokens": None, "output_tokens": None,
@@ -1898,7 +2213,8 @@ def _parse_response_meta(raw_bytes):
     meta = {"message_id": None, "resolved_model": None, "role": None,
             "stop_reason": None, "stop_sequence": None, "stop_details": None,
             "usage_start": None, "usage_final": None,
-            "content_block_types": [], "tool_uses": [], "error": None}
+            "content_block_types": [], "tool_uses": [], "error": None,
+            "text": ""}     # leading text, capped — enough for the title call
     try:
         text = raw_bytes.decode("utf-8", "replace")
     except Exception:
@@ -1926,6 +2242,10 @@ def _parse_response_meta(raw_bytes):
             meta["content_block_types"].append(cb.get("type"))
             if cb.get("type") == "tool_use":
                 meta["tool_uses"].append(cb.get("name"))
+        elif t == "content_block_delta":
+            d = ev.get("delta") or {}
+            if d.get("type") == "text_delta" and len(meta["text"]) < 500:
+                meta["text"] += d.get("text", "")
         elif t == "message_delta":
             if ev.get("usage") is not None:
                 meta["usage_final"] = ev.get("usage")     # full obj (output_tokens_details, iterations[])
@@ -1966,7 +2286,12 @@ def _new_totals():
             # PRICING-BLINDNESS guard (open item f): est_usd EXCLUDES these.
             # A nonzero unpriced_requests means the cumulative $ is a floor,
             # not a total — the mission is to price waste, so say so loudly.
-            "unpriced_requests": 0, "unpriced_models": []}
+            "unpriced_requests": 0, "unpriced_models": [],
+            # SERVER-SIDE refusal classifier hits (stop_reason:"refusal" —
+            # zero content blocks, the model never ran; fable 2026-06-10).
+            # Count + evidence -> a false-positive RATE and request_ids for
+            # /feedback instead of anecdotes. The CLI hides all of this.
+            "refusals": 0}
 
 
 _TOTALS = _new_totals()                                   # process-lifetime, all sessions
@@ -2046,8 +2371,15 @@ def _billing(kind, model_resolved=None, usage_final=None, usage_start=None, coun
             "price_basis": basis}
 
 
-def _bump(totals, bill):
+def _bump(totals, bill, stop=None):
     totals["requests"] += 1
+    if stop and stop.get("stop_reason") == "refusal":
+        totals["refusals"] = totals.get("refusals", 0) + 1
+        ev = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "category": (stop.get("stop_details") or {}).get("category"),
+              "request_id": stop.get("request_id")}
+        totals.setdefault("refusal_events", []).append(ev)
+        del totals["refusal_events"][:-20]      # keep the last 20
     if bill.get("endpoint") == "count_tokens":
         totals["count_tokens_requests"] += 1
     else:
@@ -2067,19 +2399,98 @@ def _bump(totals, bill):
                 models.append(m)
 
 
-def _accumulate(bill, session_key):
+def _accumulate(bill, session_key, stop=None):
     """Update the global + per-session running totals (the API never returns
     one) and enqueue both snapshots. Math runs on the event loop (cheap dict
     ops); the disk writes are handed to the background writer."""
-    _bump(_TOTALS, bill)
-    _bump(_SESSION_TOTALS[session_key], bill)
+    _bump(_TOTALS, bill, stop)
+    _bump(_SESSION_TOTALS[session_key], bill, stop)
     snap = dict(_TOTALS)
     _enqueue_json(LOG_DIR / "_totals.json", snap)
     _enqueue_json(LOG_DIR / session_key / "_session.json", dict(_SESSION_TOTALS[session_key]))
     return snap
 
 
+def _status_snapshot(session=None, all_sessions=False):
+    """Everything a human (or the statusline) wants to know about the sessions
+    this proxy tracks, one read-only JSON. Universe = in-memory pingable
+    sessions ∪ armed holds ∪ durable session_meta rows (last 24h unless all=1).
+    Identity (title/cwd/model) is SQLite-durable; pingability/hold/cost are
+    in-memory by design (nothing replayable survives a restart anyway)."""
+    now = time.time()
+    with _LAST_REQUEST_LOCK:
+        last_real = {sid: e["ts"] for sid, e in _LAST_REQUEST.items()}
+    holds = _hold_snapshot()
+    meta_rows, meta_err = {}, None
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            q = ("SELECT session_id, title, cwd, model, first_seen, last_seen "
+                 "FROM session_meta")
+            if session:
+                cur = con.execute(q + " WHERE session_id=?", (session,))
+            elif all_sessions:
+                cur = con.execute(q)
+            else:
+                cur = con.execute(q + " WHERE last_seen > ?", (now - 86400,))
+            meta_rows = {r[0]: r for r in cur.fetchall()}
+    except Exception as e:
+        meta_err = f"store: {e}"
+    sids = set(meta_rows) | set(last_real) | set(holds)
+    if session:
+        sids &= {session}
+    sessions = []
+    for sid in sids:
+        r = meta_rows.get(sid)
+        wq = warmth_query(session=sid)
+        tot = _SESSION_TOTALS.get(sid)        # .get: never create via defaultdict
+        sessions.append({
+            "session_id": sid,
+            "title": r[1] if r else None,
+            "cwd": r[2] if r else None,
+            "model": r[3] if r else None,
+            "first_seen": r[4] if r else None,
+            "last_seen": (r[5] if r else None) or last_real.get(sid),
+            "last_real_turn_ts": last_real.get(sid),
+            "pingable": sid in last_real,
+            "warmth": {"state": ("warm" if wq.get("warm")
+                                 else "cold" if wq.get("found") else "absent"),
+                       "remaining_s": wq.get("remaining_s"),
+                       "ttl_s": wq.get("ttl_s")},
+            "hold": holds.get(sid),
+            "cost": ({"est_usd": tot["est_usd"], "requests": tot["requests"],
+                      "unpriced_requests": tot["unpriced_requests"]}
+                     if tot else None),
+            "refusals": (tot or {}).get("refusals", 0),
+        })
+    sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
+    res = {"proxy": {"log_dir": str(LOG_DIR), "upstream": UPSTREAM,
+                     "uptime_s": round(now - _START_TS, 1),
+                     "flags": {"hold": WARMTH_HOLD, "pinger": WARMTH_PINGER,
+                               "ledger": WARMTH_LEDGER,
+                               "block_cold_ping": WARMTH_BLOCK_COLD_PING},
+                     "hold_config": {"margin_s": WARMTH_HOLD_MARGIN,
+                                     "interval_s": WARMTH_HOLD_INTERVAL,
+                                     "max_hours": WARMTH_HOLD_MAX_HOURS,
+                                     "max_pings": WARMTH_HOLD_MAX_PINGS},
+                     "tracked_last_requests": len(last_real),
+                     "holds_armed": len(holds),
+                     "totals": dict(_TOTALS)},
+           "sessions": sessions}
+    if meta_err:
+        res["proxy"]["session_meta_error"] = meta_err
+    return res
+
+
 async def handler(request: Request) -> Response:
+    # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
+    # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
+    if request.method == "GET" and request.url.path == "/_status":
+        q = request.query_params
+        res = _status_snapshot(session=q.get("session"),
+                               all_sessions=q.get("all") in ("1", "yes", "true"))
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
     # GET /_warm?h=<prefix-hash>  or  /_warm?session=<session_id>
     if request.method == "GET" and request.url.path == "/_warm":
@@ -2140,6 +2551,7 @@ async def handler(request: Request) -> Response:
     # ---- parse + summarize the request body ----
     role, model = "unknown", None
     session_id = None
+    title_call = False
     obj = None      # stays None on an unparseable body -> every transform/gate is
                     # skipped and the ORIGINAL bytes forward verbatim (fail-open:
                     # a parse failure must degrade to passthrough, never to a 500)
@@ -2236,6 +2648,12 @@ async def handler(request: Request) -> Response:
             "n_tools": len(obj.get("tools", []) or []),
             "tool_names": [t.get("name") for t in (obj.get("tools") or []) if isinstance(t, dict)],
         }
+        # session identity for /_status: bump last_seen/model; hunt the cwd
+        # until found; flag the title side-call so the response capture can
+        # harvest the session title the CLI generates anyway.
+        if upstream_path.split("?")[0].endswith("/v1/messages"):
+            _capture_session_meta(session_id, obj, model)
+            title_call = _is_title_call(obj)
     except Exception as e:
         record["parse_error"] = str(e)
         record["body_raw"] = raw.decode("utf-8", "replace")
@@ -2245,6 +2663,35 @@ async def handler(request: Request) -> Response:
     out_dir = LOG_DIR / session_key
     stem = f"{n:03d}-{agent}-{role}-{_short_model(model)}-{ts}"
     _enqueue_json(out_dir / f"{stem}.request.json", record)
+
+    # ---- HOLD-WARM arming: /warm-cache sentinel turn --------------------------
+    # The expanded /warm-cache command rides in as a normal user turn carrying
+    # the <proxy:warm-cache hours=N> sentinel. CAPTURE it here — never forward
+    # (the model has nothing to add and the turn would pollute the cached
+    # prefix); arm/disarm the session's hold and answer with a synthetic
+    # end_turn whose text reports reality. Deliberately BEFORE
+    # _cache_last_request: the sentinel turn was never cached upstream, so the
+    # previous real turn must stay the replayable prefix.
+    if isinstance(obj, dict) and upstream_path.split("?")[0].endswith("/v1/messages"):
+        hr = _hold_request(obj)
+        if hr:
+            action, hours = hr
+            ack, hrec = _arm_hold(session_id, action, hours)
+            msg_id = f"msg_hold_{n:06d}"
+            blob = _synth_end_turn_sse(model, ack, msg_id)
+            _enqueue_bytes(out_dir / f"{stem}.response.sse", blob)
+            _enqueue_json(out_dir / f"{stem}.response.json",
+                {"seq": n, "agent": agent, "role": role, "model": model,
+                 "session_id": session_id, "endpoint": "messages",
+                 "status_code": 200, "billing": None, "usage": {}, "meta": {},
+                 "hold": {**hrec, "action": action, "upstream_called": False,
+                          "synthetic_message_id": msg_id, "ack": ack}})
+            print(f"[hold] #{n} session={(session_id or '?')[:12]}… {action} "
+                  f"-> {'ARMED' if hrec.get('armed') else 'not armed'} "
+                  f"{hrec.get('hours') or ''} (upstream skipped, 0 tokens)",
+                  flush=True)
+            return StreamingResponse(iter([blob]), status_code=200,
+                                     media_type="text/event-stream")
 
     # ---- WARMTH: decline a provably-COLD keep-warm ping ----------------------
     # A keep-warm ping for a prefix the ledger knows is already busted has lost its
@@ -2348,6 +2795,10 @@ async def handler(request: Request) -> Response:
                         _enqueue_bytes(out_dir / f"{stem}.response.relayed.sse", out_blob)
                     usage = _parse_usage_from_sse(blob)
                     meta = _parse_response_meta(blob)
+                    # the title side-call's answer IS the session title — keep it
+                    if title_call and session_id and _title_from_text(meta.get("text")):
+                        _enqueue_meta(session_id,
+                                      title=_title_from_text(meta.get("text"))[:200])
                     bill = _billing("messages",
                                     model_resolved=meta.get("resolved_model") or model,
                                     usage_final=meta.get("usage_final"),
@@ -2367,7 +2818,10 @@ async def handler(request: Request) -> Response:
                     usage = {}
                     meta = {"count_tokens_result": ct}
                     bill = _billing("count_tokens", model_resolved=model, count_tokens=ct)
-                cum = _accumulate(bill, session_key)
+                stop = {"stop_reason": meta.get("stop_reason"),
+                        "stop_details": meta.get("stop_details"),
+                        "request_id": up.headers.get("request-id")}
+                cum = _accumulate(bill, session_key, stop)
                 _enqueue_json(out_dir / f"{stem}.response.json",
                     {"seq": n, "agent": agent, "role": role, "model": model,
                      "session_id": session_id,
@@ -2385,6 +2839,14 @@ async def handler(request: Request) -> Response:
                                             if mutate else None)})
                 if is_messages:
                     t = bill.get("tokens") or {}
+                    if stop.get("stop_reason") == "refusal":
+                        # server-side classifier block — model never ran; the CLI
+                        # flattens this to a generic toast, so the wire must shout
+                        print(f"[dump] #{n} *** REFUSAL *** "
+                              f"category={(stop.get('stop_details') or {}).get('category')} "
+                              f"reqid={stop.get('request_id')} "
+                              f"(session refusals={_SESSION_TOTALS[session_key].get('refusals')})",
+                              flush=True)
                     print(f"[dump] #{n} {agent}/{role} {bill.get('model') or model} "
                           f"-> {up.status_code} in={t.get('input_tokens')} "
                           f"out={t.get('output_tokens')} "
@@ -2408,4 +2870,7 @@ async def handler(request: Request) -> Response:
 
 
 app = Starlette(routes=[Route("/{path:path}", handler,
-                              methods=["GET", "POST", "PUT", "DELETE"])])
+                              methods=["GET", "POST", "PUT", "DELETE"])],
+                # the hold-warm driver must live on the event loop (it awaits
+                # _warm_session on the shared _client)
+                on_startup=[_start_hold_loop])

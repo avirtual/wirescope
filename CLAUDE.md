@@ -1,49 +1,56 @@
 # proxy-lab — handoff for the next session
 
-## ⚡ NOTE TO SELF — state as of session end 2026-06-10 (early am, fable-5)
+## ⚡ NOTE TO SELF — state as of session end 2026-06-10 (mid-day, fable-5)
 
-Investigation night, NO code changes (repo still at `80ed21b`). The proxy paid
-for itself: it exposed a fable-only SERVER-SIDE refusal classifier hiding
-behind a nonsense CLI error.
+BUILD session: **hold-warm + /_status SHIPPED**; `:7800` restarted on the new
+code (hold defaults: 60s tick / 300s margin / 12h clamp / 24-ping cap). All 55
+offline checks pass (`python3 test_warmth_store.py`); live drill on
+`:7802`/`logs_scratch` verified arm → auto-ping WARMED → disarm → `/_end`
+end-to-end (haiku, session `329a6d9b-*`).
 
-- **NEW WIRE SHAPE — server-side refusal** (full writeup: "fable's server-side
-  refusal classifier" section): `stop_reason:"refusal"` + structured
-  `stop_details{category:"reasoning_extraction", ToS explanation,
-  fallback_credit_token}` — ZERO content blocks, the model never spoke. Trigger
-  was the user's WORKBENCH multi-agent system prompt (32k, `[wb:dm]` intent
-  syntax, wrap-daemon/transcript-logging prose); the user message was literally
-  "2+2". FABLE-ONLY — same prompt fine on opus/haiku same day. The CLI flattens
-  it to a generic "Session paused … cybersecurity or biology topics" toast; the
-  wire `stop_details` is the only honest signal and the CLI discards it.
-  Billing: the refused turn still billed the full 47,374-tok 1h cache write
-  (~$0.97) and the warmth ledger correctly receipt-stamped it (a refused prefix
-  IS a warm prefix). Capture: `logs_main/396a2918-*/021`.
-- **NAMING:** the user's harness = **workbench** ("wb"). The "FleetView" string
-  in the CLI's agent-type descriptions is NOT the user's — likely a native
-  fleet layer in CLI 2.1.170.x; pull that thread if it ever shows in a capture.
-- **USER DECISIONS:** workbench stays on 4.x models; fable = lab specimen only.
-  A 2-line intent-system preamble lowers the classifier score at turn 1 but it
-  re-fires randomly later (soft threshold, score drifts as protocol-flavored
-  text accumulates) — not fixable prompt-side, so don't convert agents yet.
-  Periodic classifier-weather probe instead: workbench prompt + "2+2" through
-  `:7800`; convert one expendable worker only after it stays clean a while.
-- **QUEUED CODE CHANGE (next time logproxy.py is touched): refusal counter** —
-  count `stop_reason:"refusal"` per session in `_totals.json`, loud `[dump]`
-  flag, record `stop_details.category` + request_id (same pattern as the
-  unpriced-model accounting). Gives a false-positive RATE + request_ids for
-  /feedback reports instead of anecdotes.
-- **Side anomaly:** the title side-call of that session got `not_found_error:
-  model: claude-fable-5[1m]` (`logs_main/396a2918-*/020`) — the API rejected
-  the `[1m]`-suffixed id on that route. One-off so far; watch for recurrence.
-- **Carryovers (still pending):** writer thread swallows exceptions silently
-  (`except: pass` — add dropped-writes counter); `_LAST_REQUEST` cap (2000)
-  generous; ONE measured A/B "proxied all-levers vs vanilla 1P" before calling
-  the proxy an optimizer; Tier-2 cleaner must be warmth-gated; SC priors are
-  4.x-only. Provenance: pre-2026-06-09-restart `logs_compact_warmth` captures
+- **SHIPPED: /warm-cache hold driver (open item a CLOSED).** User arms a
+  session IN-BAND: `~/.claude/commands/warm-cache.md` expands to a
+  `<proxy:warm-cache hours=N>` sentinel; the proxy CAPTURES the turn (never
+  forwarded; session_id rides in via metadata), arms `until = now + N·3600`,
+  and answers with a synthetic end_turn ack that reports REAL warmth state.
+  Dynamic per-arm duration — no fixed-hours env knob. An asyncio task
+  (Starlette `on_startup` — it needs the event-loop `_client`) auto-pings each
+  armed session when its WARM prefix has < margin left. Sentinel turn does NOT
+  update `_LAST_REQUEST` (never cached upstream — the previous real turn stays
+  the replayable prefix). Not-warm only SKIPS, never disarms: a later real turn
+  re-warms and the hold resumes. Disarm paths: expiry / `/warm-cache off` /
+  `/_end` / max-pings / 2 consecutive ping FAILURES (clean warm-only declines
+  don't count). `WARMTH_HOLD*` knobs in the flag table.
+- **SHIPPED: `GET /_status[?session=][&all=1]`** — sessions with title, cwd,
+  model, warmth, hold state, per-session cost, refusals + proxy flags/totals.
+  Identity (title/cwd/model) is DURABLE in a new `session_meta` table in
+  warmth.sqlite: the CLI's per-session TITLE side-call is now harvested instead
+  of discarded (on CLI 2.1.170.x+haiku it answers structured-outputs JSON
+  `{"title": …}` — `_title_from_text` unwraps it), cwd comes from the
+  "Primary working directory:" line (system / msg0 bundle / relocated tail;
+  capped 5 scan attempts per sid).
+- **SHIPPED: refusal counter** (the queued change) — `refusals` +
+  `refusal_events` (category, request_id; last 20) in `_totals.json` /
+  `_session.json` / `/_status`, loud `*** REFUSAL ***` `[dump]` line.
+- **FIXED latent writer bug:** a queue item with `path=None` (ledger when
+  WARMTH_LOG_FILE=0) crashed on `path.parent.mkdir` and the bare except
+  silently dropped the WHOLE item, warmth stamp included. mkdir now guarded.
+- **Statusline (open item b) DONE last session** — proxy-polling script is in
+  `~/tmp/proxy-sl-test/.claude/` (NOT `~/tmp/.claude` — that's the older
+  transcript-inferring version). Natural next iteration: render title/hold
+  (🔥3) from `/_status`.
+- **Fable refusal-classifier intel (2026-06-10 night, unchanged):** see
+  "fable's server-side refusal classifier" section; workbench stays on 4.x,
+  fable = lab specimen; periodic classifier-weather probe = workbench prompt +
+  "2+2" through `:7800`. Side anomaly to watch: one `not_found_error: model:
+  claude-fable-5[1m]` on a title side-call (`logs_main/396a2918-*/020`).
+- **Carryovers (still pending):** writer thread still swallows exceptions
+  silently (`except: pass` — add dropped-writes counter); `_LAST_REQUEST` cap
+  (2000) generous; ONE measured A/B "proxied all-levers vs vanilla 1P" before
+  calling the proxy an optimizer; Tier-2 cleaner must be warmth-gated; SC
+  priors are 4.x-only; `_META_CWD_TRIES`/`_META_CWD_DONE` grow unbounded
+  (tiny). Provenance: pre-2026-06-09-restart `logs_compact_warmth` captures
   were transforms-ON (A/B-internal verdicts stand; not transform-free shapes).
-- **NEXT BUILD TARGET (user decision, jumps the queue ahead of hold-warm):
-  the STATUSLINE experiment (open item b)** — show time-till-cache-cold from
-  `/_warm` in the Claude Code statusline. Then the hold-warm driver (a) on top.
 
 A HANDOFF note, not an archive. Goal: get a fresh context productive fast.
 The blow-by-blow record (every experiment, session-id, intermediate
@@ -174,6 +181,8 @@ Core (always on): per-session log dirs `LOG_DIR/<sid>/<seq>-<agent>-<role>-<mode
 | `WARMTH_LEDGER` (+ `WARMTH_LOG_FILE`, `WARMTH_PING_SENTINEL`, `WARMTH_DB`) | **on** | See "Warmth ledger" below. **SQLite-backed since 2026-06-09**: `warmth.sqlite` next to logproxy.py (override `WARMTH_DB`), WAL mode, shared by ALL proxy ports, survives restarts. `WARMTH_LEDGER_MAX` is gone (expiry is the GC). |
 | `WARMTH_BLOCK_COLD_PING` | off | **Warm-only ping gate.** A ping pays off ONLY on a `warm` prefix (a 0.10× read that slides the TTL); on any non-warm state (`cold`/`absent`/store error) a replay is a cache WRITE at the premium for no gain. So **ping IFF warm; decline everything else** (sentinel path short-circuits with a synthetic `end_turn`, 0 tokens). The replay pinger (`/_ping`) enforces warm-only unconditionally; `force=1` is the only override. Principle: **never higher cost.** (The "native-TTL store's EXISTS is the perfect primitive" insight is now implemented — the SQLite expiry predicate IS the gate.) |
 | `WARMTH_PINGER` (+ `WARMTH_PINGER_MAX`) | **on** | Replay-pinger: caches each session's post-transform last messages request **in memory** (incl. auth/beta headers, never on disk; oldest-evicted past cap). `POST`/`GET /_ping?session=<id>[&force=1]` replays it with thinking off + `max_tokens:1` → a cache READ that slides the TTL, ~1 output tok. Collapses the old `--resume --fork-session` sentinel dance to one HTTP call with just the session_id. Skips any non-warm prefix (warm-only; force=1 to establish). |
+| `WARMTH_HOLD` (+ `_MAX_HOURS`=12, `_MARGIN`=300s, `_INTERVAL`=60s, `_MAX_PINGS`=24) | **on** | **The hold driver (2026-06-10)** — decides WHEN to ping. User arms a session in-band via `/warm-cache <n>` (`~/.claude/commands/warm-cache.md` → `<proxy:warm-cache hours=N>` sentinel): the proxy captures that turn (never forwarded, 0 tokens; the previous real turn stays the replayable prefix), arms an n-hour hold, answers with a synthetic end_turn ack reporting real warmth. Asyncio task pings armed sessions whose WARM prefix has `< margin` left (`_warm_session` warm-only gate is the final arbiter). Not-warm SKIPS (a real turn re-warms → hold resumes); disarm on expiry / `off` / `/_end` / ping cap / 2 consecutive failures. Spends nothing until armed. Requires PINGER+LEDGER. |
+| *(endpoint)* `GET /_status[?session=][&all=1]` | — | Read-only session inventory: title (harvested from the CLI's title side-call; structured-outputs JSON unwrapped), cwd ("Primary working directory:" line), model, warmth, hold state, per-session cost, refusals + proxy flags/totals. Identity rows are DURABLE (`session_meta` table in warmth.sqlite); pingability/hold/cost are in-memory. Default window: sessions seen <24h. |
 | `WARMTH_SWEEP_INTERVAL` / `WARMTH_LAST_REQUEST_GRACE` / `WARMTH_PURGE_SLACK` | 300s / 600s / 7d | **Housekeeping-only** sweeper (runs when pinger OR ledger on): drops in-memory cached last-requests whose prefix lapsed past the grace (judged by the ledger's last-touch, so an actively-pinged session survives), purges warmth rows expired longer than the slack, prunes stale heads. Correctness lives in the READ PREDICATE (`expires_at > now`), never in these deletions — the sweep can run late or never without changing any gate decision. |
 | `STRIP_COMPACT_CACHE` (`STRIP_COMPACT_FORCE`) | off | Drop MESSAGE-level cache_control on a `/compact` request (keep system markers) when history is **not warm** — reclaims the discarded write premium. TWO-STATE gate (2026-06-09): `warm` declines; `cold`/`absent` strip; ledger-off/store-error decline. |
 | `SPLIT_SYSTEM_REST` (`SPLIT_SYSTEM_REST_MARKER`) | off | Move the static system-prose head onto the preceding marked block so it rides as cache_READ not WRITE. Byte-identical text. Win is ~60% of system-prefix carriage **only** for trimmed-tool layouts (which get no global fleet warming anyway, so the split forfeits nothing); for full-tool layouts vanilla's free global warming wins. |
@@ -318,14 +327,16 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   post-transform last request in memory; `POST /_ping?session=<id>` replays it
   (thinking off, `max_tokens:1`) → cache read, TTL slides, ~1 output tok. The
   caller needs only the session_id. Non-warm prefixes (cold/unknown) self-skip — ping only refreshes warm (force=1 to override).
-  **Still TODO:** the outer driver that decides WHEN to ping — a no-proxy
-  `hold-warm` loop polling `/_warm?session=` and firing `/_ping?session=` when
-  `remaining_s` drops low (~55min at 1h), with a hard cap + heartbeat for the
-  statusline. **Ping economics:** at 1h TTL one ping ≈ one warm read buys a full
-  hour ≈ 19:1 → a 1h-main-agent move; CAP the count. At 5m it's a bad bet (~12
-  pings/hour). The sentinel path (`WARMTH_PING_SENTINEL` + `_is_warm_ping`) is now
-  legacy/optional — kept only because `WARMTH_BLOCK_COLD_PING` and `_record_warmth`
-  still recognize it; the replay pinger is the recommended route.
+  **DONE (2026-06-10): the outer driver** — shipped IN-PROXY as the
+  `/warm-cache` hold (user decision: in-band arming beats an external loop —
+  the session_id rides in free, the duration is dynamic per arm). See the
+  `WARMTH_HOLD` flag-table row + NOTE TO SELF. **Ping economics:** at 1h TTL
+  one ping ≈ one warm read buys a full hour ≈ 19:1 → a 1h-main-agent move; the
+  hold CAPS the count (24) + clamps duration (12h). At 5m it's a bad bet (~12
+  pings/hour — the arming ack warns). The sentinel path (`WARMTH_PING_SENTINEL`
+  + `_is_warm_ping`) is now legacy/optional — kept only because
+  `WARMTH_BLOCK_COLD_PING` and `_record_warmth` still recognize it; the replay
+  pinger is the recommended route.
   **Session teardown (2026-06-09):** `GET/POST /_end?session=<id>[&reason=]` forgets
   a session's cached request — wire to the CLI **SessionEnd hook** (`reason` =
   clear/logout/prompt_input_exit/other; hook gets `session_id`+`reason` on stdin).
@@ -356,18 +367,13 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
     BOTH `thinking` and `context_management` (neither is in the cached prefix).
     Note a tiny `cache_creation` (~760 tok) per ping: the cached tail message sits
     just past the last breakpoint so it re-writes incrementally — bulk still reads.
-- (b) **NEXT (user decision 2026-06-10): statusline cache-warmth display.**
-  Claude Code `statusLine` = a command in settings.json that receives session
-  JSON on stdin (carries `session_id`, model, workspace) — snippet curls
-  `http://localhost:7800/_warm?session=<id>` and renders remaining time, e.g.
-  `🔥 54m` (warm, `remaining_s`) / `❄️` (found-but-lapsed) / `–` (not found or
-  proxy down; non-proxied sessions land here). Design notes: `/_warm` is
-  ledger-only (SQLite) so it works right after a proxy restart when
-  `_LAST_REQUEST` is empty; read-only, spends no credits, safe at statusline
-  refresh frequency; keep the curl timeout tiny (~0.2s) so a dead proxy never
-  stalls the prompt. VERIFY first: statusline-stdin `session_id` == wire
-  session_id (expected — SessionEnd hook id matched the wire id when tested
-  2026-06-09 — but confirm before trusting the render).
+- (b) **DONE (2026-06-10): statusline cache-warmth display.** Script:
+  `~/tmp/proxy-sl-test/.claude/status-line.sh` — polls
+  `GET /_warm?session=<sid>` (0.2s curl timeout) and renders the expiry as
+  wall-clock (`🔥cache→HH:MM` / `❄️cache busted /compact` / dim `cache ∅`),
+  plus dual cost (CLI stdin `.cost.total_cost_usd` vs the proxy's
+  `_session.json` `est_usd`). statusline-stdin session_id == wire session_id
+  (verified). Next iteration: read `/_status` for title + hold display.
 - (c) Deterministic transcript CLEANER (Tier-1 lossless bookkeeping-noise strip,
   Tier-2 supersession: stale Read before a later Edit/Write → stub) before any AI
   compaction. Stubs must stay non-empty + keep tool_use/tool_result paired.
@@ -396,16 +402,19 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   unaffected). Also: `_billing` now prices a flat `cache_creation_input_tokens`
   (at the 5m rate, flagged in `price_basis`) instead of silently dropping write
   cost when the 5m/1h split is absent.
-- (g) Endpoint hardening (lab-grade today): `/_ping` `/_end` `/_warm` are
-  unauthenticated on localhost. `/_ping` SPENDS user credits (replays with cached
-  auth headers), `force=1` can even cold-write big prefixes repeatedly; `/_end`
-  lets any local proc drop state. Fine for a private lab box; gate with a token
-  before any shared-host use. Related known gaps: cached auth headers can go STALE
-  (OAuth expiry) → ping 401s, no refresh; `_cache_last_request` stores at REQUEST
+- (g) Endpoint hardening (lab-grade today): `/_ping` `/_end` `/_warm` `/_status`
+  are unauthenticated on localhost. `/_ping` SPENDS user credits (replays with
+  cached auth headers), `force=1` can even cold-write big prefixes repeatedly;
+  `/_end` lets any local proc drop state; `/_status` exposes titles/cwds/costs
+  (read-only); the armed hold spends a ping (~0.10× prefix read) per TTL window
+  autonomously — bounded by clamp + ping cap. Fine for a private lab box; gate
+  with a token before any shared-host use. Related known gaps: cached auth
+  headers can go STALE (OAuth expiry) → ping 401s, no refresh (the hold disarms
+  after 2 consecutive failures); `_cache_last_request` stores at REQUEST
   time, so a failed turn leaves an unconfirmed last-request whose hash the ledger
   never stamped → pings decline (`unknown`) until the next good turn (fail-safe but
-  loses pingability); ping TOCTOU (warm check vs arrival) — drivers should ping
-  with margin, never at the TTL edge.
+  loses pingability); ping TOCTOU (warm check vs arrival) — the hold pings inside
+  the margin (default 300s), never at the TTL edge.
 
 ## Model-switch day (2026-06-09): claude-fable-5 observations
 

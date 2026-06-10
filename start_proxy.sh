@@ -16,7 +16,8 @@
 # Bare invocation = the one canonical proxy. Every feature is an env var
 # (see the flag table in CLAUDE.md); any var you set overrides the default
 # below, including set-to-empty/0. Code defaults already cover RELOCATE_*,
-# SORT_TOOLS, CANARY, STRIP_SYSTEM_SECTIONS, WARMTH_LEDGER, WARMTH_PINGER.
+# SORT_TOOLS, CANARY, STRIP_SYSTEM_SECTIONS, WARMTH_LEDGER, WARMTH_PINGER,
+# WARMTH_HOLD (the /warm-cache hold driver; spends nothing until armed).
 set -euo pipefail
 cd "$(dirname "$0")"
 
