@@ -39,7 +39,7 @@ fi
 
 # Subshell + nohup + disown => detached, reparented to PID 1.
 (
-  LOG_DIR="$LOG_DIR" ${INJECT:+INJECT="$INJECT"} \
+  LOG_DIR="$LOG_DIR" PORT="$PORT" ${INJECT:+INJECT="$INJECT"} \
     nohup python3 -m uvicorn logproxy:app \
       --host 127.0.0.1 --port "$PORT" --log-level warning \
       >"$OUT" 2>&1 </dev/null &

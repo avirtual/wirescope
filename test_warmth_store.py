@@ -380,6 +380,37 @@ lp._restore_cwd_done()
 check("sessions with a stored cwd skip the hunt after restart",
       "sess-meta-1" in lp._META_CWD_DONE)
 
+# --- hold display: expected pings for THIS hold (duration/ttl, cap-bounded) -------
+lp._arm_hold("sess-exp-1", "arm", 2.0)
+st_exp = lp._status_snapshot(session="sess-exp-1")
+check("hold reports expected_pings = hours/ttl (2h @ 1h default -> 2)",
+      st_exp["sessions"][0]["hold"]["expected_pings"] == 2)
+lp._arm_hold("sess-exp-1", "off", None)
+
+# --- auth self-bootstrap: bounded spend decision -----------------------------------
+BST = {"attempts": 0, "last_ts": 0.0, "inflight": False}
+check("bootstrap fires for an unknown account",
+      lp._bootstrap_decision("acct-z", now=NOW, state=dict(BST))[0] is True)
+check("bootstrap declines while one is in flight",
+      lp._bootstrap_decision("acct-z", now=NOW,
+                             state={**BST, "inflight": True})[0] is False)
+check("bootstrap declines past max attempts",
+      lp._bootstrap_decision("acct-z", now=NOW,
+                             state={**BST, "attempts": lp._AUTH_BOOTSTRAP_MAX})[0] is False)
+check("bootstrap respects the cooldown",
+      lp._bootstrap_decision("acct-z", now=NOW,
+                             state={**BST, "attempts": 1, "last_ts": NOW - 5})[0] is False)
+with lp._LAST_REQUEST_LOCK:
+    lp._ACCOUNT_AUTH["acct-have"] = {"authorization": "Bearer x"}
+check("bootstrap declines when the account's auth is already present",
+      lp._bootstrap_decision("acct-have", now=NOW, state=dict(BST))
+      == (False, "auth already present (resolve instead)"))
+_sb = lp.WARMTH_AUTH_BOOTSTRAP
+lp.WARMTH_AUTH_BOOTSTRAP = False
+check("bootstrap respects the kill switch",
+      lp._bootstrap_decision("acct-z", now=NOW, state=dict(BST))[0] is False)
+lp.WARMTH_AUTH_BOOTSTRAP = _sb
+
 # --- /_admin HTML page -------------------------------------------------------------
 page = lp._render_admin_html(lp._status_snapshot(all_sessions=True), host="t:7800")
 check("admin page renders the session inventory",

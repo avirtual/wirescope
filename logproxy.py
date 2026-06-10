@@ -2135,6 +2135,80 @@ WARMTH_HOLD_INTERVAL = int(os.environ.get("WARMTH_HOLD_INTERVAL", "60"))
 WARMTH_HOLD_MAX_PINGS = int(os.environ.get("WARMTH_HOLD_MAX_PINGS", "24"))
 WARMTH_HOLD_MAX_FAILURES = 2   # consecutive ping FAILURES (not declines) -> disarm
 
+# AUTH SELF-BOOTSTRAP: after a restart, restored entries sit auth-less until
+# the account's next live request. But the box's own `claude` CLI holds the
+# credentials — so when an ARMED HOLD is stuck awaiting auth, the proxy may
+# spawn ONE minimal trimmed-tools haiku turn through ITSELF; that turn arrives
+# like any other request and re-donates the account's headers (the credentials
+# still never touch the proxy's disk — the CLI keeps them where it always did).
+# Spends real (tiny) credits autonomously, so it is tightly bounded: fires only
+# for a hold that needs it, max attempts + cooldown per process, one in flight.
+WARMTH_AUTH_BOOTSTRAP = os.environ.get(
+    "WARMTH_AUTH_BOOTSTRAP", "1") not in ("0", "no", "off", "false")
+WARMTH_AUTH_BOOTSTRAP_MODEL = os.environ.get(
+    "WARMTH_AUTH_BOOTSTRAP_MODEL", "claude-haiku-4-5-20251001")
+_AUTH_BOOTSTRAP_MAX = int(os.environ.get("WARMTH_AUTH_BOOTSTRAP_MAX", "2"))
+_AUTH_BOOTSTRAP_COOLDOWN = int(os.environ.get("WARMTH_AUTH_BOOTSTRAP_COOLDOWN", "600"))
+_AUTH_BOOTSTRAP = {"attempts": 0, "last_ts": 0.0, "inflight": False}
+
+
+def _bootstrap_decision(account, now=None, state=None):
+    """May the proxy spend a bootstrap turn right now? PURE-ish (offline-
+    testable via `state`). Returns (go, reason)."""
+    st = state if state is not None else _AUTH_BOOTSTRAP
+    now = now or time.time()
+    if not WARMTH_AUTH_BOOTSTRAP:
+        return False, "disabled (WARMTH_AUTH_BOOTSTRAP=0)"
+    if st["inflight"]:
+        return False, "bootstrap already in flight"
+    if st["attempts"] >= _AUTH_BOOTSTRAP_MAX:
+        return False, f"max attempts ({_AUTH_BOOTSTRAP_MAX}) spent"
+    if now - st["last_ts"] < _AUTH_BOOTSTRAP_COOLDOWN:
+        return False, "cooldown"
+    with _LAST_REQUEST_LOCK:
+        if account and account in _ACCOUNT_AUTH:
+            return False, "auth already present (resolve instead)"
+    return True, "go"
+
+
+async def _auth_bootstrap(account=None):
+    """Spawn the minimal donor turn (see section comment). The spawned CLI is
+    pointed at THIS proxy, so its request flows through the normal handler and
+    populates _ACCOUNT_AUTH as a side effect — nothing here touches secrets."""
+    go, why = _bootstrap_decision(account)
+    if not go:
+        return
+    _AUTH_BOOTSTRAP["inflight"] = True
+    _AUTH_BOOTSTRAP["attempts"] += 1
+    _AUTH_BOOTSTRAP["last_ts"] = time.time()
+    port = os.environ.get("PORT", "7800")
+    print(f"[auth] bootstrap: spawning a minimal {WARMTH_AUTH_BOOTSTRAP_MODEL} "
+          f"turn through :{port} to re-acquire account credentials "
+          f"(attempt {_AUTH_BOOTSTRAP['attempts']}/{_AUTH_BOOTSTRAP_MAX})",
+          flush=True)
+    proc = None
+    try:
+        env = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"}
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "-p", "--model", WARMTH_AUTH_BOOTSTRAP_MODEL,
+            "--tools", "Bash", "Reply with exactly: ok",
+            cwd="/tmp", env=env,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        rc = await asyncio.wait_for(proc.wait(), timeout=120)
+        with _LAST_REQUEST_LOCK:
+            got = bool(account) and account in _ACCOUNT_AUTH
+        print(f"[auth] bootstrap turn exited rc={rc}; account auth "
+              f"{'ACQUIRED' if got else 'not seen yet'}", flush=True)
+    except Exception as e:
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        print(f"[auth] bootstrap failed: {e}", flush=True)
+    finally:
+        _AUTH_BOOTSTRAP["inflight"] = False
+
 _HOLD_RE = re.compile(r"<proxy:warm-cache\s+hours=([0-9.]+|off)\s*>")
 _HOLD_STATE = {}   # sid -> {until, armed_at, pings, failures, last_ping_ts, last_result}
 _HOLD_LOCK = threading.Lock()
@@ -2304,6 +2378,10 @@ async def _hold_tick(now=None):
         action, reason = _hold_decision(
             hold, entry is not None, row, now,
             has_auth=bool(entry) and not entry.get("needs_auth"))
+        if action == "skip" and reason.startswith("restored without credentials"):
+            # an armed hold is stuck on the post-restart auth gap — the proxy
+            # may close it itself (bounded; see _auth_bootstrap)
+            asyncio.create_task(_auth_bootstrap(entry.get("account")))
         if action == "disarm":
             with _HOLD_LOCK:
                 _HOLD_STATE.pop(sid, None)
@@ -2803,6 +2881,15 @@ def _status_snapshot(session=None, all_sessions=False):
         wq = warmth_query(session=sid)
         tot = _SESSION_TOTALS.get(sid)        # .get: never create via defaultdict
         lr = last_real.get(sid)               # (ts, needs_auth) | None
+        hold = holds.get(sid)
+        if hold:
+            # what THIS hold should need (duration / ttl, same formula as the
+            # arming ack) — the global ping cap is only the safety bound
+            hold = dict(hold)
+            ttl = wq.get("ttl_s") or 3600
+            hold["expected_pings"] = min(
+                WARMTH_HOLD_MAX_PINGS,
+                max(1, int((hold["until"] - hold["armed_at"]) // ttl)))
         sessions.append({
             "session_id": sid,
             "title": r[1] if r else None,
@@ -2817,7 +2904,7 @@ def _status_snapshot(session=None, all_sessions=False):
                                  else "cold" if wq.get("found") else "absent"),
                        "remaining_s": wq.get("remaining_s"),
                        "ttl_s": wq.get("ttl_s")},
-            "hold": holds.get(sid),
+            "hold": hold,
             "cost": ({"est_usd": tot["est_usd"], "requests": tot["requests"],
                       "unpriced_requests": tot["unpriced_requests"]}
                      if tot else None),
@@ -2945,7 +3032,7 @@ def _render_admin_html(snap, host=""):
         h = s.get("hold")
         if h:
             hold = (f'until {time.strftime("%H:%M", time.localtime(h["until"]))} '
-                    f'· {h["pings"]}/{WARMTH_HOLD_MAX_PINGS} pings')
+                    f'· {h["pings"]}/{h.get("expected_pings", WARMTH_HOLD_MAX_PINGS)} pings')
             if h.get("failures"):
                 hold += f' <span class="bad">{h["failures"]} fail</span>'
             if h.get("last_result"):
