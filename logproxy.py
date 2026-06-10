@@ -1542,40 +1542,51 @@ def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
 # Replaces the statusline's JSONL heuristics with the bytes actually billed.
 # Latest snapshot per session, in-memory only (next request repopulates).
 _CONTEXT_STATS = {}
+# Latest main-line response text per session (capped at _META_TEXT_CAP), so
+# /_session can show the answer to the final user message — it exists only in
+# the response until the next turn re-ships it. In-memory only; /_end drops it.
+_LAST_RESPONSE = {}
+
+
+def _is_prompt_msg(m):
+    """The shared 'a turn starts here' predicate: a user message carrying real
+    prompt text (tool_result-only continuations, <command-*> expansions and
+    system-reminder bundles don't count). Used by _turn_stats and the
+    /_session turn grouping — one definition, so they can never disagree."""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    c = m.get("content")
+    blocks = (c if isinstance(c, list)
+              else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = (b.get("text") or "").lstrip()
+            if t and not t.startswith("<command-") \
+                    and not t.startswith("<local-command-") \
+                    and not t.startswith("<system-reminder>"):
+                return True
+    return False
 
 
 def _turn_stats(obj):
     """{turns_in_context, max_tool_result_chars, n_messages} for a messages
-    request. A 'turn' = a user message carrying real prompt text (tool_result-
-    only continuations, <command-*> expansions and system-reminder bundles
-    don't count)."""
+    request (turn definition: _is_prompt_msg)."""
     msgs = obj.get("messages") or []
     turns, big = 0, 0
     for m in msgs:
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
+        if _is_prompt_msg(m):
+            turns += 1
         c = m.get("content")
-        blocks = (c if isinstance(c, list)
-                  else [{"type": "text", "text": c}] if isinstance(c, str) else [])
-        prompt = False
-        for b in blocks:
-            if not isinstance(b, dict):
-                continue
-            if b.get("type") == "tool_result":
+        for b in (c if isinstance(c, list) else []):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
                 bc = b.get("content")
                 ln = (len(bc) if isinstance(bc, str)
                       else sum(len(x.get("text") or "") for x in bc
                                if isinstance(x, dict)) if isinstance(bc, list)
                       else 0)
                 big = max(big, ln)
-            elif b.get("type") == "text":
-                t = (b.get("text") or "").lstrip()
-                if t and not t.startswith("<command-") \
-                        and not t.startswith("<local-command-") \
-                        and not t.startswith("<system-reminder>"):
-                    prompt = True
-        if prompt:
-            turns += 1
     return {"turns_in_context": turns, "max_tool_result_chars": big,
             "n_messages": len(msgs)}
 
@@ -2087,6 +2098,7 @@ def _end_session(session_id, reason="unspecified"):
     with _HOLD_LOCK:
         dropped_hold = _HOLD_STATE.pop(session_id, None) is not None
     _CONTEXT_STATS.pop(session_id, None)
+    _LAST_RESPONSE.pop(session_id, None)
     dropped_head = False
     try:
         con = _warmth_db()
@@ -2610,6 +2622,13 @@ def _parse_usage_from_sse(raw_bytes):
     return usage
 
 
+# response text kept in meta: was 500 (title harvest needs ~60); raised so the
+# /_session view can show the LAST ANSWER — the reply to the final user message
+# exists only in the response until the next turn re-ships it as input, so a
+# request-only view always lagged one answer (user-reported 2026-06-10).
+_META_TEXT_CAP = 4000
+
+
 def _parse_response_meta(raw_bytes):
     """Capture the FULL metadata Anthropic returns, beyond the flat token counts.
 
@@ -2654,7 +2673,7 @@ def _parse_response_meta(raw_bytes):
                 meta["tool_uses"].append(cb.get("name"))
         elif t == "content_block_delta":
             d = ev.get("delta") or {}
-            if d.get("type") == "text_delta" and len(meta["text"]) < 500:
+            if d.get("type") == "text_delta" and len(meta["text"]) < _META_TEXT_CAP:
                 meta["text"] += d.get("text", "")
         elif t == "message_delta":
             if ev.get("usage") is not None:
@@ -3252,6 +3271,8 @@ _SESSION_CSS = _ADMIN_CSS + """
 pre{white-space:pre-wrap;word-break:break-word;color:#aab2c0;margin:.3em 0;
     background:#101317;padding:.5em;border-radius:4px;max-height:30em;overflow:auto}
 details>summary{cursor:pointer;color:#6ab0de}
+.turnhdr{margin:1.2em 0 .35em;padding-bottom:.15em;color:#9aa3b2;
+         font-weight:bold;border-bottom:1px solid #2a2e36}
 """
 
 _MD_HEADING_RE = re.compile(r"(?m)^#{1,3} .+$")
@@ -3302,7 +3323,7 @@ def _prevu(text, cap=350, full_cap=60000):
             f"<pre>{html.escape(t[:full_cap])}{html.escape(more)}</pre></details>")
 
 
-def _render_session_html(sid, entry, snap):
+def _render_session_html(sid, entry, snap, resp=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
     w = s.get("warmth") or {}
@@ -3332,11 +3353,15 @@ def _render_session_html(sid, entry, snap):
         m_ch = len(json.dumps(msgs)) if msgs else 0
         auth_badge = (' <span class="warn">awaiting auth (restored)</span>'
                       if entry.get("needs_auth") else "")
+        n_turns = _turn_stats(obj)["turns_in_context"]
+        turns_link = (f'<span>turns <b><a href="#turn-{n_turns}">{n_turns}'
+                      f'</a></b></span>' if n_turns else '')
         bar = (f'<p class="kv"><span>captured <b>{e(_fmt_ago(entry.get("ts")))}'
                f'</b>{auth_badge}</span>'
                f'<span>tools <b>{len(tools)}</b> &approx;{e(_fmt_tok(t_ch // 4))} tok</span>'
                f'<span>system <b>{len(sysb)}</b> blocks &approx;{e(_fmt_tok(s_ch // 4))} tok</span>'
                f'<span>messages <b>{len(msgs)}</b> &approx;{e(_fmt_tok(m_ch // 4))} tok</span>'
+               f'{turns_link}'
                f'<span class="dim">sizes are chars; tok &approx; ch/4</span></p>')
         if tools:
             trs = "".join(
@@ -3362,7 +3387,16 @@ def _render_session_html(sid, entry, snap):
                       f'<span class="role">system[{i}]</span> {badge} '
                       f'<span class="dim">{hl}</span>{_prevu(txt, cap=160)}</div>')
         rows = []
+        turn = 0
         for i, mm in enumerate(msgs):
+            # group the timeline by turn: a divider before each prompt-bearing
+            # user message (same predicate as turns_in_context — one source)
+            if _is_prompt_msg(mm):
+                turn += 1
+                cur = (' · <span class="warm">current</span>'
+                       if turn == n_turns else '')
+                rows.append(f'<div class="turnhdr" id="turn-{turn}">'
+                            f'turn {turn}{cur}</div>')
             role = mm.get("role", "?")
             content = mm.get("content")
             blocks = (content if isinstance(content, list)
@@ -3401,6 +3435,22 @@ def _render_session_html(sid, entry, snap):
                 else:
                     rows.append(f'<div class="blk">{lbl} '
                                 f'<span class="dim">{e(str(bt))}</span></div>')
+        # The answer to the FINAL user message lives only in the response until
+        # the next turn re-ships it as input — a request-only view always
+        # lagged one answer. Append it when fresher than the captured request.
+        if (resp and resp.get("text")
+                and (resp.get("ts") or 0) >= (entry.get("ts") or 0)):
+            rtxt = resp["text"]
+            trunc = (' <span class="dim">(preview capped)</span>'
+                     if resp.get("truncated") else '')
+            rows.append(f'<div class="turnhdr">answer · turn {turn or "?"} '
+                        f'<span class="dim">from the wire response — not yet '
+                        f'part of the cached prefix</span></div>')
+            rows.append(f'<div class="blk assistant">'
+                        f'<span class="sz">{len(rtxt):,} ch</span>'
+                        f'<span class="role">assistant (response)</span> '
+                        f'<span class="dim">{e(str(resp.get("stop_reason") or ""))}'
+                        f'</span>{trunc}{_prevu(rtxt)}</div>')
         body = (bar + tools_html + "".join(sb) + "".join(rows))
     foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
             f'<a href="/_status?session={e(sid)}">raw json</a> · '
@@ -3442,7 +3492,8 @@ async def handler(request: Request) -> Response:
         if entry is None:
             entry = _load_last_request_row(sess)
         return Response(_render_session_html(sess, entry,
-                                             _status_snapshot(session=sess)),
+                                             _status_snapshot(session=sess),
+                                             resp=_LAST_RESPONSE.get(sess)),
                         media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
@@ -3750,6 +3801,15 @@ async def handler(request: Request) -> Response:
                     if title_call and session_id and _title_from_text(meta.get("text")):
                         _enqueue_meta(session_id,
                                       title=_title_from_text(meta.get("text"))[:200])
+                    # main-line answer text for /_session's "last answer" block
+                    if (session_id and not title_call
+                            and role in ("parent", "unknown")
+                            and meta.get("text")):
+                        _LAST_RESPONSE[session_id] = {
+                            "text": meta["text"],
+                            "truncated": len(meta["text"]) >= _META_TEXT_CAP,
+                            "stop_reason": meta.get("stop_reason"),
+                            "ts": time.time()}
                     bill = _billing("messages",
                                     model_resolved=meta.get("resolved_model") or model,
                                     usage_final=meta.get("usage_final"),

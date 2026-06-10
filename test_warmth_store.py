@@ -606,6 +606,40 @@ check("session view never renders headers",
 check("session view handles a missing entry",
       "no replayable request" in lp._render_session_html(
           "nope", None, lp._status_snapshot(session="nope")))
+_tv_entry = {
+    "obj": {"model": "claude-fable-5", "tools": [], "system": "sys",
+            "messages": [
+                msg("user", "first question"),
+                msg("assistant", "answer one"),
+                {"role": "user", "content": [{"type": "tool_result",
+                 "tool_use_id": "t1", "content": "hop"}]},
+                msg("assistant", "after the hop"),
+                msg("user", "second question"),
+                msg("assistant", "answer two"),
+            ]},
+    "path": "/v1/messages", "ts": time.time(), "needs_auth": False}
+_tv = lp._render_session_html("sess-meta-1", _tv_entry,
+                              lp._status_snapshot(session="sess-meta-1"))
+check("session view groups the timeline by turn (divider per prompt msg, "
+      "tool hop doesn't start one)",
+      _tv.count('class="turnhdr"') == 2
+      and 'id="turn-1"' in _tv and 'id="turn-2"' in _tv)
+check("last turn is marked current and the bar links to it",
+      'turn 2 · <span class="warm">current</span>' in _tv
+      and 'href="#turn-2"' in _tv
+      and _tv.count("current</span>") == 1)
+_tv_resp = lp._render_session_html(
+    "sess-meta-1", _tv_entry, lp._status_snapshot(session="sess-meta-1"),
+    resp={"text": "final answer <i>here", "stop_reason": "end_turn",
+          "truncated": False, "ts": _tv_entry["ts"] + 1})
+check("session view appends the last ANSWER from the response "
+      "(the reply a request-only view always missed)",
+      "answer · turn 2" in _tv_resp and "assistant (response)" in _tv_resp
+      and "&lt;i&gt;here" in _tv_resp and "final answer <i>" not in _tv_resp)
+check("a response OLDER than the captured request is not shown (stale)",
+      "assistant (response)" not in lp._render_session_html(
+          "sess-meta-1", _tv_entry, lp._status_snapshot(session="sess-meta-1"),
+          resp={"text": "old", "ts": _tv_entry["ts"] - 99}))
 check("admin page links each session to its context view",
       "/_session?session=" in lp._render_admin_html(
           lp._status_snapshot(all_sessions=True)))
