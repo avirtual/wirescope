@@ -40,6 +40,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -1434,6 +1435,13 @@ def _warmth_db():
                         "session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
                         "model TEXT, first_seen REAL NOT NULL, "
                         "last_seen REAL NOT NULL)")
+            # `kind` tags sessions the PROXY ITSELF spawned (auth bootstrap),
+            # so the status/admin views can keep them out of the human's
+            # session list. NULL = a real user session.
+            try:
+                con.execute("ALTER TABLE session_meta ADD COLUMN kind TEXT")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             # RESTART-AMNESIA (open item h): per-proxy runtime state, mirrored on
             # every change and reloaded at startup, so a restart recovers what
             # the process held. owner = LOG_DIR (see _OWNER).
@@ -1501,9 +1509,10 @@ _META_CWD_DONE = set()                          # sids whose cwd is stored
 _META_CWD_MAX_TRIES = 5    # env block shows up in the first turns or never
 
 
-def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None):
+def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
+                         kind=None):
     """Durable identity row; COALESCE keeps existing values when a field isn't
-    supplied, so the per-request last_seen bump never erases title/cwd."""
+    supplied, so the per-request last_seen bump never erases title/cwd/kind."""
     if not session_id:
         return
     now = now or time.time()
@@ -1512,13 +1521,14 @@ def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None)
         with _DB_LOCK:
             con.execute(
                 "INSERT INTO session_meta(session_id, title, cwd, model, "
-                "first_seen, last_seen) VALUES(?,?,?,?,?,?) "
+                "first_seen, last_seen, kind) VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
                 "title=COALESCE(excluded.title, session_meta.title), "
                 "cwd=COALESCE(excluded.cwd, session_meta.cwd), "
                 "model=COALESCE(excluded.model, session_meta.model), "
+                "kind=COALESCE(excluded.kind, session_meta.kind), "
                 "last_seen=excluded.last_seen",
-                (session_id, title, cwd, model, now, now))
+                (session_id, title, cwd, model, now, now, kind))
             con.commit()
     except Exception as e:
         print(f"[meta] session_meta upsert failed for {session_id[:12]}…: {e}",
@@ -2190,15 +2200,23 @@ async def _auth_bootstrap(account=None):
     _AUTH_BOOTSTRAP["attempts"] += 1
     _AUTH_BOOTSTRAP["last_ts"] = time.time()
     port = os.environ.get("PORT", "7800")
+    # Pre-chosen session id, tagged kind=bootstrap BEFORE the spawn: every
+    # request of this session (incl. the title side-call) arrives already
+    # identifiable as proxy-spawned, and /_status hides it from the human's
+    # session list (traffic upserts COALESCE, so the tag sticks).
+    sid = str(uuid.uuid4())
+    _upsert_session_meta(sid, kind="bootstrap", cwd="/tmp",
+                         model=WARMTH_AUTH_BOOTSTRAP_MODEL)
     print(f"[auth] bootstrap: spawning a minimal {WARMTH_AUTH_BOOTSTRAP_MODEL} "
-          f"turn through :{port} to re-acquire account credentials "
-          f"(attempt {_AUTH_BOOTSTRAP['attempts']}/{_AUTH_BOOTSTRAP_MAX})",
-          flush=True)
+          f"turn through :{port} as {sid[:8]}… to re-acquire account "
+          f"credentials (attempt {_AUTH_BOOTSTRAP['attempts']}/"
+          f"{_AUTH_BOOTSTRAP_MAX})", flush=True)
     proc = None
     try:
         env = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"}
         proc = await asyncio.create_subprocess_exec(
             "claude", "-p", "--model", WARMTH_AUTH_BOOTSTRAP_MODEL,
+            "--session-id", sid,
             "--tools", "Bash", "Reply with exactly: ok",
             cwd="/tmp", env=env,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
@@ -2904,8 +2922,8 @@ def _status_snapshot(session=None, all_sessions=False):
     try:
         con = _warmth_db()
         with _DB_LOCK:
-            q = ("SELECT session_id, title, cwd, model, first_seen, last_seen "
-                 "FROM session_meta")
+            q = ("SELECT session_id, title, cwd, model, first_seen, last_seen, "
+                 "kind FROM session_meta")
             if session:
                 cur = con.execute(q + " WHERE session_id=?", (session,))
             elif all_sessions:
@@ -2921,6 +2939,10 @@ def _status_snapshot(session=None, all_sessions=False):
     sessions = []
     for sid in sids:
         r = meta_rows.get(sid)
+        kind = r[6] if r else None
+        if kind and not (session or all_sessions):
+            continue  # proxy-spawned utility session (auth bootstrap) — not
+                      # the human's; visible via ?all=1 or direct ?session=
         wq = warmth_query(session=sid)
         tot = _SESSION_TOTALS.get(sid)        # .get: never create via defaultdict
         lr = last_real.get(sid)               # (ts, needs_auth) | None
@@ -2938,6 +2960,7 @@ def _status_snapshot(session=None, all_sessions=False):
                 max(1, int((hold["until"] - ref) // ttl)))
         sessions.append({
             "session_id": sid,
+            "kind": kind,
             "title": r[1] if r else None,
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
@@ -3096,10 +3119,12 @@ def _render_admin_html(snap, host=""):
                 f'</span>') if c else '<span class="dim">—</span>'
         sref = s.get("refusals") or 0
         sid = s["session_id"]
+        kindb = (f' <span class="badge off">&#129302; {e(s["kind"])}</span>'
+                 if s.get("kind") else "")
         rows.append(
             f'<tr><td>{warmth}</td>'
             f'<td><b><a href="/_session?session={e(sid)}">'
-            f'{e(s.get("title") or "(untitled)")}</a></b><br>'
+            f'{e(s.get("title") or "(untitled)")}</a></b>{kindb}<br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(_short_model(s.get("model")))}</span><br>'
             f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'

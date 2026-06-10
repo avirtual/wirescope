@@ -258,6 +258,34 @@ check("meta upserts merge (COALESCE keeps earlier fields) + survive restart",
       row == (row[0], "/tmp/projA", "claude-fable-5", row[3], row[4])
       and row[0] == "Fix the frobnicator" and row[4] >= row[3])
 
+# --- session meta: kind tag (proxy-spawned bootstrap sessions) -------------------
+# The auth bootstrap pre-registers its spawn's session id with kind=bootstrap;
+# later traffic upserts must not erase it, and the status/admin views keep it
+# out of the human's default session list.
+lp._upsert_session_meta("sess-boot-1", kind="bootstrap", cwd="/tmp",
+                        model="claude-haiku-4-5-20251001")
+lp._upsert_session_meta("sess-boot-1", title="Process user session request")
+con4 = sqlite3.connect(os.environ["WARMTH_DB"])
+krow = con4.execute("SELECT kind, title FROM session_meta "
+                    "WHERE session_id='sess-boot-1'").fetchone()
+con4.close()
+check("kind survives traffic upserts (COALESCE)",
+      krow == ("bootstrap", "Process user session request"))
+st_all = lp._status_snapshot(all_sessions=True)
+st_def = lp._status_snapshot()
+in_all = [s for s in st_all["sessions"] if s["session_id"] == "sess-boot-1"]
+check("bootstrap session visible under all=1 and carries kind",
+      len(in_all) == 1 and in_all[0]["kind"] == "bootstrap")
+check("bootstrap session HIDDEN from the default session list",
+      not any(s["session_id"] == "sess-boot-1" for s in st_def["sessions"]))
+check("direct ?session= still shows a bootstrap session",
+      any(s["session_id"] == "sess-boot-1"
+          for s in lp._status_snapshot(session="sess-boot-1")["sessions"]))
+check("real sessions carry kind=None",
+      all(s["kind"] is None for s in st_def["sessions"]))
+check("admin marks proxy-spawned sessions (robot badge)",
+      "&#129302; bootstrap" in lp._render_admin_html(st_all, host="t:7800"))
+
 # --- session meta: cwd extraction + title-call detection -------------------------
 check("cwd from system text", lp._extract_cwd(
     {"system": [{"type": "text",
