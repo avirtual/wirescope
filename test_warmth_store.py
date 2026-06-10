@@ -677,6 +677,90 @@ check("admin page links each session to its context view",
       "/_session?session=" in lp._render_admin_html(
           lp._status_snapshot(all_sessions=True)))
 
+# --- WB intent tee (workbench integration: WB_INTENT_DISPATCH) ----------------
+# The tee is tested with an injected parse stub (boundary discipline is OURS;
+# intent grammar is the workbench's) and a collector in place of the async
+# dispatcher. One conditional check loads the REAL parse_intents when the
+# workbench checkout is present.
+
+def _sse_text_delta(t, crlf=False):
+    sep = "\r\n" if crlf else "\n"
+    data = json.dumps({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": t}})
+    return (f"event: content_block_delta{sep}data: {data}{sep}{sep}").encode()
+
+
+def _fake_parse(text):
+    # Stand-in for intent_parser.parse_intents: every "[wb:" occurrence is one
+    # accepted intent, in order. Grammar fidelity is irrelevant to the tee.
+    return [("post", f"t{i}", f"b{i}") for i in range(text.count("[wb:"))]
+
+
+_sent = []
+_tee = lp._WbIntentTee("agent-x", "7-120000",
+                       parse_fn=_fake_parse, dispatch_fn=_sent.append)
+_tee.feed(_sse_text_delta("hello [wb:post note] first body"))
+check("wb tee holds the tail intent while its body may still grow",
+      _sent == [] and _tee.dispatched == 0)
+_tee.feed(_sse_text_delta(" more body\n[wb:dm bob] second"))
+check("wb tee dispatches intent N once intent N+1 locks its boundary",
+      len(_sent) == 1 and _sent[0]["action"] == "post"
+      and _sent[0]["target"] == "t0" and _sent[0]["body"] == "b0")
+_tee.close()
+check("wb tee close() flushes the held tail intent",
+      len(_sent) == 2 and _sent[1]["target"] == "t1")
+check("wb intent payloads carry agent identity + proxy-scoped intent_id + ts",
+      _sent[0]["agent"] == "agent-x"
+      and _sent[0]["intent_id"].startswith("proxy-7-120000-0000-")
+      and "ts" in _sent[0])
+_tee.feed(_sse_text_delta("[wb:post late] after close"))
+_tee.close()
+check("wb tee ignores feeds after close; double close is idempotent",
+      len(_sent) == 2)
+
+_sent2 = []
+_tee2 = lp._WbIntentTee("a", "1-1", parse_fn=_fake_parse,
+                        dispatch_fn=_sent2.append)
+_blob = _sse_text_delta("[wb:post x] split across") \
+    + _sse_text_delta(" chunks [wb:post y] tail")
+for i in range(0, len(_blob), 7):     # mid-event, mid-JSON chunk boundaries
+    _tee2.feed(_blob[i:i + 7])
+_tee2.close()
+check("wb tee reassembles SSE events split across arbitrary chunk boundaries",
+      len(_sent2) == 2)
+
+_sent3 = []
+_tee3 = lp._WbIntentTee("a", "1-2", parse_fn=_fake_parse,
+                        dispatch_fn=_sent3.append)
+_tee3.feed(_sse_text_delta("[wb:post crlf] body", crlf=True))
+_tee3.close()
+check("wb tee handles CRLF-framed SSE", len(_sent3) == 1)
+
+_sent4 = []
+_tee4 = lp._WbIntentTee("a", "1-3", parse_fn=_fake_parse,
+                        dispatch_fn=_sent4.append)
+_tee4.feed(b'event: content_block_delta\ndata: {"type": "content_block_delta",'
+           b' "delta": {"type": "input_json_delta", "partial_json": "[wb:"}}\n\n')
+_tee4.feed(b'event: message_delta\ndata: {"type": "message_delta",'
+           b' "usage": {"output_tokens": 5}}\n\n')
+_tee4.close()
+check("wb tee ignores non-text deltas (tool_use args never parse as intents)",
+      _sent4 == [])
+
+check("wb parser loader returns None on a missing file (proxy still comes up)",
+      lp._load_intent_parser("/nonexistent/intent_parser.py") is None)
+_real_pi_path = os.path.expanduser("~/projects/agent-workbench/intent_parser.py")
+if os.path.exists(_real_pi_path):
+    _real_pi = lp._load_intent_parser(_real_pi_path)
+    check("wb parser loader imports the real workbench parse_intents",
+          callable(_real_pi) and isinstance(_real_pi("plain prose"), list))
+else:
+    print("SKIP  wb real-parser load (workbench checkout not present)")
+
+check("wb intent dispatch flag is surfaced in /_status",
+      "wb_intent_dispatch" in lp._status_snapshot()["proxy"]["flags"]
+      and "wb_intents" in lp._status_snapshot()["proxy"])
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
