@@ -44,6 +44,13 @@ end-to-end (haiku, session `329a6d9b-*`).
   fable = lab specimen; periodic classifier-weather probe = workbench prompt +
   "2+2" through `:7800`. Side anomaly to watch: one `not_found_error: model:
   claude-fable-5[1m]` on a title side-call (`logs_main/396a2918-*/020`).
+- **NEXT BUILD TARGET (user decision 2026-06-10): restart-amnesia — open
+  item (h).** The proxy must not "return clueless from a restart": every
+  relevant in-memory structure should be persisted/reconstructible so a
+  restart recovers most of what it held (the few seconds of downtime
+  themselves don't matter). See item (h) for the piece-by-piece inventory;
+  armed holds were the trigger (a restart silently forgets a user's
+  `/warm-cache`).
 - **Carryovers (still pending):** writer thread still swallows exceptions
   silently (`except: pass` — add dropped-writes counter); `_LAST_REQUEST` cap
   (2000) generous; ONE measured A/B "proxied all-levers vs vanilla 1P" before
@@ -430,6 +437,37 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   never stamped → pings decline (`unknown`) until the next good turn (fail-safe but
   loses pingability); ping TOCTOU (warm check vs arrival) — the hold pings inside
   the margin (default 300s), never at the TTL edge.
+- (h) **Restart-amnesia / state reconstruction (user decision 2026-06-10).**
+  Principle: the proxy should persist the state of the relevant in-memory
+  pieces to the DB so a restart gets back most of what it held — "everything
+  should be reconstructible"; don't worry about the couple of seconds the
+  restart itself takes. Today only the warmth ledger + session_head +
+  session_meta survive; piece-by-piece plan:
+  - **`_HOLD_STATE`** (the trigger for this item): pure intent, nothing
+    secret — persist (sid, until, armed_at, pings, failures) in a SQLite
+    table, mirror on every change, reload at startup. After a restart the
+    hold sits skipping ("no replayable request") until the session's next
+    real turn re-stashes the payload, then RESUMES — no silent forgetting of
+    a user's `/warm-cache`.
+  - **`_LAST_REQUEST`** — the hard one, split it: BODIES are not
+    secret-bearing beyond what LOG_DIR already stores (the captures contain
+    the same post-transform bodies), so they may be persisted (or
+    reconstructed from the newest `*.request.json` per session). The AUTH
+    HEADERS stay off disk (standing rule). Reconstruction idea: auth is
+    ACCOUNT-level, not session-level — on restart, re-attach auth to a
+    restored body from the first live request of the same `account_uuid`
+    (it arrives within seconds on a busy box). Until donated, entries are
+    "auth-less" and pings decline gracefully.
+  - **`_TOTALS` / `_SESSION_TOTALS`**: already snapshotted to
+    `_totals.json` / `_session.json` on every request — just RELOAD them at
+    startup instead of zeroing (decide whether process-lifetime or
+    LOG_DIR-lifetime semantics; probably reload + keep a separate
+    `since_start` field).
+  - **`_META_CWD_DONE/_TRIES`**: derive from session_meta at startup
+    (cwd IS NULL → still hunting).
+  - Already fine: canary state (on disk per LOG_DIR, lazy-loaded), warmth
+    ledger, session_head/meta. Explicitly OK to lose: `_SC_FIRED`,
+    `_PENDING_RELAY`, `_UNPRICED_WARNED` (ephemeral per-turn / cosmetic).
 
 ## Model-switch day (2026-06-09): claude-fable-5 observations
 
