@@ -1,51 +1,49 @@
 # proxy-lab — handoff for the next session
 
-## ⚡ NOTE TO SELF — state as of session end 2026-06-09 (evening, fable-5)
+## ⚡ NOTE TO SELF — state as of session end 2026-06-10 (early am, fable-5)
 
-Big rework LANDED THIS SESSION, code-complete and tested, but NOT yet running
-on the live ports:
+Investigation night, NO code changes (repo still at `80ed21b`). The proxy paid
+for itself: it exposed a fable-only SERVER-SIDE refusal classifier hiding
+behind a nonsense CLI error.
 
-- **SHIPPED:** warmth ledger → shared SQLite (`warmth.sqlite`, `WARMTH_DB`),
-  TWO-STATE gates (warm vs not-warm; strip-on-absent is deliberate — user
-  decision, see Warmth section), sweeper demoted to hygiene-only (the old one
-  had a real bug: reaped cold evidence at bare ttl → compact-strip could only
-  fire ≤300s past expiry), pricing fixed (fable-5 = $10/$50 = 2× opus-4.8;
-  opus-4.5+ split from legacy $15/$75 — **logs_opus USD numbers were ~3× high**;
-  unpriced-model accounting now loud), handler fail-open on non-JSON bodies
-  (was NameError→500). All verified: `python3 test_warmth_store.py` (24 checks)
-  + endpoint smoke test on :7899.
-- **RESTART: DONE (2026-06-09 late evening).** All eight lab ports killed and
-  relaunched via `./start_proxy.sh` — new SQLite/two-state code is live;
-  `warmth.sqlite` created; `/_warm`/`/_ping` smoke-checked on :7813 (clean
-  not-found on a bogus session). `_LAST_REQUEST` started empty as expected.
-  **Superseded the same evening by the ONE-PROXY consolidation** (user: "one
-  proxy to rule them all") — zoo decommissioned, `:7800 → logs_main` is the only
-  proxy now; see Operational state.
-  **DISCREPANCY FOUND during restart (`ps -E` on the old pids):** the OLD :7813
-  process had NO `RELOCATE_*/SORT_TOOLS/CANARY/STRIP_SYSTEM_SECTIONS` overrides
-  in its environment — i.e. it ran with those transforms at their DEFAULTS (ON),
-  not "vanilla transforms OFF" as this file claimed. So pre-restart
-  `logs_compact_warmth` captures (incl. the warm/cold strip verdicts and the
-  fable 7bc2d1d6 capture) were taken WITH transforms on. A/B-internal
-  conclusions (warm declines / cold strips) compared like-with-like and stand;
-  just don't treat those captures as transform-free wire shapes. The relaunched
-  :7813 NOW matches the documented config (explicit =0s, verified via ps -E).
-- **REVIEW FINDINGS FIXED:** sweeper bug, NameError, stale WARMTH_BLOCK_COLD_PING
-  comment, analyze_tools silent sonnet pricing, flat-cache_creation undercount.
-  **FOUND BUT NOT FIXED (small):** writer thread swallows exceptions silently
-  (`except: pass` — add a dropped-writes counter); `_LAST_REQUEST` cap (2000)
-  is generous for full bodies in memory.
-- **STRATEGIC NOTES from the fresh-eyes review (user broadly agreed):** (1) the
-  two biggest savings are native (tool-trim, @file) — worth ONE measured A/B of
-  "net cost of being proxied, all levers on, vs vanilla 1P" before treating the
-  proxy as a deployed optimizer (user: org angle tangential, tools-for-self);
-  (2) transcript cleaner (open item c) Tier-2 supersession-stubs REWRITE early
-  history → bust downstream cache on a warm prefix — gate Tier-2 on the warmth
-  ledger / apply at compact-time, same logic as compact-strip; (3) SC priors are
-  4.x-only — revalidate on fable before using.
-- **NEXT BUILD TARGET (unchanged):** the no-proxy `hold-warm` driver loop
-  (poll `/_warm?session=`, fire `/_ping` near TTL edge, cap + heartbeat) — now
-  on a durable two-state foundation. Then statusline (b).
+- **NEW WIRE SHAPE — server-side refusal** (full writeup: "fable's server-side
+  refusal classifier" section): `stop_reason:"refusal"` + structured
+  `stop_details{category:"reasoning_extraction", ToS explanation,
+  fallback_credit_token}` — ZERO content blocks, the model never spoke. Trigger
+  was the user's WORKBENCH multi-agent system prompt (32k, `[wb:dm]` intent
+  syntax, wrap-daemon/transcript-logging prose); the user message was literally
+  "2+2". FABLE-ONLY — same prompt fine on opus/haiku same day. The CLI flattens
+  it to a generic "Session paused … cybersecurity or biology topics" toast; the
+  wire `stop_details` is the only honest signal and the CLI discards it.
+  Billing: the refused turn still billed the full 47,374-tok 1h cache write
+  (~$0.97) and the warmth ledger correctly receipt-stamped it (a refused prefix
+  IS a warm prefix). Capture: `logs_main/396a2918-*/021`.
+- **NAMING:** the user's harness = **workbench** ("wb"). The "FleetView" string
+  in the CLI's agent-type descriptions is NOT the user's — likely a native
+  fleet layer in CLI 2.1.170.x; pull that thread if it ever shows in a capture.
+- **USER DECISIONS:** workbench stays on 4.x models; fable = lab specimen only.
+  A 2-line intent-system preamble lowers the classifier score at turn 1 but it
+  re-fires randomly later (soft threshold, score drifts as protocol-flavored
+  text accumulates) — not fixable prompt-side, so don't convert agents yet.
+  Periodic classifier-weather probe instead: workbench prompt + "2+2" through
+  `:7800`; convert one expendable worker only after it stays clean a while.
+- **QUEUED CODE CHANGE (next time logproxy.py is touched): refusal counter** —
+  count `stop_reason:"refusal"` per session in `_totals.json`, loud `[dump]`
+  flag, record `stop_details.category` + request_id (same pattern as the
+  unpriced-model accounting). Gives a false-positive RATE + request_ids for
+  /feedback reports instead of anecdotes.
+- **Side anomaly:** the title side-call of that session got `not_found_error:
+  model: claude-fable-5[1m]` (`logs_main/396a2918-*/020`) — the API rejected
+  the `[1m]`-suffixed id on that route. One-off so far; watch for recurrence.
+- **Carryovers (still pending):** writer thread swallows exceptions silently
+  (`except: pass` — add dropped-writes counter); `_LAST_REQUEST` cap (2000)
+  generous; ONE measured A/B "proxied all-levers vs vanilla 1P" before calling
+  the proxy an optimizer; Tier-2 cleaner must be warmth-gated; SC priors are
+  4.x-only. Provenance: pre-2026-06-09-restart `logs_compact_warmth` captures
+  were transforms-ON (A/B-internal verdicts stand; not transform-free shapes).
+- **NEXT BUILD TARGET (user decision, jumps the queue ahead of hold-warm):
+  the STATUSLINE experiment (open item b)** — show time-till-cache-cold from
+  `/_warm` in the Claude Code statusline. Then the hold-warm driver (a) on top.
 
 A HANDOFF note, not an archive. Goal: get a fresh context productive fast.
 The blow-by-blow record (every experiment, session-id, intermediate
@@ -358,7 +356,18 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
     BOTH `thinking` and `context_management` (neither is in the cached prefix).
     Note a tiny `cache_creation` (~760 tok) per ping: the cached tail message sits
     just past the last breakpoint so it re-writes incrementally — bulk still reads.
-- (b) Statusline snippet rendering `/_warm` (🔥 warm·58m vs ❄️).
+- (b) **NEXT (user decision 2026-06-10): statusline cache-warmth display.**
+  Claude Code `statusLine` = a command in settings.json that receives session
+  JSON on stdin (carries `session_id`, model, workspace) — snippet curls
+  `http://localhost:7800/_warm?session=<id>` and renders remaining time, e.g.
+  `🔥 54m` (warm, `remaining_s`) / `❄️` (found-but-lapsed) / `–` (not found or
+  proxy down; non-proxied sessions land here). Design notes: `/_warm` is
+  ledger-only (SQLite) so it works right after a proxy restart when
+  `_LAST_REQUEST` is empty; read-only, spends no credits, safe at statusline
+  refresh frequency; keep the curl timeout tiny (~0.2s) so a dead proxy never
+  stalls the prompt. VERIFY first: statusline-stdin `session_id` == wire
+  session_id (expected — SessionEnd hook id matched the wire id when tested
+  2026-06-09 — but confirm before trusting the render).
 - (c) Deterministic transcript CLEANER (Tier-1 lossless bookkeeping-noise strip,
   Tier-2 supersession: stale Read before a later Edit/Write → stub) before any AI
   compaction. Stubs must stay non-empty + keep tool_use/tool_result paired.
@@ -445,6 +454,47 @@ structurally — "reacts to unknown keys" (user). Key diff across captures:
   fix alongside the heading-list idea: fingerprint control-plane keys
   (`thinking.type`, `output_config` sans schemas, `context_management` edit
   types).
+
+### fable's server-side refusal classifier (2026-06-10, caught live by the proxy)
+
+A user-run interactive CLI through `:7800` with a custom **workbench**
+multi-agent system prompt (32k ch: `[wb:dm]/[wb:post]` intent syntax,
+wrap-daemon/forge-event/transcript-path prose) sent user message "2+2" and got
+hard-blocked UPSTREAM. Capture: `logs_main/396a2918-*/021`.
+
+- **Wire shape (NEW):** `message_start` → `message_delta` with
+  `stop_reason:"refusal"` and structured `stop_details: {type:"refusal",
+  category:"reasoning_extraction", explanation:"…Terms of Service restrictions
+  on reverse engineering or duplicating model outputs…", fallback_credit_token:
+  null, fallback_has_prefill_claim:null}` → `message_stop`. ZERO content
+  blocks, `thinking_tokens:0` — the model never ran; this is a classifier in
+  front of it, a separate enforcement layer from text-level refusals.
+  `fallback_credit_*` ties to the `fallback-credit-2026-06-01` beta — possibly
+  a credit-refund path for blocked requests (null here; nothing refunded).
+- **Trigger = system prompt CONTENT, not the message and not the proxy.** The
+  classifier reads descriptions, not behavior: our proxy (which actually
+  captures every byte) sails through because its wire shape stays canonical;
+  the workbench prompt merely *describes* transcript/event logging and gets
+  convicted. Keyword cluster suspected: `transcript_path` / "log every CLI
+  session event" / wrap-daemon prose.
+- **MODEL-GATED:** fable-only; the identical prompt runs fine on opus-4.8 and
+  haiku same day ⇒ classifier sits on the new model's endpoint (asset
+  protection for the newest weights, not account-level ToS enforcement).
+- **Soft threshold, not a rule:** a 2-line intent-system preamble up front
+  clears turn 1, but it re-fires non-deterministically on later turns as
+  protocol-flavored text accumulates in context. Worst failure mode for a
+  persistent agent: random mid-session kills.
+- **CLI hides the truth:** the visible error is a generic "Session paused —
+  Fable 5 has safety measures that flag … cybersecurity or biology topics"
+  toast (+ /feedback link). Category, ToS claim, and request_id are all wire-
+  only. Anyone debugging from the UI would blame their *message* forever.
+- **Billing/warmth interactions:** the refused turn still bills the full
+  prefix cache write (47,374 tok 1h ≈ $0.97 here), and `_record_warmth`
+  correctly stamps it (`cache_creation>0` — caching DID happen). A refused
+  prefix is a warm prefix; a mid-session block that forces a retry pays
+  carriage twice.
+- **TODO hook:** refusal counter in `_totals.json` + `[dump]` flag (see NOTE
+  TO SELF). Canary can't see this — it fingerprints requests, not responses.
 
 ### fable-probe (2026-06-09, first experiment on THE consolidated proxy)
 
