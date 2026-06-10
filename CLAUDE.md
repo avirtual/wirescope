@@ -1,63 +1,16 @@
 # proxy-lab — handoff for the next session
 
-## ⚡ NOTE TO SELF — state as of session end 2026-06-10 (mid-day, fable-5)
+## ⚡ Ephemeral handoff state → `HANDOFF.local.md` (gitignored)
 
-BUILD session: **hold-warm + /_status SHIPPED**; `:7800` restarted on the new
-code (hold defaults: 60s tick / 300s margin / 12h clamp / 24-ping cap). All 55
-offline checks pass (`python3 test_warmth_store.py`); live drill on
-`:7802`/`logs_scratch` verified arm → auto-ping WARMED → disarm → `/_end`
-end-to-end (haiku, session `329a6d9b-*`).
+@HANDOFF.local.md
 
-- **SHIPPED: /warm-cache hold driver (open item a CLOSED).** User arms a
-  session IN-BAND: `~/.claude/commands/warm-cache.md` expands to a
-  `<proxy:warm-cache hours=N>` sentinel; the proxy CAPTURES the turn (never
-  forwarded; session_id rides in via metadata), arms `until = now + N·3600`,
-  and answers with a synthetic end_turn ack that reports REAL warmth state.
-  Dynamic per-arm duration — no fixed-hours env knob. An asyncio task
-  (Starlette `on_startup` — it needs the event-loop `_client`) auto-pings each
-  armed session when its WARM prefix has < margin left. Sentinel turn does NOT
-  update `_LAST_REQUEST` (never cached upstream — the previous real turn stays
-  the replayable prefix). Not-warm only SKIPS, never disarms: a later real turn
-  re-warms and the hold resumes. Disarm paths: expiry / `/warm-cache off` /
-  `/_end` / max-pings / 2 consecutive ping FAILURES (clean warm-only declines
-  don't count). `WARMTH_HOLD*` knobs in the flag table.
-- **SHIPPED: `GET /_status[?session=][&all=1]`** — sessions with title, cwd,
-  model, warmth, hold state, per-session cost, refusals + proxy flags/totals.
-  Identity (title/cwd/model) is DURABLE in a new `session_meta` table in
-  warmth.sqlite: the CLI's per-session TITLE side-call is now harvested instead
-  of discarded (on CLI 2.1.170.x+haiku it answers structured-outputs JSON
-  `{"title": …}` — `_title_from_text` unwraps it), cwd comes from the
-  "Primary working directory:" line (system / msg0 bundle / relocated tail;
-  capped 5 scan attempts per sid).
-- **SHIPPED: refusal counter** (the queued change) — `refusals` +
-  `refusal_events` (category, request_id; last 20) in `_totals.json` /
-  `_session.json` / `/_status`, loud `*** REFUSAL ***` `[dump]` line.
-- **FIXED latent writer bug:** a queue item with `path=None` (ledger when
-  WARMTH_LOG_FILE=0) crashed on `path.parent.mkdir` and the bare except
-  silently dropped the WHOLE item, warmth stamp included. mkdir now guarded.
-- **Statusline (open item b) DONE last session** — proxy-polling script is in
-  `~/tmp/proxy-sl-test/.claude/` (NOT `~/tmp/.claude` — that's the older
-  transcript-inferring version). Natural next iteration: render title/hold
-  (🔥3) from `/_status`.
-- **Fable refusal-classifier intel (2026-06-10 night, unchanged):** see
-  "fable's server-side refusal classifier" section; workbench stays on 4.x,
-  fable = lab specimen; periodic classifier-weather probe = workbench prompt +
-  "2+2" through `:7800`. Side anomaly to watch: one `not_found_error: model:
-  claude-fable-5[1m]` on a title side-call (`logs_main/396a2918-*/020`).
-- **NEXT BUILD TARGET (user decision 2026-06-10): restart-amnesia — open
-  item (h).** The proxy must not "return clueless from a restart": every
-  relevant in-memory structure should be persisted/reconstructible so a
-  restart recovers most of what it held (the few seconds of downtime
-  themselves don't matter). See item (h) for the piece-by-piece inventory;
-  armed holds were the trigger (a restart silently forgets a user's
-  `/warm-cache`).
-- **Carryovers (still pending):** writer thread still swallows exceptions
-  silently (`except: pass` — add dropped-writes counter); `_LAST_REQUEST` cap
-  (2000) generous; ONE measured A/B "proxied all-levers vs vanilla 1P" before
-  calling the proxy an optimizer; Tier-2 cleaner must be warmth-gated; SC
-  priors are 4.x-only; `_META_CWD_TRIES`/`_META_CWD_DONE` grow unbounded
-  (tiny). Provenance: pre-2026-06-09-restart `logs_compact_warmth` captures
-  were transforms-ON (A/B-internal verdicts stand; not transform-free shapes).
+The session-end NOTE TO SELF (what shipped, what's live, the NEXT build
+target, pending carryovers) lives in **`HANDOFF.local.md`** — local-only,
+gitignored, imported above so every fresh context still loads it. **Update
+THAT file at session end, not this one** — future plans and in-flight state
+must not leak into git commits. CLAUDE.md is for DURABLE conclusions + how to
+run; commit it only when those change. If `HANDOFF.local.md` is missing
+(fresh clone), recreate it from this convention — nothing durable is lost.
 
 A HANDOFF note, not an archive. Goal: get a fresh context productive fast.
 The blow-by-blow record (every experiment, session-id, intermediate

@@ -5,3 +5,5 @@ logs_*/
 *.out
 warmth.sqlite*
 _canary/
+HANDOFF.local.md
+*.local.md
