@@ -1443,6 +1443,14 @@ def _warmth_db():
                         "pings INTEGER NOT NULL, failures INTEGER NOT NULL, "
                         "last_ping_ts REAL, last_result TEXT, "
                         "PRIMARY KEY (owner, session_id))")
+            # `hours` = the hold's INSURANCE WINDOW (2026-06-10): `until` slides
+            # to last-organic-turn + hours, so the original until/armed_at pair
+            # no longer encodes the duration. Migrate in place; legacy rows
+            # (NULL) derive hours from (until - armed_at).
+            try:
+                con.execute("ALTER TABLE hold_state ADD COLUMN hours REAL")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             # The replayable last request: BODY + NON-SECRET headers only. The
             # body is no more secret than the LOG_DIR captures (same
             # post-transform bytes); auth headers NEVER land on disk (standing
@@ -2223,16 +2231,17 @@ def _persist_hold_row(session_id, h):
         with _DB_LOCK:
             con.execute(
                 "INSERT INTO hold_state(owner, session_id, until, armed_at, "
-                "pings, failures, last_ping_ts, last_result) "
-                "VALUES(?,?,?,?,?,?,?,?) "
+                "pings, failures, last_ping_ts, last_result, hours) "
+                "VALUES(?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(owner, session_id) DO UPDATE SET "
                 "until=excluded.until, armed_at=excluded.armed_at, "
                 "pings=excluded.pings, failures=excluded.failures, "
                 "last_ping_ts=excluded.last_ping_ts, "
-                "last_result=excluded.last_result",
+                "last_result=excluded.last_result, hours=excluded.hours",
                 (_OWNER, session_id, h["until"], h["armed_at"],
                  h.get("pings", 0), h.get("failures", 0),
-                 h.get("last_ping_ts"), h.get("last_result")))
+                 h.get("last_ping_ts"), h.get("last_result"),
+                 h.get("hours")))
             con.commit()
     except Exception as e:
         print(f"[hold] persist failed for {session_id[:12]}…: {e}", flush=True)
@@ -2300,7 +2309,7 @@ def _arm_hold(session_id, action, hours):
                 "this proxy (needs WARMTH_HOLD + WARMTH_PINGER + WARMTH_LEDGER).",
                 {"armed": False, "reason": "disabled"})
     until = now + hours * 3600
-    hstate = {"until": until, "armed_at": now, "pings": 0,
+    hstate = {"until": until, "armed_at": now, "hours": hours, "pings": 0,
               "failures": 0, "last_ping_ts": None, "last_result": None}
     with _HOLD_LOCK:
         _HOLD_STATE[session_id] = hstate
@@ -2325,31 +2334,42 @@ def _arm_hold(session_id, action, hours):
     elif not pingable:
         notes.append("NOTE: replayable request restored without credentials — "
                      "pings resume once this account sends live traffic")
-    ack = (f"[logproxy] \U0001f525 cache hold armed for {hours:g}h "
-           f"(until {time.strftime('%H:%M', time.localtime(until))}); "
+    ack = (f"[logproxy] \U0001f525 cache hold armed: {hours:g}h of idle "
+           f"insurance — the window re-anchors to your LAST real turn, so the "
+           f"cache stays warm until {hours:g}h after you walk away (as of now: "
+           f"{time.strftime('%H:%M', time.localtime(until))}); "
            + "; ".join(notes) + ". Disarm: /warm-cache off")
     return (ack, {"armed": True, "hours": hours, "until": until,
                   "warmth": wq, "pingable": pingable})
 
 
-def _hold_note_real_turn(session_id):
-    """An organic turn just re-warmed the session itself, so the idle clock —
-    and with it the autonomous-ping budget — starts over: the counter means
-    'pings since your last real turn', not 'pings since arming'. (A sentinel
+def _hold_note_real_turn(session_id, now=None):
+    """An organic turn just re-warmed the session itself, so the hold is
+    INSURANCE on idle time and the whole window re-anchors: `until` slides to
+    now + the armed duration, and the ping budget restarts (the counter means
+    'pings since your last real turn', not 'pings since arming'). The hold
+    thus keeps the cache warm for N hours AFTER the user walks away, whenever
+    that turns out to be — not N hours after the arming timestamp. (A sentinel
     or replay ping never lands here; only forwarded turns do.)"""
     if not session_id:
         return
+    now = now or time.time()
     snap = None
     with _HOLD_LOCK:
         cur = _HOLD_STATE.get(session_id)
-        if cur and (cur["pings"] or cur["failures"]):
+        if cur:
+            hours = cur.get("hours") or (cur["until"] - cur["armed_at"]) / 3600
+            cur["hours"] = hours
+            cur["until"] = now + hours * 3600
             cur["pings"] = 0
             cur["failures"] = 0
             snap = dict(cur)
     if snap:
         _persist_hold_row(session_id, snap)
-        print(f"[hold] session={session_id[:12]}… ping counter reset "
-              "(organic turn re-warmed)", flush=True)
+        print(f"[hold] session={session_id[:12]}… organic turn -> window "
+              f"re-anchored (until "
+              f"{time.strftime('%H:%M', time.localtime(snap['until']))}, "
+              "pings reset)", flush=True)
 
 
 def _hold_decision(hold, has_last_request, warmth_row, now, has_auth=True):
@@ -2742,7 +2762,7 @@ def _restore_holds(now=None):
         with _DB_LOCK:
             rows = con.execute(
                 "SELECT session_id, until, armed_at, pings, failures, "
-                "last_ping_ts, last_result FROM hold_state WHERE owner=?",
+                "last_ping_ts, last_result, hours FROM hold_state WHERE owner=?",
                 (_OWNER,)).fetchall()
             expired = [r[0] for r in rows if r[1] <= now]
             if expired:
@@ -2755,11 +2775,14 @@ def _restore_holds(now=None):
         return 0
     restored = 0
     with _HOLD_LOCK:
-        for sid, until, armed_at, pings, failures, lpt, lres in rows:
+        for sid, until, armed_at, pings, failures, lpt, lres, hours in rows:
             if until > now and sid not in _HOLD_STATE:
                 _HOLD_STATE[sid] = {"until": until, "armed_at": armed_at,
                                     "pings": pings, "failures": failures,
-                                    "last_ping_ts": lpt, "last_result": lres}
+                                    "last_ping_ts": lpt, "last_result": lres,
+                                    # legacy row: until never slid, so the
+                                    # original span IS the duration
+                                    "hours": hours or (until - armed_at) / 3600}
                 restored += 1
     return restored
 

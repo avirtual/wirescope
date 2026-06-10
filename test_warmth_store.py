@@ -386,27 +386,44 @@ st_exp = lp._status_snapshot(session="sess-exp-1")
 check("hold reports expected_pings = hours/ttl (2h @ 1h default -> 2)",
       st_exp["sessions"][0]["hold"]["expected_pings"] == 2)
 
-# an organic turn resets the ping counter AND re-anchors expected_pings
+# the hold is IDLE INSURANCE: an organic turn re-anchors the WHOLE window
+# (until = turn + armed hours), not just the ping counter — "/warm-cache 2"
+# means "keep me warm until 2h after my LAST interaction, whenever that is".
 with lp._HOLD_LOCK:
     lp._HOLD_STATE["sess-exp-1"]["pings"] = 2
     lp._HOLD_STATE["sess-exp-1"]["failures"] = 1
-    _h = lp._HOLD_STATE["sess-exp-1"]
-with lp._LAST_REQUEST_LOCK:   # simulate the organic turn 1h into the 2h hold
+    _h = dict(lp._HOLD_STATE["sess-exp-1"])
+_turn_ts = _h["armed_at"] + 3600              # organic turn 1h into the 2h hold
+with lp._LAST_REQUEST_LOCK:
     lp._LAST_REQUEST["sess-exp-1"] = {
         "obj": {"messages": []}, "headers": {}, "path": "/v1/messages",
-        "ts": _h["armed_at"] + 3600, "account": None, "needs_auth": False}
-lp._hold_note_real_turn("sess-exp-1")
+        "ts": _turn_ts, "account": None, "needs_auth": False}
+lp._hold_note_real_turn("sess-exp-1", now=_turn_ts)
 st_exp2 = lp._status_snapshot(session="sess-exp-1")
+_h2 = st_exp2["sessions"][0]["hold"]
 check("organic turn resets pings/failures",
-      st_exp2["sessions"][0]["hold"]["pings"] == 0
-      and st_exp2["sessions"][0]["hold"]["failures"] == 0)
-check("expected_pings re-anchors at the last real turn (1h left @ 1h -> 1)",
-      st_exp2["sessions"][0]["hold"]["expected_pings"] == 1)
-with lp._HOLD_LOCK:           # the reset was mirrored: a restart reloads 0
+      _h2["pings"] == 0 and _h2["failures"] == 0)
+check("organic turn SLIDES the window (until = last turn + armed hours)",
+      abs(_h2["until"] - (_turn_ts + 2 * 3600)) < 1)
+check("expected_pings is the full window again after the slide (2h @ 1h -> 2)",
+      _h2["expected_pings"] == 2)
+with lp._HOLD_LOCK:           # the slide+reset was mirrored: a restart reloads it
     lp._HOLD_STATE.clear()
 lp._restore_holds()
-check("counter reset survives a restart",
-      lp._hold_snapshot()["sess-exp-1"]["pings"] == 0)
+_h3 = lp._hold_snapshot()["sess-exp-1"]
+check("slid window + counter reset + hours survive a restart",
+      _h3["pings"] == 0 and abs(_h3["until"] - (_turn_ts + 2 * 3600)) < 1
+      and _h3["hours"] == 2.0)
+# legacy row (pre-`hours` column): duration derives from until - armed_at
+lp._persist_hold_row("sess-legacy-1",
+                     {"until": time.time() + 5400, "armed_at": time.time() - 1800,
+                      "pings": 0, "failures": 0})
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE.clear()
+lp._restore_holds()
+check("legacy hold row derives hours from its original span (2h)",
+      abs(lp._hold_snapshot()["sess-legacy-1"]["hours"] - 2.0) < 0.01)
+lp._arm_hold("sess-legacy-1", "off", None)
 with lp._LAST_REQUEST_LOCK:
     lp._LAST_REQUEST.pop("sess-exp-1", None)
 lp._arm_hold("sess-exp-1", "off", None)
