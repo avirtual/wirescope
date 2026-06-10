@@ -234,9 +234,12 @@ check("arm registers hold state",
       rec["armed"] is True and "sess-hold-1" in lp._hold_snapshot())
 check("arm ack warns when prefix is not warm",
       "not warm" in ack)
+check("ack is attributed to the proxy (anti-ambush: a later model must not "
+      "believe IT made the claim)", ack.startswith("[logproxy]"))
 ack2, rec2 = lp._arm_hold("sess-hold-1", "off", None)
 check("disarm pops hold state",
       rec2["disarmed"] is True and "sess-hold-1" not in lp._hold_snapshot())
+check("disarm ack attributed too", ack2.startswith("[logproxy]"))
 ack3, rec3 = lp._arm_hold(None, "arm", 2.0)
 check("no session metadata -> not armed", rec3["armed"] is False)
 lp._arm_hold("sess-hold-2", "arm", 1.0)

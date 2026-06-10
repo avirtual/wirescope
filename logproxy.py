@@ -2027,22 +2027,32 @@ def _arm_hold(session_id, action, hours):
     """Arm/disarm a session's hold; compose the user-facing ack (it lands in the
     transcript as the assistant's reply, so it reports REALITY: current warmth,
     expected ping count, and every reason the hold might be a no-op).
-    Returns (ack_text, record)."""
+    Returns (ack_text, record).
+
+    Every ack is ATTRIBUTED with a "[logproxy]" prefix: the synthetic reply
+    persists in the transcript as an *assistant* message, and an unattributed
+    one ambushes the NEXT turn's model — it sees the command's tripwire in
+    history, concludes the proxy never intercepted, and 'retracts' a hold that
+    is in fact armed (observed live 2026-06-10). The attribution plus the
+    command file's turn-scoped tripwire wording make the pair an inert log
+    record when read from history."""
     now = time.time()
     if not session_id:
-        return ("cache hold NOT armed: request carries no session metadata.",
+        return ("[logproxy] cache hold NOT armed: request carries no session "
+                "metadata.",
                 {"armed": False, "reason": "no_session"})
     if action == "off":
         with _HOLD_LOCK:
             prev = _HOLD_STATE.pop(session_id, None)
         if prev:
-            return (f"cache hold disarmed ({prev['pings']} ping(s) had fired).",
+            return (f"[logproxy] cache hold disarmed ({prev['pings']} ping(s) "
+                    "had fired).",
                     {"armed": False, "disarmed": True, "pings": prev["pings"]})
-        return ("no cache hold was armed for this session.",
+        return ("[logproxy] no cache hold was armed for this session.",
                 {"armed": False, "disarmed": False})
     if not (WARMTH_HOLD and WARMTH_PINGER and WARMTH_LEDGER):
-        return ("cache hold NOT armed: hold-warm is disabled on this proxy "
-                "(needs WARMTH_HOLD + WARMTH_PINGER + WARMTH_LEDGER).",
+        return ("[logproxy] cache hold NOT armed: hold-warm is disabled on "
+                "this proxy (needs WARMTH_HOLD + WARMTH_PINGER + WARMTH_LEDGER).",
                 {"armed": False, "reason": "disabled"})
     until = now + hours * 3600
     with _HOLD_LOCK:
@@ -2066,7 +2076,7 @@ def _arm_hold(session_id, action, hours):
     if not pingable:
         notes.append("NOTE: no replayable request cached yet (proxy restart?) — "
                      "pings resume after the next real turn")
-    ack = (f"\U0001f525 cache hold armed for {hours:g}h "
+    ack = (f"[logproxy] \U0001f525 cache hold armed for {hours:g}h "
            f"(until {time.strftime('%H:%M', time.localtime(until))}); "
            + "; ".join(notes) + ". Disarm: /warm-cache off")
     return (ack, {"armed": True, "hours": hours, "until": until,
