@@ -142,7 +142,9 @@ Core (always on): per-session log dirs `LOG_DIR/<sid>/<seq>-<agent>-<role>-<mode
 | `WARMTH_BLOCK_COLD_PING` | off | **Warm-only ping gate.** A ping pays off ONLY on a `warm` prefix (a 0.10× read that slides the TTL); on any non-warm state (`cold`/`absent`/store error) a replay is a cache WRITE at the premium for no gain. So **ping IFF warm; decline everything else** (sentinel path short-circuits with a synthetic `end_turn`, 0 tokens). The replay pinger (`/_ping`) enforces warm-only unconditionally; `force=1` is the only override. Principle: **never higher cost.** (The "native-TTL store's EXISTS is the perfect primitive" insight is now implemented — the SQLite expiry predicate IS the gate.) |
 | `WARMTH_PINGER` (+ `WARMTH_PINGER_MAX`) | **on** | Replay-pinger: caches each session's post-transform last messages request **in memory** (incl. auth/beta headers, never on disk; oldest-evicted past cap). `POST`/`GET /_ping?session=<id>[&force=1]` replays it with thinking off + `max_tokens:1` → a cache READ that slides the TTL, ~1 output tok. Collapses the old `--resume --fork-session` sentinel dance to one HTTP call with just the session_id. Skips any non-warm prefix (warm-only; force=1 to establish). |
 | `WARMTH_HOLD` (+ `_MAX_HOURS`=12, `_MARGIN`=300s, `_INTERVAL`=60s, `_MAX_PINGS`=24) | **on** | **The hold driver (2026-06-10)** — decides WHEN to ping. User arms a session in-band via `/warm-cache <n>` (`~/.claude/commands/warm-cache.md` → `<proxy:warm-cache hours=N>` sentinel): the proxy captures that turn (never forwarded, 0 tokens; the previous real turn stays the replayable prefix), arms an n-hour hold, answers with a synthetic end_turn ack reporting real warmth. Asyncio task pings armed sessions whose WARM prefix has `< margin` left (`_warm_session` warm-only gate is the final arbiter). Not-warm SKIPS (a real turn re-warms → hold resumes); disarm on expiry / `off` / `/_end` / ping cap / 2 consecutive failures. Spends nothing until armed. Requires PINGER+LEDGER. **Anti-ambush (2026-06-10):** the sentinel+ack pair PERSISTS in the transcript; an unattributed ack made the NEXT turn's model read the command's tripwire in history and 'retract' a real hold (observed live). Fix: acks are `[logproxy]`-prefixed and the command's tripwire is turn-scoped ("final user message of the request you are answering" fires; "earlier history" is declared inert) — true in both reading contexts, still detects a dead proxy. |
-| *(endpoint)* `GET /_status[?session=][&all=1]` | — | Read-only session inventory: title (harvested from the CLI's title side-call; structured-outputs JSON unwrapped), cwd ("Primary working directory:" line), model, warmth, hold state, per-session cost, refusals + proxy flags/totals. Identity rows are DURABLE (`session_meta` table in warmth.sqlite); pingability/hold/cost are in-memory. Default window: sessions seen <24h. |
+| *(endpoint)* `GET /_status[?session=][&all=1]` | — | Read-only session inventory: title (harvested from the CLI's title side-call; structured-outputs JSON unwrapped), cwd ("Primary working directory:" line), model, warmth, hold state, per-session cost + refusals + `pingable`/`awaiting_auth`, proxy flags/totals + `totals_since_start` + `restored_at_start`. Identity rows are DURABLE (`session_meta`); holds/last-request-bodies/totals are persisted too since 2026-06-10 (see restart-amnesia below). Default window: sessions seen <24h. |
+| *(endpoint)* `GET /_admin[?session=][&all=1]` | — | The `/_status` snapshot rendered as HTML for humans (the "proxy admin page"): dark single-page table — warmth (🔥 + time left / ❄️ / ∅), title+sid+cwd+model, hold (until HH:MM, pings n/cap), pingable/awaiting-auth, per-session cost, refusals; header has flags, totals and a since-restart delta. Server-rendered, zero JS, `html.escape` on everything (titles are model output), meta-refresh 10s. Same lab-grade auth posture as the other endpoints (none — localhost). |
+| *(persistence)* restart-amnesia fix | **on** (not a flag) | **Open item (h), SHIPPED 2026-06-10.** Per-proxy runtime state is mirrored to warmth.sqlite and reloaded at startup, scoped by `owner = LOG_DIR` (a scratch port never resurrects the main proxy's sessions): `_HOLD_STATE` → `hold_state` table (mirrored on arm/disarm/every ping; expired rows reaped at load); `_LAST_REQUEST` → `last_request` table (post-transform body + NON-SECRET headers on the writer thread; **auth headers never touch disk** — restored entries are `needs_auth` and pings DECLINE cleanly (`skipped:no_auth`, no failure count, no hold ping-slot burned) until the account's first live request re-donates credentials via the in-memory `_ACCOUNT_AUTH` registry (auth is account-level, not session-level)); `_TOTALS`/`_SESSION_TOTALS` reloaded from the `_totals.json`/`_session.json` snapshots (LOG_DIR-lifetime semantics; `/_status` adds a `totals_since_start` delta); `_META_CWD_DONE` derived from `session_meta`. `/_end` + sweeper delete the mirror rows in step. Explicitly NOT restored (fine to lose): `_SC_FIRED`, `_PENDING_RELAY`, `_UNPRICED_WARNED`. |
 | `WARMTH_SWEEP_INTERVAL` / `WARMTH_LAST_REQUEST_GRACE` / `WARMTH_PURGE_SLACK` | 300s / 600s / 7d | **Housekeeping-only** sweeper (runs when pinger OR ledger on): drops in-memory cached last-requests whose prefix lapsed past the grace (judged by the ledger's last-touch, so an actively-pinged session survives), purges warmth rows expired longer than the slack, prunes stale heads. Correctness lives in the READ PREDICATE (`expires_at > now`), never in these deletions — the sweep can run late or never without changing any gate decision. |
 | `STRIP_COMPACT_CACHE` (`STRIP_COMPACT_FORCE`) | off | Drop MESSAGE-level cache_control on a `/compact` request (keep system markers) when history is **not warm** — reclaims the discarded write premium. TWO-STATE gate (2026-06-09): `warm` declines; `cold`/`absent` strip; ledger-off/store-error decline. |
 | `SPLIT_SYSTEM_REST` (`SPLIT_SYSTEM_REST_MARKER`) | off | Move the static system-prose head onto the preceding marked block so it rides as cache_READ not WRITE. Byte-identical text. Win is ~60% of system-prefix carriage **only** for trimmed-tool layouts (which get no global fleet warming anyway, so the split forfeits nothing); for full-tool layouts vanilla's free global warming wins. |
@@ -266,18 +268,20 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
     observer), 7801→logs_inject (INJECT_MARKER=Math:), 7802→logs_chatty,
     7803→logs_inject (SC: SYSPATCH+DONE), 7810→logs_opus (defaults),
     7811→logs_compact_strip, 7812→logs_forkcache, 7813→logs_compact_warmth.
-  - Restart caveat: restarting wipes in-memory `_LAST_REQUEST` (pings 404 until
-    each session's next real turn) AND `_HOLD_STATE` (armed holds are lost —
-    re-arm with `/warm-cache <n>` after the next real turn); the SQLite ledger
-    + `session_meta` (titles/cwds) survive restarts. Don't restart
-    mid-experiment.
-  - `:7800` last restarted 2026-06-10 mid-day on commit `7ca38e7`
-    (hold-warm + /_status); hold defaults 60s tick / 300s margin / 12h clamp /
-    24-ping cap. Sanity-check anytime: `curl -s localhost:7800/_status`.
-    **PENDING RESTART:** the `[logproxy]` ack-attribution fix (anti-ambush) is
-    committed but NOT live on `:7800` — a hold was armed (user session, until
-    ~13:34) and restarting would wipe it. Restart at the next idle moment; the
-    command-file tripwire fix is already live (read at invocation).
+  - Restart caveat (DEFANGED 2026-06-10 by the restart-amnesia fix): armed
+    holds, replayable request bodies, totals, session identity and the warmth
+    ledger ALL survive a restart now. The one thing that doesn't is
+    CREDENTIALS (never persisted): restored sessions show `awaiting_auth` in
+    `/_status` and pings resume only after the account's next live request
+    through the proxy re-donates auth. Still avoid restarting mid-experiment
+    (a few seconds of downtime + the auth gap).
+  - `:7800` last restarted 2026-06-10 ~11:26 on the restart-amnesia + /_admin
+    code; the `[logproxy]` ack-attribution (anti-ambush) fix went live with
+    the same restart. The user hold armed until ~13:34 was carried ACROSS the
+    restart by pre-seeding the new `hold_state`/`last_request` tables from the
+    old process's `/_status` + newest capture (one-off migration; future
+    restarts carry state automatically). Sanity-check anytime:
+    `curl -s localhost:7800/_status` or eyeball `localhost:7800/_admin`.
   - (`:7799` and `8080` are the human's — leave alone.)
 - **`/warm-cache` registers as a SKILL in Claude Code sessions** (the
   user-level command file `~/.claude/commands/warm-cache.md` shows up in the
@@ -378,7 +382,7 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   (at the 5m rate, flagged in `price_basis`) instead of silently dropping write
   cost when the 5m/1h split is absent.
 - (g) Endpoint hardening (lab-grade today): `/_ping` `/_end` `/_warm` `/_status`
-  are unauthenticated on localhost. `/_ping` SPENDS user credits (replays with
+  `/_admin` are unauthenticated on localhost. `/_ping` SPENDS user credits (replays with
   cached auth headers), `force=1` can even cold-write big prefixes repeatedly;
   `/_end` lets any local proc drop state; `/_status` exposes titles/cwds/costs
   (read-only); the armed hold spends a ping (~0.10× prefix read) per TTL window
@@ -390,37 +394,21 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
   never stamped → pings decline (`unknown`) until the next good turn (fail-safe but
   loses pingability); ping TOCTOU (warm check vs arrival) — the hold pings inside
   the margin (default 300s), never at the TTL edge.
-- (h) **Restart-amnesia / state reconstruction (user decision 2026-06-10).**
-  Principle: the proxy should persist the state of the relevant in-memory
-  pieces to the DB so a restart gets back most of what it held — "everything
-  should be reconstructible"; don't worry about the couple of seconds the
-  restart itself takes. Today only the warmth ledger + session_head +
-  session_meta survive; piece-by-piece plan:
-  - **`_HOLD_STATE`** (the trigger for this item): pure intent, nothing
-    secret — persist (sid, until, armed_at, pings, failures) in a SQLite
-    table, mirror on every change, reload at startup. After a restart the
-    hold sits skipping ("no replayable request") until the session's next
-    real turn re-stashes the payload, then RESUMES — no silent forgetting of
-    a user's `/warm-cache`.
-  - **`_LAST_REQUEST`** — the hard one, split it: BODIES are not
-    secret-bearing beyond what LOG_DIR already stores (the captures contain
-    the same post-transform bodies), so they may be persisted (or
-    reconstructed from the newest `*.request.json` per session). The AUTH
-    HEADERS stay off disk (standing rule). Reconstruction idea: auth is
-    ACCOUNT-level, not session-level — on restart, re-attach auth to a
-    restored body from the first live request of the same `account_uuid`
-    (it arrives within seconds on a busy box). Until donated, entries are
-    "auth-less" and pings decline gracefully.
-  - **`_TOTALS` / `_SESSION_TOTALS`**: already snapshotted to
-    `_totals.json` / `_session.json` on every request — just RELOAD them at
-    startup instead of zeroing (decide whether process-lifetime or
-    LOG_DIR-lifetime semantics; probably reload + keep a separate
-    `since_start` field).
-  - **`_META_CWD_DONE/_TRIES`**: derive from session_meta at startup
-    (cwd IS NULL → still hunting).
-  - Already fine: canary state (on disk per LOG_DIR, lazy-loaded), warmth
-    ledger, session_head/meta. Explicitly OK to lose: `_SC_FIRED`,
-    `_PENDING_RELAY`, `_UNPRICED_WARNED` (ephemeral per-turn / cosmetic).
+- (h) **DONE (2026-06-10): restart-amnesia / state reconstruction.** Shipped
+  exactly per the piece-by-piece plan — see the "(persistence) restart-amnesia
+  fix" row in the flag table for what persists where and the auth re-donation
+  mechanism (`_ACCOUNT_AUTH`, account-level). Verified: 16 new offline checks
+  in `test_warmth_store.py` (holds survive / expired reaped / secrets never on
+  disk / no_auth declines / donation / stale-row reap / totals+since_start /
+  cwd_done) + a live drill on `:7802` (arm → kill → restart → hold+body
+  restored `awaiting_auth` → live turn from another session of the account
+  donated auth → `/_ping` WARMED with cache_read=30901 on a body the new
+  process never saw live). Design choices worth remembering: rows are scoped
+  by `owner = LOG_DIR` so scratch ports don't double-ping the main proxy's
+  sessions; restore applies the sweeper's own staleness predicate (warmth-
+  ledger-based, NOT row ts) so actively-pinged sessions survive but stale rows
+  are reaped instead of resurrected; `_hold_decision` gained `has_auth` so an
+  auth-less hold SKIPS without burning a ping slot.
 
 ## Model-switch day (2026-06-09): claude-fable-5 observations
 

@@ -280,6 +280,116 @@ check("main-agent turn (has tools) is NOT a title call", lp._is_title_call(
      "system": [{"type": "text", "text": "Generate a concise, sentence-case title"}],
      "messages": []}) is False)
 
+# --- restart-amnesia (item h): holds survive a restart ----------------------------
+import asyncio  # noqa: E402
+
+lp._arm_hold("sess-persist-1", "arm", 2.0)
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE.clear()                  # simulate the restart: memory wiped
+n = lp._restore_holds()
+check("armed hold survives a simulated restart",
+      n == 1 and "sess-persist-1" in lp._hold_snapshot())
+lp._persist_hold_row("sess-persist-old",
+                     {"until": time.time() - 5, "armed_at": time.time() - 7200,
+                      "pings": 3, "failures": 0})
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE.clear()
+lp._restore_holds()
+check("expired hold is NOT restored (row reaped)",
+      "sess-persist-old" not in lp._hold_snapshot()
+      and "sess-persist-1" in lp._hold_snapshot())
+lp._arm_hold("sess-persist-1", "off", None)
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE.clear()
+check("disarm also deletes the persisted row", lp._restore_holds() == 0)
+
+# --- restart-amnesia: last_request bodies persist, auth does NOT ------------------
+lobj = compact_obj(sid="sess-lr-1")
+lturn = {**lobj, "messages": lobj["messages"][:2]}
+lp._record_warmth(lturn, {"cache_creation_input_tokens": 50})   # warm -> restorable
+lp._cache_last_request("sess-lr-1", lturn,
+                       {"authorization": "Bearer SECRET", "x-api-key": "sk-SECRET",
+                        "anthropic-beta": "beta-1", "content-type": "application/json"},
+                       "/v1/messages", account_uuid="acct-1")
+lp._WRITE_Q.join()                          # the mirror write rides the writer thread
+con6 = sqlite3.connect(os.environ["WARMTH_DB"])
+lrow = con6.execute("SELECT headers, account_uuid, body FROM last_request "
+                    "WHERE session_id='sess-lr-1'").fetchone()
+con6.close()
+check("last_request row persisted with account_uuid",
+      lrow is not None and lrow[1] == "acct-1")
+check("persisted headers exclude every secret (standing rule)",
+      "SECRET" not in lrow[0] and "authorization" not in lrow[0].lower()
+      and "anthropic-beta" in lrow[0])
+with lp._LAST_REQUEST_LOCK:
+    lp._LAST_REQUEST.clear()
+    lp._ACCOUNT_AUTH.clear()                # restart: auth registry gone too
+check("restore loads the body auth-less",
+      lp._restore_last_requests() == 1
+      and lp._LAST_REQUEST["sess-lr-1"]["needs_auth"] is True
+      and lp._LAST_REQUEST["sess-lr-1"]["headers"].get("anthropic-beta") == "beta-1")
+code_na, res_na = asyncio.run(lp._warm_session("sess-lr-1"))
+check("ping declines cleanly (not a failure) while auth is missing",
+      code_na == 200 and res_na.get("skipped") == "no_auth")
+check("hold decision skips an auth-less entry (no ping slot burned)",
+      lp._hold_decision(HOLD, True, warm_due, NOW, has_auth=False)[0] == "skip")
+with lp._LAST_REQUEST_LOCK:                 # the account's next live turn donates
+    lp._ACCOUNT_AUTH["acct-1"] = {"authorization": "Bearer FRESH"}
+ent = lp._resolve_auth("sess-lr-1")
+check("live traffic re-donates account-level auth to the restored entry",
+      ent["needs_auth"] is False
+      and ent["headers"]["authorization"] == "Bearer FRESH"
+      and ent["headers"].get("anthropic-beta") == "beta-1")
+lp._end_session("sess-lr-1", reason="clear")
+con7 = sqlite3.connect(os.environ["WARMTH_DB"])
+left = con7.execute("SELECT COUNT(*) FROM last_request "
+                    "WHERE session_id='sess-lr-1'").fetchone()[0]
+con7.close()
+check("/_end drops the persisted last_request row too", left == 0)
+
+# stale rows (cold past the grace) are reaped at restore, not resurrected
+lp._persist_last_request_row("sess-lr-stale", "acct-1", "/v1/messages",
+                             time.time() - 7200,
+                             {"model": "m", "messages": [msg("user", "hi")]}, {})
+with lp._LAST_REQUEST_LOCK:
+    lp._LAST_REQUEST.clear()
+lp._restore_last_requests()
+check("stale last_request row is reaped at restore",
+      "sess-lr-stale" not in lp._LAST_REQUEST)
+
+# --- restart-amnesia: totals reload + since_start delta ---------------------------
+import pathlib  # noqa: E402
+
+(pathlib.Path(os.environ["LOG_DIR"]) / "sess-tot-1").mkdir(exist_ok=True)
+(pathlib.Path(os.environ["LOG_DIR"]) / "_totals.json").write_text(
+    json.dumps({**lp._new_totals(), "requests": 7, "est_usd": 1.25}))
+(pathlib.Path(os.environ["LOG_DIR"]) / "sess-tot-1" / "_session.json").write_text(
+    json.dumps({**lp._new_totals(), "requests": 3}))
+restored_t, nsess = lp._restore_totals()
+check("totals reload from the on-disk snapshots",
+      restored_t and lp._TOTALS["requests"] == 7
+      and lp._TOTALS["est_usd"] == 1.25 and nsess == 1
+      and lp._SESSION_TOTALS["sess-tot-1"]["requests"] == 3)
+lp._bump(lp._TOTALS, bill2)
+check("since_start tracks only post-restart deltas",
+      lp._since_start()["requests"] == 1 and lp._TOTALS["requests"] == 8)
+
+# --- restart-amnesia: cwd hunt resumes only where needed --------------------------
+lp._META_CWD_DONE.clear()
+lp._restore_cwd_done()
+check("sessions with a stored cwd skip the hunt after restart",
+      "sess-meta-1" in lp._META_CWD_DONE)
+
+# --- /_admin HTML page -------------------------------------------------------------
+page = lp._render_admin_html(lp._status_snapshot(all_sessions=True), host="t:7800")
+check("admin page renders the session inventory",
+      page.startswith("<!doctype html") and "Fix the frobnicator" in page
+      and "/_status" in page)
+lp._upsert_session_meta("sess-xss", title='<script>alert("x")</script>')
+page2 = lp._render_admin_html(lp._status_snapshot(session="sess-xss"))
+check("admin page escapes model-authored titles",
+      "<script>alert" not in page2 and "&lt;script&gt;" in page2)
+
 # --- /_status shape ---------------------------------------------------------------
 st = lp._status_snapshot(session="sess-meta-1")
 check("/_status lists the session with its meta",

@@ -31,6 +31,7 @@ import asyncio
 import atexit
 import collections
 import hashlib
+import html
 import itertools
 import json
 import os
@@ -1226,6 +1227,10 @@ def _writer_loop():
             if kind == "meta":  # session_meta upsert (no file output)
                 sid, fields = data
                 _upsert_session_meta(sid, **fields)
+            elif kind == "lastreq":   # mirror a replayable request (no secrets)
+                _persist_last_request_row(*data)
+            elif kind == "lastreq_del":
+                _delete_last_request_row(data)
             elif kind == "bytes":
                 path.write_bytes(data)
             elif kind == "append":  # one JSON object per line (canary change-log)
@@ -1290,6 +1295,18 @@ def _enqueue_meta(session_id, **fields):
     the SQLite write never runs on the byte hot path."""
     if session_id:
         _WRITE_Q.put((None, "meta", (session_id, fields)))
+
+
+def _enqueue_last_request(session_id, account_uuid, path, ts, obj, safe_headers):
+    """Mirror a session's replayable last request to SQLite on the writer thread
+    (JSON serialization of a multi-hundred-KB body stays off the event loop).
+    obj is not reused after its turn, so passing the ref is safe."""
+    _WRITE_Q.put((None, "lastreq",
+                  (session_id, account_uuid, path, ts, obj, safe_headers)))
+
+
+def _enqueue_last_request_delete(session_id):
+    _WRITE_Q.put((None, "lastreq_del", session_id))
 
 
 def _session_ids(obj):
@@ -1382,6 +1399,12 @@ WARMTH_BLOCK_COLD_PING = os.environ.get("WARMTH_BLOCK_COLD_PING") in (
     "1", "yes", "on", "true")
 WARMTH_DB = os.environ.get("WARMTH_DB",
                            str(Path(__file__).resolve().parent / "warmth.sqlite"))
+# Per-proxy-INSTANCE scope for persisted runtime state (holds, last-requests).
+# Warmth is global by design (it lives on the content-addressed prefix lineage,
+# shared across ports), but a hold/replayable-request belongs to THE proxy that
+# serves the session — scoping rows by LOG_DIR keeps a scratch port from
+# resurrecting (and double-pinging) the main proxy's sessions after a restart.
+_OWNER = str(LOG_DIR.resolve())
 _DB = None
 _DB_LOCK = threading.Lock()
 
@@ -1411,6 +1434,25 @@ def _warmth_db():
                         "session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
                         "model TEXT, first_seen REAL NOT NULL, "
                         "last_seen REAL NOT NULL)")
+            # RESTART-AMNESIA (open item h): per-proxy runtime state, mirrored on
+            # every change and reloaded at startup, so a restart recovers what
+            # the process held. owner = LOG_DIR (see _OWNER).
+            con.execute("CREATE TABLE IF NOT EXISTS hold_state ("
+                        "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+                        "until REAL NOT NULL, armed_at REAL NOT NULL, "
+                        "pings INTEGER NOT NULL, failures INTEGER NOT NULL, "
+                        "last_ping_ts REAL, last_result TEXT, "
+                        "PRIMARY KEY (owner, session_id))")
+            # The replayable last request: BODY + NON-SECRET headers only. The
+            # body is no more secret than the LOG_DIR captures (same
+            # post-transform bytes); auth headers NEVER land on disk (standing
+            # rule) — they are re-attached at runtime from the first live
+            # request of the same account (_ACCOUNT_AUTH).
+            con.execute("CREATE TABLE IF NOT EXISTS last_request ("
+                        "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+                        "account_uuid TEXT, path TEXT NOT NULL, ts REAL NOT NULL, "
+                        "body TEXT NOT NULL, headers TEXT NOT NULL, "
+                        "PRIMARY KEY (owner, session_id))")
             con.commit()
             _DB = con
     return _DB
@@ -1553,23 +1595,95 @@ def _capture_session_meta(session_id, obj, model):
 # beta namespace + credentials) — IN MEMORY ONLY, never written to disk.
 WARMTH_PINGER = os.environ.get("WARMTH_PINGER", "1") not in ("0", "no", "off", "false")
 _LAST_REQUEST_MAX = int(os.environ.get("WARMTH_PINGER_MAX", "2000"))
-_LAST_REQUEST = {}                 # session_id -> {"obj","headers","path","ts"}
+# entry: {"obj","headers","path","ts","account","needs_auth"} — needs_auth=True
+# marks an entry RESTORED from SQLite after a restart: its body/path are real
+# but the secret headers are absent until the account re-donates them.
+_LAST_REQUEST = {}
 _LAST_REQUEST_LOCK = threading.Lock()
+# account_uuid -> {secret header: value}, harvested from live traffic. Auth is
+# ACCOUNT-level, not session-level, so the first live request after a restart
+# re-arms every restored entry of that account. IN MEMORY ONLY, never on disk.
+# Mutated only under _LAST_REQUEST_LOCK. (Unbounded, but accounts ~ 1/box.)
+_ACCOUNT_AUTH = {}
 
 
-def _cache_last_request(session_id, obj, fwd_headers, upstream_path):
+def _persist_last_request_row(session_id, account_uuid, path, ts, obj, safe_headers):
+    """Writer-thread upsert of the replayable request (body + NON-SECRET
+    headers — secrets were split off before enqueue, see _cache_last_request)."""
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute(
+                "INSERT INTO last_request(owner, session_id, account_uuid, "
+                "path, ts, body, headers) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(owner, session_id) DO UPDATE SET "
+                "account_uuid=excluded.account_uuid, path=excluded.path, "
+                "ts=excluded.ts, body=excluded.body, headers=excluded.headers",
+                (_OWNER, session_id, account_uuid, path, ts,
+                 json.dumps(obj, ensure_ascii=False),
+                 json.dumps(safe_headers, ensure_ascii=False)))
+            con.commit()
+    except Exception as e:
+        print(f"[lastreq] persist failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _delete_last_request_row(session_id):
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute("DELETE FROM last_request WHERE owner=? AND session_id=?",
+                        (_OWNER, session_id))
+            con.commit()
+    except Exception as e:
+        print(f"[lastreq] delete failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _cache_last_request(session_id, obj, fwd_headers, upstream_path,
+                        account_uuid=None):
     """Stash the just-forwarded (post-transform) messages request so a later
     /_ping can replay it. obj is not reused after this turn, so we keep the ref;
     headers are kept whole (incl. auth + anthropic-beta) so the replay rides the
-    same cache namespace — in-memory only, evicted oldest-first past the cap."""
+    same cache namespace — evicted oldest-first past the cap. The body + the
+    non-secret headers are also MIRRORED to SQLite (restart-amnesia, item h);
+    the secret headers go only to the in-memory _ACCOUNT_AUTH registry."""
     if not (WARMTH_PINGER and session_id and isinstance(obj, dict)):
         return
+    headers = dict(fwd_headers)
+    auth = {k: v for k, v in headers.items() if k.lower() in _SECRET_HEADERS}
+    safe = {k: v for k, v in headers.items() if k.lower() not in _SECRET_HEADERS}
+    ts = time.time()
+    evicted = None
     with _LAST_REQUEST_LOCK:
-        _LAST_REQUEST[session_id] = {"obj": obj, "headers": dict(fwd_headers),
-                                     "path": upstream_path, "ts": time.time()}
+        if account_uuid and auth:
+            _ACCOUNT_AUTH[account_uuid] = auth
+        _LAST_REQUEST[session_id] = {"obj": obj, "headers": headers,
+                                     "path": upstream_path, "ts": ts,
+                                     "account": account_uuid,
+                                     "needs_auth": False}
         if len(_LAST_REQUEST) > _LAST_REQUEST_MAX:
-            oldest = min(_LAST_REQUEST.items(), key=lambda kv: kv[1]["ts"])[0]
-            _LAST_REQUEST.pop(oldest, None)
+            evicted = min(_LAST_REQUEST.items(), key=lambda kv: kv[1]["ts"])[0]
+            _LAST_REQUEST.pop(evicted, None)
+    _enqueue_last_request(session_id, account_uuid, upstream_path, ts, obj, safe)
+    if evicted:
+        _enqueue_last_request_delete(evicted)
+
+
+def _resolve_auth(session_id):
+    """Return the session's cached entry, re-attaching account-level credentials
+    to a restored (auth-less) one when its account has since sent live traffic.
+    The entry stays needs_auth=True — and pings decline gracefully — until the
+    donation arrives."""
+    with _LAST_REQUEST_LOCK:
+        e = _LAST_REQUEST.get(session_id)
+        if not e or not e.get("needs_auth"):
+            return e
+        donated = _ACCOUNT_AUTH.get(e.get("account"))
+        if donated:
+            e = dict(e)
+            e["headers"] = {**e["headers"], **donated}
+            e["needs_auth"] = False
+            _LAST_REQUEST[session_id] = e
+        return e
 
 
 def _strip_cache_control(node):
@@ -1798,14 +1912,22 @@ async def _warm_session(session_id, force=False):
     would be a cold-write at the write premium) unless force=1."""
     if not WARMTH_PINGER:
         return 404, {"ok": False, "reason": "pinger disabled (WARMTH_PINGER=0)"}
-    with _LAST_REQUEST_LOCK:
-        entry = _LAST_REQUEST.get(session_id)
-        entry = dict(entry) if entry else None
+    entry = _resolve_auth(session_id)
+    entry = dict(entry) if entry else None
     if not entry:
         return 404, {"ok": False, "session": session_id,
                      "reason": "no cached request for this session yet "
                                "(it must have made >=1 messages call through "
                                "this proxy since start)"}
+    if entry.get("needs_auth"):
+        # Restored after a restart, body intact but credentials (rightly) not
+        # persisted — a clean DECLINE, not a failure: the account's next live
+        # turn re-donates auth and pings resume.
+        return 200, {"ok": True, "warmed": False, "skipped": "no_auth",
+                     "session": session_id,
+                     "reason": "replayable request restored without credentials "
+                               "(auth never persists); waiting for live traffic "
+                               "from the same account to re-attach them"}
     src = entry["obj"]
     msgs = src.get("messages") or []
     if not msgs:
@@ -1907,6 +2029,10 @@ def _end_session(session_id, reason="unspecified"):
         with _DB_LOCK:
             cur = con.execute("DELETE FROM session_head WHERE session_id=?",
                               (session_id,))
+            con.execute("DELETE FROM hold_state WHERE owner=? AND session_id=?",
+                        (_OWNER, session_id))
+            con.execute("DELETE FROM last_request WHERE owner=? AND session_id=?",
+                        (_OWNER, session_id))
             con.commit()
             dropped_head = cur.rowcount > 0
     except Exception:
@@ -1952,6 +2078,15 @@ def _sweep_state(now=None):
                                  (now - _WARMTH_PURGE_SLACK,)).rowcount
             heads = con.execute("DELETE FROM session_head WHERE updated_at < ?",
                                 (now - _WARMTH_PURGE_SLACK,)).rowcount
+            # keep the last_request mirror in step with the in-memory drop —
+            # otherwise the next restart resurrects entries the sweep already
+            # judged stale (ts-based deletes would be wrong here: a row's ts is
+            # the original turn, but an actively-pinged session stays fresh via
+            # the ledger, which is what the in-memory predicate consulted).
+            if stale:
+                con.executemany(
+                    "DELETE FROM last_request WHERE owner=? AND session_id=?",
+                    [(_OWNER, s) for s in stale])
             con.commit()
     except Exception:
         pass
@@ -2005,6 +2140,41 @@ _HOLD_STATE = {}   # sid -> {until, armed_at, pings, failures, last_ping_ts, las
 _HOLD_LOCK = threading.Lock()
 
 
+def _persist_hold_row(session_id, h):
+    """Mirror a hold to SQLite (pure intent, nothing secret) so a restart can't
+    silently forget a user's /warm-cache. Called OUTSIDE _HOLD_LOCK with a
+    snapshot — a store failure degrades to the old in-memory-only behavior."""
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute(
+                "INSERT INTO hold_state(owner, session_id, until, armed_at, "
+                "pings, failures, last_ping_ts, last_result) "
+                "VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(owner, session_id) DO UPDATE SET "
+                "until=excluded.until, armed_at=excluded.armed_at, "
+                "pings=excluded.pings, failures=excluded.failures, "
+                "last_ping_ts=excluded.last_ping_ts, "
+                "last_result=excluded.last_result",
+                (_OWNER, session_id, h["until"], h["armed_at"],
+                 h.get("pings", 0), h.get("failures", 0),
+                 h.get("last_ping_ts"), h.get("last_result")))
+            con.commit()
+    except Exception as e:
+        print(f"[hold] persist failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _delete_hold_row(session_id):
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute("DELETE FROM hold_state WHERE owner=? AND session_id=?",
+                        (_OWNER, session_id))
+            con.commit()
+    except Exception as e:
+        print(f"[hold] row delete failed for {session_id[:12]}…: {e}", flush=True)
+
+
 def _hold_request(obj):
     """Parse a /warm-cache sentinel out of the last user message.
     ('arm', hours) | ('off', None) | None (no sentinel)."""
@@ -2044,6 +2214,7 @@ def _arm_hold(session_id, action, hours):
     if action == "off":
         with _HOLD_LOCK:
             prev = _HOLD_STATE.pop(session_id, None)
+        _delete_hold_row(session_id)
         if prev:
             return (f"[logproxy] cache hold disarmed ({prev['pings']} ping(s) "
                     "had fired).",
@@ -2055,13 +2226,14 @@ def _arm_hold(session_id, action, hours):
                 "this proxy (needs WARMTH_HOLD + WARMTH_PINGER + WARMTH_LEDGER).",
                 {"armed": False, "reason": "disabled"})
     until = now + hours * 3600
+    hstate = {"until": until, "armed_at": now, "pings": 0,
+              "failures": 0, "last_ping_ts": None, "last_result": None}
     with _HOLD_LOCK:
-        _HOLD_STATE[session_id] = {"until": until, "armed_at": now, "pings": 0,
-                                   "failures": 0, "last_ping_ts": None,
-                                   "last_result": None}
+        _HOLD_STATE[session_id] = hstate
+    _persist_hold_row(session_id, hstate)
     wq = warmth_query(session=session_id)
-    with _LAST_REQUEST_LOCK:
-        pingable = session_id in _LAST_REQUEST
+    entry = _resolve_auth(session_id)
+    pingable = entry is not None and not entry.get("needs_auth")
     notes = []
     if wq.get("warm"):
         ttl = wq.get("ttl_s") or 3600
@@ -2073,9 +2245,12 @@ def _arm_hold(session_id, action, hours):
     else:
         notes.append("WARNING: prefix not warm — pings decline until a real "
                      "turn re-caches it (the hold then resumes)")
-    if not pingable:
+    if entry is None:
         notes.append("NOTE: no replayable request cached yet (proxy restart?) — "
                      "pings resume after the next real turn")
+    elif not pingable:
+        notes.append("NOTE: replayable request restored without credentials — "
+                     "pings resume once this account sends live traffic")
     ack = (f"[logproxy] \U0001f525 cache hold armed for {hours:g}h "
            f"(until {time.strftime('%H:%M', time.localtime(until))}); "
            + "; ".join(notes) + ". Disarm: /warm-cache off")
@@ -2083,7 +2258,7 @@ def _arm_hold(session_id, action, hours):
                   "warmth": wq, "pingable": pingable})
 
 
-def _hold_decision(hold, has_last_request, warmth_row, now):
+def _hold_decision(hold, has_last_request, warmth_row, now, has_auth=True):
     """One tick's verdict for an armed session — PURE (offline-testable).
     warmth_row = (stamped_at, ttl, expires_at) | None.
     Returns ('disarm'|'ping'|'skip', reason). Not-warm only SKIPS (never
@@ -2098,6 +2273,10 @@ def _hold_decision(hold, has_last_request, warmth_row, now):
                           "(stale credentials?)")
     if not has_last_request:
         return ("skip", "no replayable request cached")
+    if not has_auth:
+        # restored entry, credentials not yet re-donated — don't even burn a
+        # ping-count slot on the guaranteed decline
+        return ("skip", "restored without credentials; awaiting live traffic")
     if not warmth_row:
         return ("skip", "prefix not in ledger")
     remaining = warmth_row[2] - now
@@ -2113,8 +2292,7 @@ async def _hold_tick(now=None):
     with _HOLD_LOCK:
         armed = {sid: dict(h) for sid, h in _HOLD_STATE.items()}
     for sid, hold in armed.items():
-        with _LAST_REQUEST_LOCK:
-            entry = _LAST_REQUEST.get(sid)
+        entry = _resolve_auth(sid)
         row = None
         if entry:
             try:
@@ -2123,16 +2301,20 @@ async def _hold_tick(now=None):
                 row = _warmth_rows([h]).get(h)
             except Exception:
                 row = None
-        action, reason = _hold_decision(hold, entry is not None, row, now)
+        action, reason = _hold_decision(
+            hold, entry is not None, row, now,
+            has_auth=bool(entry) and not entry.get("needs_auth"))
         if action == "disarm":
             with _HOLD_LOCK:
                 _HOLD_STATE.pop(sid, None)
+            _delete_hold_row(sid)
             print(f"[hold] session={sid[:12]}… disarmed: {reason}", flush=True)
         elif action == "ping":
             code, res = await _warm_session(sid)
             warmed = bool(res.get("warmed"))
             declined = bool(res.get("skipped"))   # clean warm-only decline (race
-            with _HOLD_LOCK:                      # to cold) — not a failure
+            snap = None                           # to cold) — not a failure
+            with _HOLD_LOCK:
                 cur = _HOLD_STATE.get(sid)
                 if cur:
                     cur["pings"] += 1
@@ -2145,6 +2327,9 @@ async def _hold_tick(now=None):
                     else:
                         cur["failures"] += 1
                         cur["last_result"] = f"fail:{code}"
+                    snap = dict(cur)
+            if snap:
+                _persist_hold_row(sid, snap)
             print(f"[hold] session={sid[:12]}… auto-ping -> "
                   f"{'WARMED' if warmed else res.get('skipped') or f'FAILED ({code})'} "
                   f"pings={hold['pings'] + 1}", flush=True)
@@ -2304,8 +2489,21 @@ def _new_totals():
             "refusals": 0}
 
 
-_TOTALS = _new_totals()                                   # process-lifetime, all sessions
+_TOTALS = _new_totals()              # LOG_DIR-lifetime (reloaded at startup)
 _SESSION_TOTALS = collections.defaultdict(_new_totals)    # per-session running totals
+# Snapshot of _TOTALS right after the startup reload — /_status derives a
+# "since_start" delta from it, so LOG_DIR-lifetime and this-process views both
+# survive the restart-amnesia fix (item h: reload instead of zeroing).
+_TOTALS_AT_START = {}
+
+
+def _since_start():
+    out = {}
+    for k, v in _TOTALS.items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            base = _TOTALS_AT_START.get(k)
+            out[k] = round(v - (base if isinstance(base, (int, float)) else 0), 6)
+    return out
 
 
 _UNPRICED_WARNED = set()
@@ -2421,6 +2619,155 @@ def _accumulate(bill, session_key, stop=None):
     return snap
 
 
+# --- RESTART-AMNESIA (open item h): reload persisted state at startup ----------
+# Principle: every relevant in-memory structure is persisted/reconstructible, so
+# a restart recovers most of what the process held — the proxy must not "return
+# clueless". What each piece restores from:
+#   _HOLD_STATE      <- hold_state table (expired rows reaped on load)
+#   _LAST_REQUEST    <- last_request table (bodies + non-secret headers; entries
+#                       come back needs_auth=True until the account's first live
+#                       request re-donates credentials — see _resolve_auth)
+#   _TOTALS et al.   <- the _totals.json/_session.json snapshots already written
+#                       on every request (LOG_DIR-lifetime semantics + a
+#                       since_start delta)
+#   _META_CWD_DONE   <- session_meta (cwd IS NOT NULL = stop hunting)
+# Explicitly OK to lose: _SC_FIRED, _PENDING_RELAY, _UNPRICED_WARNED (ephemeral
+# per-turn / cosmetic). Warmth ledger + session_head/meta were already durable.
+_RESTORED = {"holds": 0, "last_requests": 0, "totals": False,
+             "session_totals": 0, "cwd_done": 0}
+
+
+def _restore_holds(now=None):
+    now = now or time.time()
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            rows = con.execute(
+                "SELECT session_id, until, armed_at, pings, failures, "
+                "last_ping_ts, last_result FROM hold_state WHERE owner=?",
+                (_OWNER,)).fetchall()
+            expired = [r[0] for r in rows if r[1] <= now]
+            if expired:
+                con.executemany(
+                    "DELETE FROM hold_state WHERE owner=? AND session_id=?",
+                    [(_OWNER, s) for s in expired])
+                con.commit()
+    except Exception as e:
+        print(f"[restore] holds failed: {e}", flush=True)
+        return 0
+    restored = 0
+    with _HOLD_LOCK:
+        for sid, until, armed_at, pings, failures, lpt, lres in rows:
+            if until > now and sid not in _HOLD_STATE:
+                _HOLD_STATE[sid] = {"until": until, "armed_at": armed_at,
+                                    "pings": pings, "failures": failures,
+                                    "last_ping_ts": lpt, "last_result": lres}
+                restored += 1
+    return restored
+
+
+def _restore_last_requests(now=None):
+    """Reload replayable request bodies (auth-less; newest first, capped). Rows
+    past the same staleness predicate the sweeper uses are reaped instead."""
+    now = now or time.time()
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            rows = con.execute(
+                "SELECT session_id, account_uuid, path, ts, body, headers "
+                "FROM last_request WHERE owner=? ORDER BY ts DESC LIMIT ?",
+                (_OWNER, _LAST_REQUEST_MAX)).fetchall()
+    except Exception as e:
+        print(f"[restore] last_requests failed: {e}", flush=True)
+        return 0
+    loaded, stale = 0, []
+    for sid, acct, path, ts, body, hdrs in rows:
+        try:
+            entry = {"obj": json.loads(body), "headers": json.loads(hdrs),
+                     "path": path, "ts": ts, "account": acct,
+                     "needs_auth": True}
+            age, ttl = _prefix_age_ttl(entry, now)
+        except Exception:
+            stale.append(sid)
+            continue
+        if age > ttl + _LAST_REQUEST_GRACE:
+            stale.append(sid)
+            continue
+        with _LAST_REQUEST_LOCK:
+            if sid not in _LAST_REQUEST:
+                _LAST_REQUEST[sid] = entry
+                loaded += 1
+    if stale:
+        try:
+            con = _warmth_db()
+            with _DB_LOCK:
+                con.executemany(
+                    "DELETE FROM last_request WHERE owner=? AND session_id=?",
+                    [(_OWNER, s) for s in stale])
+                con.commit()
+        except Exception:
+            pass
+    return loaded
+
+
+def _restore_totals():
+    """Reload the running totals from the snapshots _accumulate already writes
+    on every request, then baseline since_start. Best-effort: a kill -9 may have
+    lost the last enqueued snapshot — acceptable drift, flagged nowhere."""
+    global _TOTALS_AT_START
+    restored, nsess = False, 0
+    try:
+        p = LOG_DIR / "_totals.json"
+        if p.exists():
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                _TOTALS.update(data)
+                restored = True
+    except Exception as e:
+        print(f"[restore] totals failed: {e}", flush=True)
+    try:
+        for sp in LOG_DIR.glob("*/_session.json"):
+            try:
+                d = json.loads(sp.read_text())
+                if isinstance(d, dict):
+                    _SESSION_TOTALS[sp.parent.name].update(d)
+                    nsess += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    _TOTALS_AT_START = json.loads(json.dumps(_TOTALS))
+    return restored, nsess
+
+
+def _restore_cwd_done():
+    """Sessions whose cwd is already in session_meta need no further hunting;
+    the rest get their (cheap, capped) scan attempts back after a restart."""
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            rows = con.execute("SELECT session_id FROM session_meta "
+                               "WHERE cwd IS NOT NULL").fetchall()
+        _META_CWD_DONE.update(r[0] for r in rows)
+        return len(rows)
+    except Exception as e:
+        print(f"[restore] cwd_done failed: {e}", flush=True)
+        return 0
+
+
+def _restore_state():
+    now = time.time()
+    _RESTORED["holds"] = _restore_holds(now)
+    _RESTORED["last_requests"] = _restore_last_requests(now)
+    _RESTORED["totals"], _RESTORED["session_totals"] = _restore_totals()
+    _RESTORED["cwd_done"] = _restore_cwd_done()
+    print(f"[restore] holds={_RESTORED['holds']} "
+          f"last_requests={_RESTORED['last_requests']} (auth-less until live "
+          f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
+          f"session_totals={_RESTORED['session_totals']} "
+          f"cwd_known={_RESTORED['cwd_done']}", flush=True)
+
+
 def _status_snapshot(session=None, all_sessions=False):
     """Everything a human (or the statusline) wants to know about the sessions
     this proxy tracks, one read-only JSON. Universe = in-memory pingable
@@ -2429,7 +2776,8 @@ def _status_snapshot(session=None, all_sessions=False):
     in-memory by design (nothing replayable survives a restart anyway)."""
     now = time.time()
     with _LAST_REQUEST_LOCK:
-        last_real = {sid: e["ts"] for sid, e in _LAST_REQUEST.items()}
+        last_real = {sid: (e["ts"], bool(e.get("needs_auth")))
+                     for sid, e in _LAST_REQUEST.items()}
     holds = _hold_snapshot()
     meta_rows, meta_err = {}, None
     try:
@@ -2454,15 +2802,17 @@ def _status_snapshot(session=None, all_sessions=False):
         r = meta_rows.get(sid)
         wq = warmth_query(session=sid)
         tot = _SESSION_TOTALS.get(sid)        # .get: never create via defaultdict
+        lr = last_real.get(sid)               # (ts, needs_auth) | None
         sessions.append({
             "session_id": sid,
             "title": r[1] if r else None,
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
             "first_seen": r[4] if r else None,
-            "last_seen": (r[5] if r else None) or last_real.get(sid),
-            "last_real_turn_ts": last_real.get(sid),
-            "pingable": sid in last_real,
+            "last_seen": (r[5] if r else None) or (lr[0] if lr else None),
+            "last_real_turn_ts": lr[0] if lr else None,
+            "pingable": bool(lr and not lr[1]),
+            "awaiting_auth": bool(lr and lr[1]),
             "warmth": {"state": ("warm" if wq.get("warm")
                                  else "cold" if wq.get("found") else "absent"),
                        "remaining_s": wq.get("remaining_s"),
@@ -2485,11 +2835,153 @@ def _status_snapshot(session=None, all_sessions=False):
                                      "max_pings": WARMTH_HOLD_MAX_PINGS},
                      "tracked_last_requests": len(last_real),
                      "holds_armed": len(holds),
-                     "totals": dict(_TOTALS)},
+                     "restored_at_start": dict(_RESTORED),
+                     "totals": dict(_TOTALS),
+                     "totals_since_start": _since_start()},
            "sessions": sessions}
     if meta_err:
         res["proxy"]["session_meta_error"] = meta_err
     return res
+
+
+# --- /_admin: the /_status snapshot rendered for humans ------------------------
+# Same read-only data, as a self-refreshing HTML page — JSON is for tools, this
+# is for eyeballs. Server-rendered, zero JS, escapes everything (titles are
+# model output). Lab-grade like the other endpoints: localhost, unauthenticated.
+
+def _fmt_ago(ts, now=None):
+    if not ts:
+        return "—"
+    d = max(0.0, (now or time.time()) - ts)
+    if d < 60:
+        return f"{int(d)}s ago"
+    if d < 3600:
+        return f"{int(d // 60)}m ago"
+    if d < 86400:
+        return f"{d / 3600:.1f}h ago"
+    return f"{d / 86400:.1f}d ago"
+
+
+def _fmt_dur(s):
+    if s is None:
+        return "?"
+    s = max(0, int(s))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def _fmt_tok(n):
+    n = n or 0
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+_ADMIN_CSS = """
+body{background:#14161a;color:#cdd3dd;font:13px/1.5 ui-monospace,Menlo,monospace;
+     margin:1.2em auto;max-width:1180px;padding:0 1em}
+a{color:#6ab0de;text-decoration:none} a:hover{text-decoration:underline}
+h1{font-size:16px;color:#e6ebf2} h1 small{color:#69707d;font-weight:normal}
+table{border-collapse:collapse;width:100%;margin:.8em 0}
+th{color:#8a93a3;text-align:left;font-weight:normal;border-bottom:1px solid #2a2e36}
+th,td{padding:.32em .6em;vertical-align:top}
+tr:nth-child(even) td{background:#191c21}
+.kv span{margin-right:1.4em;white-space:nowrap}
+.kv b{color:#e6ebf2;font-weight:600}
+.warm{color:#7ec699}.cold{color:#6ab0de}.absent{color:#69707d}
+.bad{color:#e06c75}.warn{color:#e5c07b}.dim{color:#69707d}
+.badge{border:1px solid #2a2e36;border-radius:3px;padding:0 .35em;margin-right:.3em}
+.on{color:#7ec699}.off{color:#69707d}
+code{color:#9aa3b2}
+"""
+
+
+def _render_admin_html(snap, host=""):
+    e = html.escape
+    p = snap["proxy"]
+    t = p["totals"]
+    s0 = p.get("totals_since_start") or {}
+    now = time.time()
+    flags = " ".join(
+        f'<span class="badge {"on" if v else "off"}">{e(k)}</span>'
+        for k, v in (p.get("flags") or {}).items())
+    ref = t.get("refusals") or 0
+    unp = t.get("unpriced_requests") or 0
+    head = (
+        f'<h1>logproxy <small>· {e(p["log_dir"])} @ {e(host or "localhost")} '
+        f'&rarr; {e(p["upstream"])}</small></h1>'
+        f'<p class="kv">'
+        f'<span>up <b>{e(_fmt_dur(p["uptime_s"]))}</b></span>'
+        f'<span>{flags}</span>'
+        f'<span>holds <b>{p["holds_armed"]}</b></span>'
+        f'<span>replayable <b>{p["tracked_last_requests"]}</b></span></p>'
+        f'<p class="kv">'
+        f'<span>requests <b>{t["requests"]}</b></span>'
+        f'<span>in <b>{e(_fmt_tok(t["input_tokens"]))}</b></span>'
+        f'<span>out <b>{e(_fmt_tok(t["output_tokens"]))}</b></span>'
+        f'<span>cache r/w <b>{e(_fmt_tok(t["cache_read_tokens"]))}/'
+        f'{e(_fmt_tok(t["cache_write_tokens"]))}</b></span>'
+        f'<span>est <b>${t["est_usd"]:.4f}</b>'
+        f'{f" <span class=warn>(+{unp} unpriced)</span>" if unp else ""}</span>'
+        f'<span class="{"bad" if ref else "dim"}">refusals <b>{ref}</b></span>'
+        f'<span class="dim">since restart: {s0.get("requests", 0):g} req / '
+        f'${s0.get("est_usd", 0):.4f}</span></p>')
+    rows = []
+    for s in snap["sessions"]:
+        w = s["warmth"]
+        if w["state"] == "warm":
+            warmth = (f'<span class="warm">&#128293; '
+                      f'{e(_fmt_dur(w["remaining_s"]))} left</span>'
+                      f'<br><span class="dim">ttl {e(_fmt_dur(w["ttl_s"]))}</span>')
+        elif w["state"] == "cold":
+            warmth = '<span class="cold">&#10052;&#65039; cold</span>'
+        else:
+            warmth = '<span class="absent">&empty;</span>'
+        h = s.get("hold")
+        if h:
+            hold = (f'until {time.strftime("%H:%M", time.localtime(h["until"]))} '
+                    f'· {h["pings"]}/{WARMTH_HOLD_MAX_PINGS} pings')
+            if h.get("failures"):
+                hold += f' <span class="bad">{h["failures"]} fail</span>'
+            if h.get("last_result"):
+                hold += f'<br><span class="dim">{e(str(h["last_result"]))}</span>'
+        else:
+            hold = '<span class="dim">—</span>'
+        if s.get("pingable"):
+            ping = '<span class="warm">yes</span>'
+        elif s.get("awaiting_auth"):
+            ping = '<span class="warn">awaiting auth</span>'
+        else:
+            ping = '<span class="dim">no</span>'
+        c = s.get("cost")
+        cost = (f'${c["est_usd"]:.4f}<br><span class="dim">{c["requests"]} req'
+                f'</span>') if c else '<span class="dim">—</span>'
+        sref = s.get("refusals") or 0
+        sid = s["session_id"]
+        rows.append(
+            f'<tr><td>{warmth}</td>'
+            f'<td><b>{e(s.get("title") or "(untitled)")}</b><br>'
+            f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
+            f'<span class="dim">{e(_short_model(s.get("model")))}</span><br>'
+            f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'
+            f'<td>{e(_fmt_ago(s.get("last_seen"), now))}</td>'
+            f'<td>{hold}</td><td>{ping}</td><td>{cost}</td>'
+            f'<td class="{"bad" if sref else "dim"}">{sref or "—"}</td></tr>')
+    table = ('<table><tr><th>warmth</th><th>session</th><th>last seen</th>'
+             '<th>hold</th><th>pingable</th><th>cost</th><th>ref</th></tr>'
+             + "".join(rows) + "</table>") if rows else "<p class=dim>no sessions tracked</p>"
+    foot = ('<p class="dim">auto-refresh 10s · <a href="/_admin">last 24h</a> · '
+            '<a href="/_admin?all=1">all</a> · <a href="/_status">raw json</a></p>')
+    return ('<!doctype html><html><head><meta charset="utf-8">'
+            '<meta http-equiv="refresh" content="10">'
+            f'<title>logproxy · {e(p["log_dir"])}</title>'
+            f'<style>{_ADMIN_CSS}</style></head><body>'
+            + head + table + foot + "</body></html>")
 
 
 async def handler(request: Request) -> Response:
@@ -2500,6 +2992,15 @@ async def handler(request: Request) -> Response:
         res = _status_snapshot(session=q.get("session"),
                                all_sessions=q.get("all") in ("1", "yes", "true"))
         return Response(json.dumps(res, indent=2), media_type="application/json")
+
+    # ---- admin page: the same snapshot for humans ------------------------------
+    # GET /_admin[?session=<id>][&all=1] — read-only HTML view of /_status.
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_admin":
+        q = request.query_params
+        res = _status_snapshot(session=q.get("session"),
+                               all_sessions=q.get("all") in ("1", "yes", "true"))
+        return Response(_render_admin_html(res, host=request.headers.get("host", "")),
+                        media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
     # GET /_warm?h=<prefix-hash>  or  /_warm?session=<session_id>
@@ -2560,7 +3061,7 @@ async def handler(request: Request) -> Response:
 
     # ---- parse + summarize the request body ----
     role, model = "unknown", None
-    session_id = None
+    session_id = account_uuid = None
     title_call = False
     obj = None      # stays None on an unparseable body -> every transform/gate is
                     # skipped and the ORIGINAL bytes forward verbatim (fail-open:
@@ -2762,7 +3263,8 @@ async def handler(request: Request) -> Response:
     fwd_headers["accept-encoding"] = "identity"  # force uncompressed so we can read the SSE
     # Stash this (post-transform) request so POST /_ping?session= can replay it.
     if upstream_path.split("?")[0].endswith("/v1/messages"):
-        _cache_last_request(session_id, obj, fwd_headers, upstream_path)
+        _cache_last_request(session_id, obj, fwd_headers, upstream_path,
+                            account_uuid)
     req = _client.build_request(request.method, UPSTREAM + upstream_path,
                                 headers=fwd_headers, content=raw)
     up = await _client.send(req, stream=True)
@@ -2878,6 +3380,11 @@ async def handler(request: Request) -> Response:
                              headers=resp_headers,
                              media_type=up.headers.get("content-type"))
 
+
+# Reload persisted state BEFORE serving: armed holds resume (skipping until
+# auth is re-donated), totals continue instead of zeroing, the cwd hunt skips
+# known sessions. Runs at import so the offline tests exercise it too.
+_restore_state()
 
 app = Starlette(routes=[Route("/{path:path}", handler,
                               methods=["GET", "POST", "PUT", "DELETE"])],
