@@ -96,6 +96,13 @@ Measured chatty 14-msg dev session: **−72.7% tokens, −50% USD, same work.**
 - **Mid-turn eviction is real** — a tool step longer than the TTL between dispatch
   and continuation of one turn re-writes the prefix. 1h's real value = shielding a
   slow in-flight tool/approval-pause.
+- **CLI `total_cost_usd` UNDER-reports 1h-cached sessions** (2026-06-10,
+  reconciled to the cent on `aac68362`): the CLI prices cache writes at the 5m
+  rate (1.25×) even when the wire's `message_start` usage says
+  `ephemeral_1h_input_tokens` (2× premium — which main-agent sessions always
+  are, the CLI adds `[1m]` itself). cli $0.5548 vs proxy $0.6542 = exactly
+  13,246 write tok × (20−12.5)/MTok on fable. The statusline's dual cost will
+  always show cli < px by 0.75×base×cw1h; the PROXY number is the real bill.
 - **Org/proxy scope caveat:** a custom `ANTHROPIC_BASE_URL` (our proxy) flips the
   client to 3P → org cache scope → the static/dynamic system boundary is never
   inserted → static+dynamic system are bundled. So no system cache survives an env
