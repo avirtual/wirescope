@@ -307,16 +307,27 @@ synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done
     7803→logs_inject (SC: SYSPATCH+DONE), 7810→logs_opus (defaults),
     7811→logs_compact_strip, 7812→logs_forkcache, 7813→logs_compact_warmth.
   - Restart caveat: restarting wipes in-memory `_LAST_REQUEST` (pings 404 until
-    each session's next real turn); the SQLite ledger survives restarts. Don't
-    restart mid-experiment.
+    each session's next real turn) AND `_HOLD_STATE` (armed holds are lost —
+    re-arm with `/warm-cache <n>` after the next real turn); the SQLite ledger
+    + `session_meta` (titles/cwds) survive restarts. Don't restart
+    mid-experiment.
+  - `:7800` last restarted 2026-06-10 mid-day on commit `7ca38e7`
+    (hold-warm + /_status); hold defaults 60s tick / 300s margin / 12h clamp /
+    24-ping cap. Sanity-check anytime: `curl -s localhost:7800/_status`.
   - (`:7799` and `8080` are the human's — leave alone.)
+- **`/warm-cache` registers as a SKILL in Claude Code sessions** (the
+  user-level command file `~/.claude/commands/warm-cache.md` shows up in the
+  skill list). It works from ANY project whose session routes through the
+  proxy; without the proxy it self-diagnoses ("proxy not active — hold NOT
+  armed", one cheap real turn).
 - **Git: repo initialized 2026-06-09** (first commit = post-rework code).
   `.gitignore` excludes `logs*/`, `*.out`, `warmth.sqlite*`, `_canary/`. Commit
   after meaningful changes — the lab finally has undo.
 - **Key captures:** `logs_live/` (38× carriage data + subagent spawns) ·
   `logs_chatty/` (tool-trim, fat 4bcf519f / lean a0f0c609) · `logs_compact_warmth/`
   (warm fork cdcd1b7e / cold f5c27104) · split/reloc A/B pairs (`logs_split5m_on|off`,
-  `logs_reloc2_on|off`).
+  `logs_reloc2_on|off`) · `logs_scratch/329a6d9b-*` (hold-warm live drill
+  2026-06-10: arm sentinel intercept `004-*`, auto-ping WARMED, disarm, `/_end`).
 
 ## Open / next
 
