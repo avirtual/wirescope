@@ -3075,7 +3075,8 @@ def _render_admin_html(snap, host=""):
         sid = s["session_id"]
         rows.append(
             f'<tr><td>{warmth}</td>'
-            f'<td><b>{e(s.get("title") or "(untitled)")}</b><br>'
+            f'<td><b><a href="/_session?session={e(sid)}">'
+            f'{e(s.get("title") or "(untitled)")}</a></b><br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(_short_model(s.get("model")))}</span><br>'
             f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'
@@ -3094,6 +3095,183 @@ def _render_admin_html(snap, host=""):
             + head + table + foot + "</body></html>")
 
 
+# --- /_session: simplified view of a session's captured context ----------------
+# Renders the session's REPLAYABLE LAST REQUEST — the post-transform body the
+# pinger would replay, i.e. the exact context the model saw on the session's
+# last turn (in-memory entry; SQLite `last_request` row after a restart) — as a
+# human-readable inventory: tools / system blocks / message timeline with
+# previews. BODY ONLY: headers (incl. auth) are never rendered. Static snapshot,
+# no auto-refresh (pages can be large). Zero JS — expansion is <details>.
+
+_SESSION_CSS = _ADMIN_CSS + """
+.blk{border:1px solid #2a2e36;border-left-width:3px;border-radius:4px;
+     margin:.45em 0;padding:.3em .6em}
+.blk .sz{float:right;color:#69707d;margin-left:1em}
+.user{border-left-color:#6ab0de}.assistant{border-left-color:#7ec699}
+.tooluse{border-left-color:#e5c07b}.toolres{border-left-color:#c678dd}
+.sysb{border-left-color:#e06c75}
+pre{white-space:pre-wrap;word-break:break-word;color:#aab2c0;margin:.3em 0;
+    background:#101317;padding:.5em;border-radius:4px;max-height:30em;overflow:auto}
+details>summary{cursor:pointer;color:#6ab0de}
+"""
+
+_MD_HEADING_RE = re.compile(r"(?m)^#{1,3} .+$")
+
+
+def _load_last_request_row(session_id):
+    """Read this proxy's persisted replayable request straight from SQLite —
+    fallback for entries not in memory (e.g. evicted past the cap)."""
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            r = con.execute("SELECT path, ts, body FROM last_request "
+                            "WHERE owner=? AND session_id=?",
+                            (_OWNER, session_id)).fetchone()
+        if r:
+            return {"obj": json.loads(r[2]), "path": r[0], "ts": r[1],
+                    "needs_auth": True}
+    except Exception as e:
+        print(f"[session] last_request read failed for {session_id[:12]}…: {e}",
+              flush=True)
+    return None
+
+
+def _flat_text(content):
+    """All human-readable text under a content value (str | block list)."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for b in content or []:
+        if isinstance(b, dict):
+            if b.get("type") == "text":
+                out.append(b.get("text") or "")
+            elif b.get("type") == "tool_result":
+                out.append(_flat_text(b.get("content")))
+    return "\n".join(x for x in out if x)
+
+
+def _prevu(text, cap=350, full_cap=60000):
+    """Escaped preview <pre> + a <details> with the (capped) full text."""
+    t = text or ""
+    if not t:
+        return ""
+    if len(t) <= cap:
+        return f"<pre>{html.escape(t)}</pre>"
+    more = "" if len(t) <= full_cap else f"\n… (+{len(t) - full_cap:,} more ch)"
+    return (f"<pre>{html.escape(t[:cap])}…</pre>"
+            f"<details><summary>show all {len(t):,} ch</summary>"
+            f"<pre>{html.escape(t[:full_cap])}{html.escape(more)}</pre></details>")
+
+
+def _render_session_html(sid, entry, snap):
+    e = html.escape
+    s = (snap.get("sessions") or [{}])[0]
+    w = s.get("warmth") or {}
+    warmth = {"warm": (f'<span class="warm">&#128293; '
+                       f'{e(_fmt_dur(w.get("remaining_s")))} left</span>'),
+              "cold": '<span class="cold">&#10052;&#65039; cold</span>'
+              }.get(w.get("state"), '<span class="absent">&empty;</span>')
+    head = (f'<h1>{e(s.get("title") or "(untitled)")} '
+            f'<small>· <code>{e(sid)}</code></small></h1>'
+            f'<p class="kv"><span>{warmth}</span>'
+            f'<span>model <b>{e(_short_model(s.get("model")))}</b></span>'
+            f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
+            f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
+    if not entry:
+        body = ('<p class="warn">no replayable request tracked for this session '
+                '— nothing captured yet, evicted, or ended via /_end.</p>')
+        obj = {}
+    else:
+        obj = entry.get("obj") or {}
+        tools = obj.get("tools") or []
+        sysv = obj.get("system")
+        sysb = ([{"type": "text", "text": sysv}] if isinstance(sysv, str)
+                else [b for b in (sysv or []) if isinstance(b, dict)])
+        msgs = obj.get("messages") or []
+        t_ch = len(json.dumps(tools)) if tools else 0
+        s_ch = sum(len(b.get("text") or "") for b in sysb)
+        m_ch = len(json.dumps(msgs)) if msgs else 0
+        auth_badge = (' <span class="warn">awaiting auth (restored)</span>'
+                      if entry.get("needs_auth") else "")
+        bar = (f'<p class="kv"><span>captured <b>{e(_fmt_ago(entry.get("ts")))}'
+               f'</b>{auth_badge}</span>'
+               f'<span>tools <b>{len(tools)}</b> &approx;{e(_fmt_tok(t_ch // 4))} tok</span>'
+               f'<span>system <b>{len(sysb)}</b> blocks &approx;{e(_fmt_tok(s_ch // 4))} tok</span>'
+               f'<span>messages <b>{len(msgs)}</b> &approx;{e(_fmt_tok(m_ch // 4))} tok</span>'
+               f'<span class="dim">sizes are chars; tok &approx; ch/4</span></p>')
+        if tools:
+            trs = "".join(
+                f'<tr><td><b>{e(t.get("name", "?"))}</b></td>'
+                f'<td class="dim">{len(json.dumps(t)):,} ch</td>'
+                f'<td class="dim">{e((t.get("description") or "")[:120])}</td></tr>'
+                for t in sorted(tools, key=lambda t: -len(json.dumps(t))))
+            tools_html = (f'<details><summary>tools · {len(tools)} · '
+                          f'&approx;{e(_fmt_tok(t_ch // 4))} tok</summary>'
+                          f'<table>{trs}</table></details>')
+        else:
+            tools_html = '<p class="dim">no tools</p>'
+        sb = []
+        for i, b in enumerate(sysb):
+            txt = b.get("text") or ""
+            cc = b.get("cache_control")
+            badge = (f'<span class="badge on">cache '
+                     f'{e((cc.get("ttl") or "5m") if isinstance(cc, dict) else "5m")}'
+                     f'</span>' if cc else "")
+            heads = _MD_HEADING_RE.findall(txt)
+            hl = " · ".join(e(h.lstrip("# ")) for h in heads[:12])
+            sb.append(f'<div class="blk sysb"><span class="sz">{len(txt):,} ch</span>'
+                      f'<span class="role">system[{i}]</span> {badge} '
+                      f'<span class="dim">{hl}</span>{_prevu(txt, cap=160)}</div>')
+        rows = []
+        for i, mm in enumerate(msgs):
+            role = mm.get("role", "?")
+            content = mm.get("content")
+            blocks = (content if isinstance(content, list)
+                      else [{"type": "text", "text": content or ""}])
+            for b in blocks:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                pin = " &#128204;" if b.get("cache_control") else ""
+                lbl = f'<span class="role">#{i} {e(role)}{pin}</span>'
+                if bt == "text":
+                    txt = b.get("text") or ""
+                    rem = (' <span class="warn">[system-reminder]</span>'
+                           if "<system-reminder" in txt else "")
+                    rows.append(f'<div class="blk {e(role)}">'
+                                f'<span class="sz">{len(txt):,} ch</span>'
+                                f'{lbl}{rem}{_prevu(txt)}</div>')
+                elif bt == "tool_use":
+                    args = json.dumps(b.get("input") or {}, ensure_ascii=False)
+                    rows.append(f'<div class="blk tooluse">'
+                                f'<span class="sz">{len(args):,} ch</span>'
+                                f'{lbl} tool_use <b>{e(b.get("name") or "?")}</b>'
+                                f'{_prevu(args, cap=200)}</div>')
+                elif bt == "tool_result":
+                    txt = _flat_text(b.get("content"))
+                    err = (' <span class="bad">ERROR</span>'
+                           if b.get("is_error") else "")
+                    rows.append(f'<div class="blk toolres">'
+                                f'<span class="sz">{len(txt):,} ch</span>'
+                                f'{lbl} tool_result{err}{_prevu(txt, cap=200)}</div>')
+                elif bt == "thinking":
+                    txt = b.get("thinking") or ""
+                    rows.append(f'<div class="blk assistant">'
+                                f'<span class="sz">{len(txt):,} ch</span>'
+                                f'{lbl} thinking{_prevu(txt, cap=120)}</div>')
+                else:
+                    rows.append(f'<div class="blk">{lbl} '
+                                f'<span class="dim">{e(str(bt))}</span></div>')
+        body = (bar + tools_html + "".join(sb) + "".join(rows))
+    foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
+            f'<a href="/_status?session={e(sid)}">raw json</a> · '
+            f'static snapshot (reload to refresh)</p>')
+    return ('<!doctype html><html><head><meta charset="utf-8">'
+            f'<title>logproxy · {e((s.get("title") or sid)[:60])}</title>'
+            f'<style>{_SESSION_CSS}</style></head><body>'
+            + head + body + foot + "</body></html>")
+
+
 async def handler(request: Request) -> Response:
     # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
     # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
@@ -3110,6 +3288,22 @@ async def handler(request: Request) -> Response:
         res = _status_snapshot(session=q.get("session"),
                                all_sessions=q.get("all") in ("1", "yes", "true"))
         return Response(_render_admin_html(res, host=request.headers.get("host", "")),
+                        media_type="text/html; charset=utf-8")
+
+    # ---- session context view: the replayable last request, for humans --------
+    # GET /_session?session=<id> — read-only HTML rendering of the session's
+    # captured context (body only, never headers).
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_session":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response("missing ?session=", status_code=400,
+                            media_type="text/plain")
+        with _LAST_REQUEST_LOCK:
+            entry = _LAST_REQUEST.get(sess)
+        if entry is None:
+            entry = _load_last_request_row(sess)
+        return Response(_render_session_html(sess, entry,
+                                             _status_snapshot(session=sess)),
                         media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---

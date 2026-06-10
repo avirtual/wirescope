@@ -456,6 +456,37 @@ check("/_status proxy block carries flags + totals",
       st["proxy"]["flags"]["ledger"] in (True, False)
       and "refusals" in st["proxy"]["totals"])
 
+# --- /_session context view --------------------------------------------------------
+_sv_entry = {
+    "obj": {"model": "claude-fable-5",
+            "tools": [{"name": "Bash", "description": "Run a command",
+                       "input_schema": {"type": "object"}}],
+            "system": [{"type": "text", "text": "# Harness\nrules here",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text",
+                 "text": "<system-reminder>ctx</system-reminder>hello <b>world"}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1",
+                 "name": "Bash", "input": {"command": "ls"}}]},
+                {"role": "user", "content": [{"type": "tool_result",
+                 "tool_use_id": "t1", "content": "ok", "is_error": False}]}]},
+    "path": "/v1/messages", "ts": time.time(), "needs_auth": False}
+_sv = lp._render_session_html("sess-meta-1", _sv_entry,
+                              lp._status_snapshot(session="sess-meta-1"))
+check("session view renders tools/system/messages segments",
+      "Bash" in _sv and "# Harness" in _sv and "tool_result" in _sv
+      and "cache 1h" in _sv and "[system-reminder]" in _sv)
+check("session view escapes message content",
+      "<b>world" not in _sv and "&lt;b&gt;world" in _sv)
+check("session view never renders headers",
+      "authorization" not in _sv.lower() and "x-api-key" not in _sv.lower())
+check("session view handles a missing entry",
+      "no replayable request" in lp._render_session_html(
+          "nope", None, lp._status_snapshot(session="nope")))
+check("admin page links each session to its context view",
+      "/_session?session=" in lp._render_admin_html(
+          lp._status_snapshot(all_sessions=True)))
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
