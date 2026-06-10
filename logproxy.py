@@ -2280,17 +2280,25 @@ async def _auth_bootstrap(account=None):
     proc = None
     try:
         env = {**os.environ, "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}"}
+        # prompt must come BEFORE --tools: the flag is variadic and would
+        # swallow a trailing positional as another tool name (the CLI then
+        # exits 1 with "Input must be provided" before any API call)
         proc = await asyncio.create_subprocess_exec(
-            "claude", "-p", "--model", WARMTH_AUTH_BOOTSTRAP_MODEL,
+            "claude", "-p", "Reply with exactly: ok",
+            "--model", WARMTH_AUTH_BOOTSTRAP_MODEL,
             "--session-id", sid,
-            "--tools", "Bash", "Reply with exactly: ok",
+            "--tools", "Bash",
             cwd="/tmp", env=env,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        rc = await asyncio.wait_for(proc.wait(), timeout=120)
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+        rc = proc.returncode
         with _LAST_REQUEST_LOCK:
             got = bool(account) and account in _ACCOUNT_AUTH
+        tail = ""
+        if rc and err:
+            tail = "; stderr: " + err.decode(errors="replace").strip()[-300:]
         print(f"[auth] bootstrap turn exited rc={rc}; account auth "
-              f"{'ACQUIRED' if got else 'not seen yet'}", flush=True)
+              f"{'ACQUIRED' if got else 'not seen yet'}{tail}", flush=True)
     except Exception as e:
         if proc is not None:
             try:
