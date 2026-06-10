@@ -2332,6 +2332,26 @@ def _arm_hold(session_id, action, hours):
                   "warmth": wq, "pingable": pingable})
 
 
+def _hold_note_real_turn(session_id):
+    """An organic turn just re-warmed the session itself, so the idle clock —
+    and with it the autonomous-ping budget — starts over: the counter means
+    'pings since your last real turn', not 'pings since arming'. (A sentinel
+    or replay ping never lands here; only forwarded turns do.)"""
+    if not session_id:
+        return
+    snap = None
+    with _HOLD_LOCK:
+        cur = _HOLD_STATE.get(session_id)
+        if cur and (cur["pings"] or cur["failures"]):
+            cur["pings"] = 0
+            cur["failures"] = 0
+            snap = dict(cur)
+    if snap:
+        _persist_hold_row(session_id, snap)
+        print(f"[hold] session={session_id[:12]}… ping counter reset "
+              "(organic turn re-warmed)", flush=True)
+
+
 def _hold_decision(hold, has_last_request, warmth_row, now, has_auth=True):
     """One tick's verdict for an armed session — PURE (offline-testable).
     warmth_row = (stamped_at, ttl, expires_at) | None.
@@ -2883,13 +2903,16 @@ def _status_snapshot(session=None, all_sessions=False):
         lr = last_real.get(sid)               # (ts, needs_auth) | None
         hold = holds.get(sid)
         if hold:
-            # what THIS hold should need (duration / ttl, same formula as the
-            # arming ack) — the global ping cap is only the safety bound
+            # what THIS hold should still need: idle span / ttl, anchored at
+            # the LAST REAL TURN (an organic turn re-warms for free and resets
+            # the ping counter, so both sides of n/expected restart together).
+            # The global ping cap is only the safety bound.
             hold = dict(hold)
             ttl = wq.get("ttl_s") or 3600
+            ref = max(hold["armed_at"], (lr[0] if lr else 0))
             hold["expected_pings"] = min(
                 WARMTH_HOLD_MAX_PINGS,
-                max(1, int((hold["until"] - hold["armed_at"]) // ttl)))
+                max(1, int((hold["until"] - ref) // ttl)))
         sessions.append({
             "session_id": sid,
             "title": r[1] if r else None,
@@ -3352,6 +3375,7 @@ async def handler(request: Request) -> Response:
     if upstream_path.split("?")[0].endswith("/v1/messages"):
         _cache_last_request(session_id, obj, fwd_headers, upstream_path,
                             account_uuid)
+        _hold_note_real_turn(session_id)   # organic turn -> ping budget restarts
     req = _client.build_request(request.method, UPSTREAM + upstream_path,
                                 headers=fwd_headers, content=raw)
     up = await _client.send(req, stream=True)

@@ -385,6 +385,30 @@ lp._arm_hold("sess-exp-1", "arm", 2.0)
 st_exp = lp._status_snapshot(session="sess-exp-1")
 check("hold reports expected_pings = hours/ttl (2h @ 1h default -> 2)",
       st_exp["sessions"][0]["hold"]["expected_pings"] == 2)
+
+# an organic turn resets the ping counter AND re-anchors expected_pings
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE["sess-exp-1"]["pings"] = 2
+    lp._HOLD_STATE["sess-exp-1"]["failures"] = 1
+    _h = lp._HOLD_STATE["sess-exp-1"]
+with lp._LAST_REQUEST_LOCK:   # simulate the organic turn 1h into the 2h hold
+    lp._LAST_REQUEST["sess-exp-1"] = {
+        "obj": {"messages": []}, "headers": {}, "path": "/v1/messages",
+        "ts": _h["armed_at"] + 3600, "account": None, "needs_auth": False}
+lp._hold_note_real_turn("sess-exp-1")
+st_exp2 = lp._status_snapshot(session="sess-exp-1")
+check("organic turn resets pings/failures",
+      st_exp2["sessions"][0]["hold"]["pings"] == 0
+      and st_exp2["sessions"][0]["hold"]["failures"] == 0)
+check("expected_pings re-anchors at the last real turn (1h left @ 1h -> 1)",
+      st_exp2["sessions"][0]["hold"]["expected_pings"] == 1)
+with lp._HOLD_LOCK:           # the reset was mirrored: a restart reloads 0
+    lp._HOLD_STATE.clear()
+lp._restore_holds()
+check("counter reset survives a restart",
+      lp._hold_snapshot()["sess-exp-1"]["pings"] == 0)
+with lp._LAST_REQUEST_LOCK:
+    lp._LAST_REQUEST.pop("sess-exp-1", None)
 lp._arm_hold("sess-exp-1", "off", None)
 
 # --- auth self-bootstrap: bounded spend decision -----------------------------------
