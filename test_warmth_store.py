@@ -558,6 +558,39 @@ check("bootstrap respects the kill switch",
       lp._bootstrap_decision("acct-z", now=NOW, state=dict(BST))[0] is False)
 lp.WARMTH_AUTH_BOOTSTRAP = _sb
 
+# --- stale-auth (ping 401) self-heal -----------------------------------------------
+# A 401 replay invalidates the dead bearer everywhere: account registry dropped,
+# entry back to needs_auth -> the no-auth skip + bootstrap path takes over.
+with lp._LAST_REQUEST_LOCK:
+    lp._ACCOUNT_AUTH["acct-stale"] = {"authorization": "Bearer EXPIRED"}
+    lp._LAST_REQUEST["sess-stale-1"] = {
+        "obj": dict(lturn), "headers": {"authorization": "Bearer EXPIRED"},
+        "path": "/v1/messages", "ts": NOW, "account": "acct-stale",
+        "needs_auth": False}
+lp._invalidate_stale_auth("sess-stale-1", "acct-stale")
+check("401 invalidation drops the account's stale auth",
+      "acct-stale" not in lp._ACCOUNT_AUTH)
+check("401 invalidation flips the entry back to needs_auth",
+      lp._LAST_REQUEST["sess-stale-1"]["needs_auth"] is True)
+check("resolve declines (no re-attach) after stale invalidation",
+      lp._resolve_auth("sess-stale-1").get("needs_auth") is True)
+check("bootstrap may fire again for the invalidated account",
+      lp._bootstrap_decision("acct-stale", now=NOW, state=dict(BST))[0] is True)
+# a fresh donation (live turn or bootstrap's donor) resets the spend budget:
+# bounded per auth OUTAGE, not per process lifetime
+lp._AUTH_BOOTSTRAP["attempts"] = lp._AUTH_BOOTSTRAP_MAX
+lp._cache_last_request("sess-stale-1", dict(lturn),
+                       {"authorization": "Bearer FRESH2",
+                        "content-type": "application/json"},
+                       "/v1/messages", account_uuid="acct-stale")
+check("fresh auth donation resets the bootstrap attempt budget",
+      lp._AUTH_BOOTSTRAP["attempts"] == 0
+      and lp._ACCOUNT_AUTH["acct-stale"]["authorization"] == "Bearer FRESH2")
+check("donated entry is pingable again (needs_auth cleared)",
+      lp._LAST_REQUEST["sess-stale-1"]["needs_auth"] is False)
+lp._WRITE_Q.join()
+lp._end_session("sess-stale-1")
+
 # --- /_admin HTML page -------------------------------------------------------------
 page = lp._render_admin_html(lp._status_snapshot(all_sessions=True), host="t:7800")
 check("admin page renders the session inventory",

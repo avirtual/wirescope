@@ -1730,6 +1730,10 @@ def _cache_last_request(session_id, obj, fwd_headers, upstream_path,
     with _LAST_REQUEST_LOCK:
         if account_uuid and auth:
             _ACCOUNT_AUTH[account_uuid] = auth
+            # fresh credentials close the auth gap: the bootstrap budget is
+            # per OUTAGE (2 consecutive failed spawns), not per process — a
+            # long hold may legitimately need a refresh every OAuth expiry
+            _AUTH_BOOTSTRAP["attempts"] = 0
         _LAST_REQUEST[session_id] = {"obj": obj, "headers": headers,
                                      "path": upstream_path, "ts": ts,
                                      "account": account_uuid,
@@ -1758,6 +1762,20 @@ def _resolve_auth(session_id):
             e["needs_auth"] = False
             _LAST_REQUEST[session_id] = e
         return e
+
+
+def _invalidate_stale_auth(session_id, account):
+    """A 401 on a replay means the cached bearer went stale (OAuth expiry):
+    drop it from the account registry and flip the session entry back to
+    needs_auth, so nothing retries the dead headers and the existing no-auth
+    path (clean skip + auth bootstrap) takes over until fresh credentials
+    are donated."""
+    with _LAST_REQUEST_LOCK:
+        if account:
+            _ACCOUNT_AUTH.pop(account, None)
+        live = _LAST_REQUEST.get(session_id)
+        if live:
+            live["needs_auth"] = True
 
 
 def _strip_cache_control(node):
@@ -2066,6 +2084,9 @@ async def _warm_session(session_id, force=False):
         res["cache_hit"] = bool((usage.get("cache_read_input_tokens") or 0) > 0)
     else:
         res["error"] = data or r.text[:500]
+        if r.status_code == 401:
+            _invalidate_stale_auth(session_id, entry.get("account"))
+            res["auth_stale"] = True
     return (200 if ok else r.status_code), res
 
 
@@ -2548,7 +2569,8 @@ async def _hold_tick(now=None):
             code, res = await _warm_session(sid)
             warmed = bool(res.get("warmed"))
             declined = bool(res.get("skipped"))   # clean warm-only decline (race
-            snap = None                           # to cold) — not a failure
+            auth_stale = bool(res.get("auth_stale"))  # to cold) — not a failure
+            snap = None
             with _HOLD_LOCK:
                 cur = _HOLD_STATE.get(sid)
                 if cur:
@@ -2559,14 +2581,23 @@ async def _hold_tick(now=None):
                         cur["last_result"] = "warmed"
                     elif declined:
                         cur["last_result"] = f"declined:{res.get('skipped')}"
+                    elif auth_stale:
+                        # NOT a disarm strike: _warm_session already invalidated
+                        # the dead bearer (entry is needs_auth again) and the
+                        # bootstrap below re-donates — recoverable auth gap,
+                        # same as the post-restart one
+                        cur["last_result"] = "auth_stale"
                     else:
                         cur["failures"] += 1
                         cur["last_result"] = f"fail:{code}"
                     snap = dict(cur)
             if snap:
                 _persist_hold_row(sid, snap)
+            if auth_stale:
+                asyncio.create_task(
+                    _auth_bootstrap(entry.get("account") if entry else None))
             print(f"[hold] session={sid[:12]}… auto-ping -> "
-                  f"{'WARMED' if warmed else res.get('skipped') or f'FAILED ({code})'} "
+                  f"{'WARMED' if warmed else 'auth stale (401) -> bootstrap' if auth_stale else res.get('skipped') or f'FAILED ({code})'} "
                   f"pings={hold['pings'] + 1}", flush=True)
 
 
