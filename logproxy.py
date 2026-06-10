@@ -1535,6 +1535,51 @@ def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
               flush=True)
 
 
+# Heaviness signals derived from the REQUEST BODY — the model-visible history
+# every request re-ships (the wire IS the transcript). Statelessly recomputed
+# per turn, so it is resume/fork/restart-proof and resets at /compact for free
+# (the summary replaces history; the summary message itself counts as 1).
+# Replaces the statusline's JSONL heuristics with the bytes actually billed.
+# Latest snapshot per session, in-memory only (next request repopulates).
+_CONTEXT_STATS = {}
+
+
+def _turn_stats(obj):
+    """{turns_in_context, max_tool_result_chars, n_messages} for a messages
+    request. A 'turn' = a user message carrying real prompt text (tool_result-
+    only continuations, <command-*> expansions and system-reminder bundles
+    don't count)."""
+    msgs = obj.get("messages") or []
+    turns, big = 0, 0
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        blocks = (c if isinstance(c, list)
+                  else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+        prompt = False
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_result":
+                bc = b.get("content")
+                ln = (len(bc) if isinstance(bc, str)
+                      else sum(len(x.get("text") or "") for x in bc
+                               if isinstance(x, dict)) if isinstance(bc, list)
+                      else 0)
+                big = max(big, ln)
+            elif b.get("type") == "text":
+                t = (b.get("text") or "").lstrip()
+                if t and not t.startswith("<command-") \
+                        and not t.startswith("<local-command-") \
+                        and not t.startswith("<system-reminder>"):
+                    prompt = True
+        if prompt:
+            turns += 1
+    return {"turns_in_context": turns, "max_tool_result_chars": big,
+            "n_messages": len(msgs)}
+
+
 def _extract_cwd(obj):
     """Find 'Primary working directory: …' wherever this CLI build put it:
     system text, the msg0 context bundle, or the relocated tail block. Scans
@@ -2041,6 +2086,7 @@ def _end_session(session_id, reason="unspecified"):
         dropped_lr = _LAST_REQUEST.pop(session_id, None) is not None
     with _HOLD_LOCK:
         dropped_hold = _HOLD_STATE.pop(session_id, None) is not None
+    _CONTEXT_STATS.pop(session_id, None)
     dropped_head = False
     try:
         con = _warmth_db()
@@ -2655,7 +2701,13 @@ def _new_totals():
             # zero content blocks, the model never ran; fable 2026-06-10).
             # Count + evidence -> a false-positive RATE and request_ids for
             # /feedback instead of anecdotes. The CLI hides all of this.
-            "refusals": 0}
+            "refusals": 0,
+            # Completed user turns, RECEIPT-counted (2026-06-10): one terminal
+            # response (stop_reason != tool_use) = one turn; tool-loop hops,
+            # title side-calls and subagent traffic excluded at the call site
+            # (stop["is_turn"]). CLI retries dedupe for free — a failed
+            # request never produces a terminal response.
+            "turns": 0}
 
 
 _TOTALS = _new_totals()              # LOG_DIR-lifetime (reloaded at startup)
@@ -2750,6 +2802,8 @@ def _billing(kind, model_resolved=None, usage_final=None, usage_start=None, coun
 
 def _bump(totals, bill, stop=None):
     totals["requests"] += 1
+    if stop and stop.get("is_turn"):
+        totals["turns"] = totals.get("turns", 0) + 1
     if stop and stop.get("stop_reason") == "refusal":
         totals["refusals"] = totals.get("refusals", 0) + 1
         ev = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -3011,6 +3065,10 @@ def _status_snapshot(session=None, all_sessions=False):
                       "unpriced_requests": tot["unpriced_requests"]}
                      if tot else None),
             "refusals": (tot or {}).get("refusals", 0),
+            # receipt-counted completed turns + the latest request-derived
+            # heaviness snapshot (turns_in_context resets at /compact)
+            "turns_completed": (tot or {}).get("turns"),
+            "context": _CONTEXT_STATS.get(sid),
         })
     sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
     res = {"proxy": {"log_dir": str(LOG_DIR), "upstream": UPSTREAM,
@@ -3563,6 +3621,11 @@ async def handler(request: Request) -> Response:
         if upstream_path.split("?")[0].endswith("/v1/messages"):
             _capture_session_meta(session_id, obj, model)
             title_call = _is_title_call(obj)
+            # heaviness snapshot from the model-visible history (main line
+            # only: a subagent's small history must not clobber the parent's)
+            if session_id and not title_call and role in ("parent", "unknown"):
+                _CONTEXT_STATS[session_id] = {**_turn_stats(obj),
+                                              "ts": time.time()}
     except Exception as e:
         record["parse_error"] = str(e)
         record["body_raw"] = raw.decode("utf-8", "replace")
@@ -3708,7 +3771,14 @@ async def handler(request: Request) -> Response:
                     bill = _billing("count_tokens", model_resolved=model, count_tokens=ct)
                 stop = {"stop_reason": meta.get("stop_reason"),
                         "stop_details": meta.get("stop_details"),
-                        "request_id": up.headers.get("request-id")}
+                        "request_id": up.headers.get("request-id"),
+                        # one terminal response = one completed user turn
+                        # (refusal/max_tokens still END a turn; tool_use is a
+                        # mid-turn hop). Side-calls + subagents don't count.
+                        "is_turn": bool(
+                            is_messages and not title_call
+                            and role in ("parent", "unknown")
+                            and meta.get("stop_reason") not in (None, "tool_use"))}
                 cum = _accumulate(bill, session_key, stop)
                 _enqueue_json(out_dir / f"{stem}.response.json",
                     {"seq": n, "agent": agent, "role": role, "model": model,

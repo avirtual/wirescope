@@ -293,6 +293,49 @@ check("meta upserts merge (COALESCE keeps earlier fields) + survive restart",
       row == (row[0], "/tmp/projA", "claude-fable-5", row[3], row[4])
       and row[0] == "Fix the frobnicator" and row[4] >= row[3])
 
+# --- turn accounting: request-derived context stats + receipt-counted turns ------
+ts = lp._turn_stats({"messages": [
+    msg("user", "first question"),
+    msg("assistant", "answer"),
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": [{"type": "text", "text": "x" * 5000}]}]},
+    msg("assistant", "after tool"),
+    {"role": "user", "content": [
+        {"type": "text", "text": "<command-message>foo</command-message>"}]},
+    {"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder>bundle only</system-reminder>"}]},
+    msg("user", "second real question"),
+]})
+check("turns_in_context counts only text-bearing prompts (tool_result-only, "
+      "<command-*> and system-reminder-only excluded)",
+      ts["turns_in_context"] == 2)
+check("max_tool_result_chars finds the biggest single tool_result",
+      ts["max_tool_result_chars"] == 5000)
+check("n_messages is the raw message count", ts["n_messages"] == 7)
+check("string-content user message counts as a turn",
+      lp._turn_stats({"messages": [{"role": "user", "content": "hi"}]})
+      ["turns_in_context"] == 1)
+tot_t = lp._new_totals()
+bill_t = {"endpoint": "messages", "tokens": {}, "est_usd": 0.0}
+lp._bump(tot_t, bill_t, stop={"stop_reason": "tool_use", "is_turn": False})
+lp._bump(tot_t, bill_t, stop={"stop_reason": "end_turn", "is_turn": True})
+lp._bump(tot_t, bill_t, stop={"stop_reason": "refusal", "is_turn": True})
+check("turns receipt-counts terminal responses only (tool_use hop doesn't; "
+      "refusal still ends a turn)", tot_t["turns"] == 2)
+lp._CONTEXT_STATS["sess-meta-1"] = {"turns_in_context": 5,
+                                    "max_tool_result_chars": 123,
+                                    "n_messages": 11, "ts": 0}
+lp._bump(lp._SESSION_TOTALS["sess-meta-1"], bill_t,
+         stop={"stop_reason": "end_turn", "is_turn": True})
+st_turns = lp._status_snapshot(session="sess-meta-1")["sessions"][0]
+check("/_status exposes turns_completed + context heaviness",
+      st_turns["turns_completed"] == 1
+      and st_turns["context"]["turns_in_context"] == 5)
+check("/_end drops the context snapshot",
+      (lp._end_session("sess-meta-1"),
+       "sess-meta-1" not in lp._CONTEXT_STATS)[1])
+
 # --- session meta: kind tag (proxy-spawned bootstrap sessions) -------------------
 # The auth bootstrap pre-registers its spawn's session id with kind=bootstrap;
 # later traffic upserts must not erase it, and the status/admin views keep it
