@@ -86,18 +86,20 @@ def _status_snapshot(session=None, all_sessions=False):
         ended = meta_mod._ENDED.get(sid)
         if not ended and r and r[7]:
             ended = {"ts": r[7], "reason": r[8] or "unspecified"}
-        # No title (SDK/headless sessions never make the title side-call) →
-        # fall back to the route agent name, bracketed so a label reads as a
-        # label, not a generated summary. Consumers wanting the raw split
-        # have the `agent` field.
+        # The route agent name IS the session name when present — it's the
+        # operator's own label, stabler than a generated summary (and SDK/
+        # headless sessions never make the title side-call at all). Bracketed
+        # so a label reads as a label. Consumers wanting the raw learned
+        # title have the `summary` field.
         agent_name = r[9] if r else None
         sessions.append({
             "session_id": sid,
             "kind": kind,
             "ended": ended,
             "agent": agent_name,
-            "title": (r[1] if r else None) or
-                     (f"[{agent_name}]" if agent_name else None),
+            "summary": r[1] if r else None,
+            "title": (f"[{agent_name}]" if agent_name else None) or
+                     (r[1] if r else None),
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
             "first_seen": r[4] if r else None,

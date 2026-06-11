@@ -392,20 +392,21 @@ check("real sessions carry kind=None",
 check("admin marks proxy-spawned sessions (robot badge)",
       "&#129302; bootstrap" in lp._render_admin_html(st_all, host="t:7800"))
 
-# --- session meta: agent route name as title fallback ----------------------------
-# SDK-driven sessions (workbench agents) never make the title side-call; the
-# /agent/<name>/ route identity is their only label. /_status falls back to
-# "[<agent>]" when no title was ever learned; a real title, once seen, wins.
+# --- session meta: agent route name names the session ----------------------------
+# The /agent/<name>/ route identity is the operator's own label — it WINS over
+# a learned summary title (and SDK-driven sessions never make the title
+# side-call anyway). The raw learned title stays available as `summary`.
 lp._capture_session_meta("sess-agent-1", {"system": [], "messages": []},
                          "claude-sonnet-4-6", agent="executor-1")
 lp._WRITE_Q.join()
 st_ag = lp._status_snapshot(session="sess-agent-1")["sessions"][0]
-check("untitled agent-routed session: title falls back to [agent]",
+check("agent-routed session is titled [agent]",
       st_ag["agent"] == "executor-1" and st_ag["title"] == "[executor-1]")
 lp._upsert_session_meta("sess-agent-1", title="Run the test matrix")
 st_ag2 = lp._status_snapshot(session="sess-agent-1")["sessions"][0]
-check("a learned title beats the agent fallback; agent field stays",
-      st_ag2["title"] == "Run the test matrix"
+check("agent name beats the learned title; summary keeps the raw title",
+      st_ag2["title"] == "[executor-1]"
+      and st_ag2["summary"] == "Run the test matrix"
       and st_ag2["agent"] == "executor-1")
 lp._capture_session_meta("sess-agent-1", {"system": [], "messages": []},
                          "claude-sonnet-4-6")   # plain turn: agent=None
