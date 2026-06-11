@@ -171,7 +171,10 @@ Anthropic sessions:
       }                                     // ADVISORY: stamped off-thread, may lag one turn
     }
 
-OpenAI/codex sessions (server-side caching, no proxy pricing):
+OpenAI/codex sessions (caching is server-side; cost is the API-EQUIVALENT
+estimate — ChatGPT-plan traffic is never dollar-billed, the proxy prices the
+same tokens at OpenAI API list rates so codex and anthropic carriage are
+comparable in one ledger):
 
     "data": {
       "provider": "openai",
@@ -180,11 +183,18 @@ OpenAI/codex sessions (server-side caching, no proxy pricing):
       "response_id": "resp_…",
       "status": "completed",                // openai response status; their stop signal
       "text": "…full assistant text…",
-      "usage": {
+      "usage": {                            // openai axes (input INCLUDES cached)
         "input_tokens": 9000, "cached_tokens": 8700,
         "output_tokens": 300, "reasoning_tokens": 120
       },
-      "cost": null, "session_totals": null, "context": null, "warmth": null
+      "cost": { "est_usd": 0.0124, "unpriced": false },
+      "session_totals": {                   // same shape as anthropic sessions
+        "requests": 31, "turns": 7, "refusals": 0,
+        "input_tokens": 1200, "output_tokens": 9100,
+        "cache_read_tokens": 240000, "cache_write_tokens": 0,
+        "est_usd": 0.41
+      },
+      "context": null, "warmth": null
     }
 
 Fields are nullable: error responses, non-streaming bodies, and provider gaps

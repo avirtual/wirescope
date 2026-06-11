@@ -423,7 +423,8 @@ def emit_turn_completed_anthropic(agent, session_id, request_id, *, meta, bill,
 
 
 def emit_turn_completed_openai(agent, session_id, request_id, *, meta,
-                               status_code, text):
+                               status_code, text, bill=None,
+                               session_totals=None):
     subs = _match(agent, "turn.completed")
     if not subs:
         return 0
@@ -432,6 +433,12 @@ def emit_turn_completed_openai(agent, session_id, request_id, *, meta,
              "output_tokens": u.get("output_tokens"),
              "cached_tokens": (u.get("input_tokens_details") or {}).get("cached_tokens"),
              "reasoning_tokens": (u.get("output_tokens_details") or {}).get("reasoning_tokens")}
+    totals = None
+    if session_totals:
+        totals = {k: session_totals.get(k) for k in
+                  ("requests", "turns", "refusals", "input_tokens",
+                   "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                   "est_usd")}
     data = {"provider": "openai",
             "model": meta.get("resolved_model"),
             "status_code": status_code,
@@ -439,7 +446,12 @@ def emit_turn_completed_openai(agent, session_id, request_id, *, meta,
             "status": meta.get("status"),
             "text": text or "",
             "usage": usage,
-            "cost": None, "session_totals": None, "context": None,
+            # API-EQUIVALENT estimate (PRICES_OPENAI): chatgpt-plan traffic is
+            # never dollar-billed; this prices the same tokens at API rates.
+            "cost": ({"est_usd": bill.get("est_usd"),
+                      "unpriced": bool(bill.get("unpriced"))}
+                     if bill else None),
+            "session_totals": totals, "context": None,
             "warmth": None}
     return dispatch("turn.completed", agent, session_id, request_id, data,
                     subs=subs)

@@ -195,19 +195,31 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                         "truncated": len(meta["text"]) >= billing_mod._META_TEXT_CAP,
                         "stop_reason": meta.get("status"),
                         "ts": time.time()}
+                # API-equivalent pricing (PRICES_OPENAI; plan traffic is never
+                # dollar-billed) into the same global/session ledger. Turn
+                # heuristic: a completed response WITH text ends a turn;
+                # tool-loop hops come back text-less (reasoning+calls only).
+                bill = billing_mod._billing_openai(
+                    meta.get("resolved_model") or model, u)
+                stop = {"stop_reason": meta.get("status"),
+                        "is_turn": (meta.get("status") == "completed"
+                                    and bool(meta.get("text")))}
+                cum = billing_mod._accumulate(bill, session_key, stop)
                 writer_mod._enqueue_json(out_dir / f"{stem}.response.json",
                     {"seq": n, "agent": agent, "provider": "openai",
                      "model": model, "session_id": session_id,
                      "endpoint": "responses", "status_code": up.status_code,
                      "response_headers": dict(up.headers),
-                     # subscription traffic: tokens are the accounting, no USD
-                     "billing": None, "usage": u, "meta": meta,
+                     "billing": bill, "cumulative": cum,
+                     "usage": u, "meta": meta,
                      "wb_intents": (wb_tee.dispatched if wb_tee else None)})
                 subs_mod.emit_turn_completed_openai(
                     agent, session_id, f"{n}-{ts}", meta=meta,
                     status_code=up.status_code,
                     text=(sub_tee.text if sub_tee is not None
-                          else meta.get("text")))
+                          else meta.get("text")),
+                    bill=bill,
+                    session_totals=billing_mod._SESSION_TOTALS.get(session_key))
                 print(f"[codex] #{n} {agent} {meta.get('resolved_model') or model} "
                       f"-> {up.status_code} in={u.get('input_tokens')} "
                       f"cached={cached} out={u.get('output_tokens')} "

@@ -161,6 +161,28 @@ check("legacy opus-4-1 keeps $15 rates",
 check("unknown model -> None (not a silent default)",
       lp._price_for("claude-zonnet-9") is None)
 
+# openai side (codex routes): API-equivalent estimate, longest prefix again
+check("gpt-5.4-mini wins over the bare gpt-5.4 prefix",
+      lp._price_for("gpt-5.4-mini", table=lp.PRICES_OPENAI)["in"] == 0.75)
+ob = lp._billing_openai("gpt-5.4", {
+    "input_tokens": 23502,
+    "input_tokens_details": {"cached_tokens": 21376},
+    "output_tokens": 114,
+    "output_tokens_details": {"reasoning_tokens": 108}})
+check("openai bill splits cached out of input (anthropic totals semantics)",
+      ob["tokens"]["input_tokens"] == 2126
+      and ob["tokens"]["cache_read_input_tokens"] == 21376
+      and ob["tokens"]["thinking_tokens"] == 108)
+check("openai est_usd: uncached*in + cached*cached_in + out*out",
+      ob["est_usd"] == round(2126*2.5e-6 + 21376*0.25e-6 + 114*15e-6, 6))
+check("unknown gpt model flagged unpriced (loud floor, not silent None)",
+      lp._billing_openai("gpt-9-turbo", {"input_tokens": 1})["unpriced"] is True)
+tot_o = lp._new_totals()
+lp._bump(tot_o, ob, stop={"stop_reason": "completed", "is_turn": True})
+check("openai bill feeds the shared totals (cache_read = cached tokens)",
+      tot_o["cache_read_tokens"] == 21376 and tot_o["est_usd"] == ob["est_usd"]
+      and tot_o["turns"] == 1)
+
 bill = lp._billing("messages", model_resolved="claude-zonnet-9",
                    usage_final={"input_tokens": 10, "output_tokens": 5})
 check("unknown model bill flagged unpriced",

@@ -219,6 +219,24 @@ check("openai turn.completed shape", d["provider"] == "openai"
                          "cached_tokens": 8700, "reasoning_tokens": 120}
       and d["cost"] is None and d["warmth"] is None)
 
+# with a bill + running totals (server passes both since the openai pricing
+# wire-up): cost = API-equivalent estimate, session_totals = anthropic shape
+SENT.clear()
+subs.emit_turn_completed_openai(
+    "wb-alice", "sess-2", "009-2", status_code=200, text="codex full",
+    meta={"resolved_model": "gpt-5.4", "response_id": "resp_2",
+          "status": "completed", "usage": {}},
+    bill={"est_usd": 0.012369, "unpriced": False},
+    session_totals={"requests": 3, "turns": 2, "refusals": 0,
+                    "input_tokens": 9, "output_tokens": 9,
+                    "cache_read_tokens": 9, "cache_write_tokens": 0,
+                    "est_usd": 0.05, "unpriced_models": ["x"]})
+d2 = SENT[0][4]
+check("openai receipt carries cost + projected session_totals when billed",
+      d2["cost"] == {"est_usd": 0.012369, "unpriced": False}
+      and d2["session_totals"]["turns"] == 2
+      and "unpriced_models" not in d2["session_totals"])
+
 # --- session.ended ----------------------------------------------------------------
 SENT.clear()
 subs.note_session("wb-alice", "sess-9")

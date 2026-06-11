@@ -147,6 +147,19 @@ PRICES = {
     "claude-haiku-4":  {"in": 1.0,  "out": 5.0,  "cache_write_5m": 1.25,  "cache_write_1h": 2.0,  "cache_read": 0.10},
 }
 
+# OpenAI side (codex routes), same longest-prefix matching on their axes:
+# no client cache writes (caching is server-side), cached input bills at 10%
+# of input. developers.openai.com/api/docs/pricing, fetched 2026-06-12.
+# NOTE: codex traffic rides a ChatGPT plan and is never dollar-billed —
+# est_usd is the API-EQUIVALENT price of the same tokens, so codex carriage
+# is comparable with the anthropic numbers in the same ledger.
+PRICES_OPENAI = {
+    "gpt-5.5":       {"in": 5.0,  "cached_in": 0.50,  "out": 30.0},
+    "gpt-5.4":       {"in": 2.5,  "cached_in": 0.25,  "out": 15.0},
+    "gpt-5.4-mini":  {"in": 0.75, "cached_in": 0.075, "out": 4.5},
+    "gpt-5.3-codex": {"in": 1.75, "cached_in": 0.175, "out": 14.0},
+}
+
 def _new_totals():
     return {"requests": 0, "billed_requests": 0, "count_tokens_requests": 0,
             "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
@@ -188,16 +201,25 @@ def _since_start():
 _UNPRICED_WARNED = set()
 
 
-def _price_for(model):
+def _price_for(model, table=None):
     """Longest-prefix match (the old first-dict-hit walk silently shadowed
     "claude-opus-4-8" with the legacy "claude-opus-4" entry). None = unpriced."""
     if not model:
         return None
     best = None
-    for pfx, p in PRICES.items():
+    for pfx, p in (PRICES if table is None else table).items():
         if model.startswith(pfx) and (best is None or len(pfx) > len(best[0])):
             best = (pfx, p)
     return best[1] if best else None
+
+
+def _warn_unpriced(model, table_name):
+    if model not in _UNPRICED_WARNED:
+        _UNPRICED_WARNED.add(model)
+        print(f"[pricing] WARNING: no {table_name} entry matches {model!r} — "
+              "est_usd=None for its traffic; cumulative est_usd is now a FLOOR. "
+              "Tracked in totals.unpriced_requests/unpriced_models; add rates "
+              f"to {table_name}.", flush=True)
 
 
 def _usd(tokens, rate_per_m):
@@ -247,13 +269,42 @@ def _billing(kind, model_resolved=None, usage_final=None, usage_start=None, coun
         # PRICING BLINDNESS guard: an unmatched model must be LOUD, not a silent
         # None that lets _totals.json keep reporting a confident under-count.
         unpriced = True
-        if model_resolved not in _UNPRICED_WARNED:
-            _UNPRICED_WARNED.add(model_resolved)
-            print(f"[pricing] WARNING: no PRICES entry matches {model_resolved!r} — "
-                  "est_usd=None for its traffic; cumulative est_usd is now a FLOOR. "
-                  "Tracked in totals.unpriced_requests/unpriced_models; add rates "
-                  "to PRICES.", flush=True)
+        _warn_unpriced(model_resolved, "PRICES")
     return {"endpoint": "messages", "billable": True, "model": model_resolved,
+            "tokens": tokens, "est_usd": est, "unpriced": unpriced,
+            "price_basis": basis}
+
+
+def _billing_openai(model_resolved, usage):
+    """Bill an openai /responses receipt in the same shape _bump consumes.
+    OpenAI's input_tokens INCLUDES the cached portion — split it out so the
+    shared totals keep anthropic semantics (input = uncached at full rate,
+    cache_read = cached at the discounted rate). reasoning_tokens are part of
+    output_tokens on their wire, surfaced as thinking_tokens."""
+    u = usage or {}
+    total_in = u.get("input_tokens") or 0
+    cached = (u.get("input_tokens_details") or {}).get("cached_tokens") or 0
+    tokens = {
+        "input_tokens": max(total_in - cached, 0),
+        "output_tokens": u.get("output_tokens"),
+        "cache_read_input_tokens": cached,
+        "cache_write_5m_tokens": None, "cache_write_1h_tokens": None,
+        "cache_write_flat_tokens": None,
+        "thinking_tokens": (u.get("output_tokens_details") or {}).get("reasoning_tokens"),
+        "service_tier": None,
+    }
+    p = _price_for(model_resolved, table=PRICES_OPENAI)
+    est, unpriced = None, False
+    basis = ("API-equivalent USD/1M (chatgpt-plan traffic is never "
+             "dollar-billed); edit PRICES_OPENAI")
+    if p:
+        est = round(_usd(tokens["input_tokens"], p["in"])
+                    + _usd(cached, p["cached_in"])
+                    + _usd(tokens["output_tokens"], p["out"]), 6)
+    elif model_resolved:
+        unpriced = True
+        _warn_unpriced(model_resolved, "PRICES_OPENAI")
+    return {"endpoint": "responses", "billable": True, "model": model_resolved,
             "tokens": tokens, "est_usd": est, "unpriced": unpriced,
             "price_basis": basis}
 
