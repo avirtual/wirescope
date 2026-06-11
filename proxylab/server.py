@@ -29,6 +29,7 @@ from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
 from proxylab import restore as restore_mod
 from proxylab import status as status_mod
+from proxylab import subs as subs_mod
 from proxylab import transforms as transforms_mod
 from proxylab import views as views_mod
 from proxylab import warmth as warmth_mod
@@ -149,6 +150,10 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
     chunks = []
     wb_tee = (wb_mod._WbIntentTee(agent, f"{n}-{ts}", wire="openai")
               if wb_mod._parse_intents is not None and is_model_call else None)
+    # Generic subscriber tee (SUBSCRIBERS.md); every request here is /agent/-
+    # routed by construction, so the agent identity gate is the route itself.
+    sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}", wire="openai")
+               if is_model_call else None)
 
     async def body_iter():
         try:
@@ -158,12 +163,16 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                 yield chunk
                 if wb_tee is not None:   # after yield: client bytes come first
                     wb_tee.feed(chunk)
+                if sub_tee is not None:
+                    sub_tee.feed(chunk)
         finally:
             if wb_tee is not None:
                 wb_tee.close()
                 if wb_tee.dispatched:
                     print(f"[wb] #{n} {agent} dispatched {wb_tee.dispatched} "
                           f"intent(s) to {wb_mod.WB_URL}/api/intent", flush=True)
+            if sub_tee is not None:
+                sub_tee.close()
             await up.aclose()
             if is_model_call and chunks:
                 blob = b"".join(chunks)
@@ -194,6 +203,11 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                      # subscription traffic: tokens are the accounting, no USD
                      "billing": None, "usage": u, "meta": meta,
                      "wb_intents": (wb_tee.dispatched if wb_tee else None)})
+                subs_mod.emit_turn_completed_openai(
+                    agent, session_id, f"{n}-{ts}", meta=meta,
+                    status_code=up.status_code,
+                    text=(sub_tee.text if sub_tee is not None
+                          else meta.get("text")))
                 print(f"[codex] #{n} {agent} {meta.get('resolved_model') or model} "
                       f"-> {up.status_code} in={u.get('input_tokens')} "
                       f"cached={cached} out={u.get('output_tokens')} "
@@ -277,10 +291,17 @@ async def handler(request: Request) -> Response:
             return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
                             status_code=400, media_type="application/json")
         res = pinger_mod._end_session(sess, reason=request.query_params.get("reason", "unspecified"))
+        subs_mod.emit_session_ended(sess, res["reason"])
         print(f"[end] session={sess[:12]}… reason={res['reason']} "
               f"ended={res['ended']} hold_disarmed={res['hold_disarmed']} "
               f"retained={res['retained']} (sweeper reaps later)", flush=True)
         return Response(json.dumps(res), media_type="application/json")
+
+    # ---- subscriber registry: app-agnostic push feed (see SUBSCRIBERS.md) -----
+    # GET/POST/DELETE /_subscribe — consumers register an endpoint + agent globs
+    # and receive text.delta / turn.completed / session.ended for their sessions.
+    if request.url.path.rstrip("/") == "/_subscribe":
+        return await subs_mod.handle_subscribe(request)
 
     n = next(core_mod._counter)
     raw = await request.body()
@@ -528,6 +549,10 @@ async def handler(request: Request) -> Response:
     wb_tee = None
     if wb_mod._parse_intents is not None and m is not None and is_messages:
         wb_tee = wb_mod._WbIntentTee(agent, f"{n}-{ts}")
+    # Generic subscriber tee (SUBSCRIBERS.md): same scope guard; None when no
+    # registered subscriber matches this agent, so plain traffic pays nothing.
+    sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}")
+               if m is not None and is_messages else None)
 
     async def body_iter():
         out_blob = None
@@ -539,6 +564,8 @@ async def handler(request: Request) -> Response:
                     yield chunk
                 if wb_tee is not None:  # after yield: client bytes come first
                     wb_tee.feed(chunk)
+                if sub_tee is not None:
+                    sub_tee.feed(chunk)
             if buffer_resp and chunks:
                 full = b"".join(chunks)
                 # relay stashes prose + blanks it as a side effect; compute ONCE
@@ -550,6 +577,8 @@ async def handler(request: Request) -> Response:
                 if wb_tee.dispatched:
                     print(f"[wb] #{n} {agent} dispatched {wb_tee.dispatched} "
                           f"intent(s) to {wb_mod.WB_URL}/api/intent", flush=True)
+            if sub_tee is not None:
+                sub_tee.close()     # flush the tail text.delta, if any
             await up.aclose()
             if capture and chunks:
                 blob = b"".join(chunks)
@@ -621,6 +650,20 @@ async def handler(request: Request) -> Response:
                                              "replace": transforms_mod.RESP_REPLACE}
                                             if mutate else None),
                      "wb_intents": (wb_tee.dispatched if wb_tee else None)})
+                if is_messages and m is not None:
+                    # turn.completed receipt for subscribers: the tee's text is
+                    # the FULL turn (meta["text"] is capped); _SESSION_TOTALS
+                    # key exists — _accumulate just ran for this request.
+                    subs_mod.emit_turn_completed_anthropic(
+                        agent, session_id, f"{n}-{ts}",
+                        meta=meta, bill=bill, stop=stop,
+                        status_code=up.status_code,
+                        text=(sub_tee.text if sub_tee is not None
+                              else meta.get("text")),
+                        role=role, title_call=title_call,
+                        session_totals=billing_mod._SESSION_TOTALS.get(session_key),
+                        context=(meta_mod._CONTEXT_STATS.get(session_id)
+                                 if session_id else None))
                 if is_messages:
                     t = bill.get("tokens") or {}
                     if stop.get("stop_reason") == "refusal":

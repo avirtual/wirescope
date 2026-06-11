@@ -12,6 +12,7 @@ from proxylab import wb  # noqa: F401,E402
 from proxylab import canary  # noqa: F401,E402
 from proxylab import writer  # noqa: F401,E402
 from proxylab import warmth  # noqa: F401,E402
+from proxylab import subs  # noqa: F401,E402
 from proxylab import meta  # noqa: F401,E402
 from proxylab import pinger  # noqa: F401,E402
 from proxylab import hold  # noqa: F401,E402

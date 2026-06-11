@@ -27,6 +27,7 @@ from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
 from proxylab import restore as restore_mod
+from proxylab import subs as subs_mod
 from proxylab import warmth as warmth_mod
 from proxylab import wb as wb_mod
 
@@ -122,6 +123,7 @@ def _status_snapshot(session=None, all_sessions=False):
                                "block_cold_ping": warmth_mod.WARMTH_BLOCK_COLD_PING,
                                "wb_intent_dispatch": bool(wb_mod._parse_intents)},
                      "wb_intents": dict(wb_mod._WB_STATS),
+                     "subscribers": subs_mod._stats(),
                      "codex": dict(codex_mod._CODEX_STATS),
                      "hold_config": {"margin_s": hold_mod.WARMTH_HOLD_MARGIN,
                                      "interval_s": hold_mod.WARMTH_HOLD_INTERVAL,

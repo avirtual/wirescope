@@ -129,7 +129,9 @@ core 3k (constants/routes/httpx client) · codex 9k (openai provider + zstd
 capture) · wb 8k (workbench intent tee) · transforms 51k (inject/SC/relocate/
 strip/sort/compact-strip + gates) · canary 8k (drift detector) · writer 6k
 (disk-writer thread, _classify_role, NO_SESSION) · warmth 20k (SQLite ledger,
-prefix hashing, _record_warmth) · meta 8k (session metadata, turn stats,
+prefix hashing, _record_warmth) · subs 21k (subscriber push feed: /_subscribe
+registry + SSE text tee + turn receipts; contract in SUBSCRIBERS.md) · meta 8k
+(session metadata, turn stats,
 _ENDED/_CONTEXT_STATS/_LAST_RESPONSE) · pinger 21k (last-request cache,
 _ACCOUNT_AUTH, /_ping replay, session teardown + sweeper) · hold 21k
 (/warm-cache driver, echo transform, auth bootstrap) · billing 14k (SSE usage
@@ -143,7 +145,8 @@ Starlette app).
 |---|---|---|
 | `RELOCATE_ENV_TO_TAIL` / `RELOCATE_CLAUDEMD_PATHSTAMP` | on | Peel volatile `# Environment`/`# currentDate` to a tail reminder; own cache marker for static CLAUDE.md → env-independent shared segment. |
 | `SORT_TOOLS` | on | Alphabetize tools[]; predictability only. |
-| `WB_INTENT_DISPATCH` (+`WB_URL` :9000, `WB_PARSER_TOKEN`, `WB_INTENT_PARSER`) | on | On `/agent/<name>/anthropic/…` routes only: SSE tee POSTs `[wb:action]` intents to the workbench, fire-and-forget; parser loaded from the canonical workbench file. Plain CC traffic never dispatches. |
+| `WB_INTENT_DISPATCH` (+`WB_URL` :9000, `WB_PARSER_TOKEN`, `WB_INTENT_PARSER`) | on | On `/agent/<name>/anthropic/…` routes only: SSE tee POSTs `[wb:action]` intents to the workbench, fire-and-forget; parser loaded from the canonical workbench file. Plain CC traffic never dispatches. **LEGACY: superseded by `SUBSCRIBERS` — retire once workbench registers via /_subscribe and parses its own intents.** |
+| `SUBSCRIBERS` (+`_ALLOW_REMOTE` 0, `_TOKEN`, `_DELTA_MS` 300, `_MAX_FAILURES` 10) | on | **App-agnostic push feed; protocol contract = `SUBSCRIBERS.md`** (hand that file to consumers). `POST /_subscribe` {url, token, agent globs, events} → `text.delta` (normalized streaming text, offset reassembly, both wire dialects), `turn.completed` (full text + usage/cost/session-totals/context/warmth receipts — the wire-only facts: refusals, real USD, resolved model), `session.ended`. Agent-routed traffic only (`ext` never pushed); upsert by url; at-most-once fire-and-forget, suspension after N consecutive failures (re-POST reactivates); registry persists in warmth.sqlite owner-scoped; reconciliation is pull (`/_status?session=`). Loopback-only callbacks by default (exfil guard). Verified live 2026-06-12 (all 3 events, both deltas+receipts). |
 | *(provider)* openai/codex routing (`UPSTREAM_OPENAI`, `CODEX_AUTH_FILE`, `CODEX_MODELS_STUB`) | on | `/agent/<name>/openai/…` → ChatGPT codex backend: strip `/v1`, OAuth headers re-read per request from `~/.codex/auth.json` (redacted in captures), models stub, SSE-by-path, zstd decoded observer-side. Server-side caching (`prompt_cache_key` = routing hint only) → NO warmth/transform stack applies. Codex 0.139+ tries a WebSocket first, 403s, falls back (~3–8s) — known codex bug; custom model_provider with `supports_websockets=false` avoids it. |
 | `CANARY` (`CANARY_DIR`) | on | Read-only structural drift detector per (model, beta); appends `_canary/changes.jsonl`. Gaps #1–#3 open: system-block heading lists, control-plane keys, message roles not fingerprinted. |
 | `WARMTH_LEDGER` (`WARMTH_DB`) | on | The SQLite warmth store (see verdicts above). |
@@ -152,7 +155,7 @@ Starlette app).
 | `WARMTH_HOLD` (`_MAX_HOURS` 12, `_MARGIN` 300s, `_INTERVAL` 60s, `_MAX_PINGS` 24) | on | `/warm-cache <n>` arms n hours of IDLE INSURANCE (until = last organic turn + n; every real turn re-anchors + resets counters). Echo-forward arming: proxy injects a `[logproxy]` echo block, the MODEL speaks the ack; command file is default-dead without the proxy. Disarm on expiry/`off`/`/_end`/ping cap/2 failures. |
 | `WARMTH_AUTH_BOOTSTRAP` (`_MODEL`, `_MAX` 2, `_COOLDOWN` 600s) | on | A hold stuck on missing/stale auth (post-restart gap or 401'd ping) makes the proxy spawn ONE minimal haiku turn through itself to re-donate account headers. Bounded; kill switch `=0`. PROMPT BEFORE `--tools` (variadic flag eats positionals). |
 | *(persistence)* restart-amnesia fix | on | Holds / last-request bodies (non-secret headers) / totals / session identity persist in warmth.sqlite scoped by `owner = LOG_DIR`; reload at startup. CREDENTIALS never persist — restored sessions are `awaiting_auth` until the account's next live request re-donates (in-memory `_ACCOUNT_AUTH`, account-level). |
-| *(endpoints)* `GET /_status[?session=][&all=1]`, `GET /_admin`, `GET /_session?session=`, `GET/POST /_ping`, `/_warm`, `/_end` | — | Status JSON (titles/cwd/model/warmth/hold/cost/turns/context); admin = dark HTML render, 10s refresh; /_session = HTML view of the replayable last request (turn-grouped timeline + last answer; codex sessions render view-only, never pingable). `/_end` (SessionEnd hook) = MARKER not delete: disarms hold, stamps ended_at, keeps debug state for the sweeper to reap (~ttl+grace). Bootstrap-spawned sessions tagged `kind:bootstrap`, hidden unless `?all=1`. All unauthenticated, localhost lab-grade (open item g). |
+| *(endpoints)* `GET /_status[?session=][&all=1]`, `GET /_admin`, `GET /_session?session=`, `GET/POST /_ping`, `/_warm`, `/_end`, `GET/POST/DELETE /_subscribe` | — | Status JSON (titles/cwd/model/warmth/hold/cost/turns/context); admin = dark HTML render, 10s refresh; /_session = HTML view of the replayable last request (turn-grouped timeline + last answer; codex sessions render view-only, never pingable). `/_end` (SessionEnd hook) = MARKER not delete: disarms hold, stamps ended_at, keeps debug state for the sweeper to reap (~ttl+grace). Bootstrap-spawned sessions tagged `kind:bootstrap`, hidden unless `?all=1`. All unauthenticated, localhost lab-grade (open item g). |
 | `WARMTH_SWEEP_INTERVAL` / `WARMTH_LAST_REQUEST_GRACE` / `WARMTH_PURGE_SLACK` | 300s/600s/7d | Hygiene-only sweeper; correctness never depends on it. |
 | `STRIP_COMPACT_CACHE` | off (script: on) | Warmth-gated: strip message-level cache markers on a cold `/compact`. |
 | `SPLIT_SYSTEM_REST` | off | Ride static system-prose head as cache READ; wins only for trimmed-tool layouts. |
@@ -164,8 +167,9 @@ Starlette app).
 `analyze_tools.py` — offline tool-utilization ledger:
 `python3 analyze_tools.py <dir> --by role|session`. Prices deadweight.
 
-**Test suite: `python3 test_warmth_store.py`** (161 offline checks) — run after
-any warmth/pricing/hold/persistence edit.
+**Test suites: `python3 test_warmth_store.py`** (161 offline checks) — run after
+any warmth/pricing/hold/persistence edit — **and `python3 test_subscribers.py`**
+(52 offline checks) after any subs/tee/server-wiring edit.
 
 ## Operational state (VERIFY before continuing)
 
@@ -217,8 +221,12 @@ any warmth/pricing/hold/persistence edit.
   keys (`thinking.type`, `output_config`, `context_management`), message
   roles. Plus: refusal counter in totals (canary can't see responses).
 - A/B `--exclude-dynamic-system-prompt-sections` vs RELOCATE_ENV_TO_TAIL.
-- WB flip remainder: `WB_PARSER_TOKEN` into start_proxy.sh env; optional
-  usage-emit to `/api/proxy/usage`; then flip `WB_PROXY_PORT→7800`.
+- WB flip: land it on the SUBSCRIBER contract (workbench registers via
+  /_subscribe + parses its own intents from text.delta; SUBSCRIBERS.md is the
+  spec to hand over), then flip `WB_PROXY_PORT→7800` and retire
+  `WB_INTENT_DISPATCH` + the parser import. The old remainder
+  (`WB_PARSER_TOKEN` into release.env) only matters if the legacy path ships
+  first.
 - Statusline TITLE display (statusline already polls /_status for
   warmth/hold/turn; script `~/tmp/proxy-sl-test/.claude/status-line.sh`).
 - Measured A/B: proxied all-levers vs vanilla 1P.

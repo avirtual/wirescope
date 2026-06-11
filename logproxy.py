@@ -19,14 +19,14 @@ owning module instead, e.g. `lp.warmth.WARMTH_LEDGER = False`.
 """
 from proxylab.server import app  # noqa: F401  (eager: uvicorn logproxy:app)
 from proxylab import (core, codex, transforms, wb, canary, writer, warmth,  # noqa: F401
-                      meta, pinger, hold, billing, restore, status, views,
-                      server)
+                      subs, meta, pinger, hold, billing, restore, status,
+                      views, server)
 
 # Fixed search order for __getattr__ (original file order, server last-but-first
 # tried since it owns the handler). Names duplicated across modules are only
 # by-name imports of the same object, so any hit is the right object.
-_SUBMODULES = (core, codex, transforms, wb, canary, writer, warmth, meta,
-               pinger, hold, billing, restore, status, views, server)
+_SUBMODULES = (core, codex, transforms, wb, canary, writer, warmth, subs,
+               meta, pinger, hold, billing, restore, status, views, server)
 
 
 def __getattr__(name):
