@@ -109,12 +109,12 @@ check("ABSENT strips identically (purge never changes the decision)",
 
 # ledger off -> 'off' must DECLINE (can't judge != evidence of bust)
 _saved = lp.WARMTH_LEDGER
-lp.WARMTH_LEDGER = False
+lp.warmth.WARMTH_LEDGER = False
 res = lp._strip_compact_cache(compact_obj())
 check("ledger OFF declines the strip",
       res is not None and res["condition_met"] is False
       and res["warmth_state"] == "off")
-lp.WARMTH_LEDGER = _saved
+lp.warmth.WARMTH_LEDGER = _saved
 
 # --- session head index + /_end + durability ----------------------------------
 sobj = compact_obj(sid="sess-test-1")
@@ -605,10 +605,10 @@ check("bootstrap declines when the account's auth is already present",
       lp._bootstrap_decision("acct-have", now=NOW, state=dict(BST))
       == (False, "auth already present (resolve instead)"))
 _sb = lp.WARMTH_AUTH_BOOTSTRAP
-lp.WARMTH_AUTH_BOOTSTRAP = False
+lp.hold.WARMTH_AUTH_BOOTSTRAP = False
 check("bootstrap respects the kill switch",
       lp._bootstrap_decision("acct-z", now=NOW, state=dict(BST))[0] is False)
-lp.WARMTH_AUTH_BOOTSTRAP = _sb
+lp.hold.WARMTH_AUTH_BOOTSTRAP = _sb
 
 # --- stale-auth (ping 401) self-heal -----------------------------------------------
 # A 401 replay invalidates the dead bearer everywhere: account registry dropped,
