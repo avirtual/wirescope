@@ -40,7 +40,7 @@ _META_CWD_MAX_TRIES = 5    # env block shows up in the first turns or never
 
 
 def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
-                         kind=None):
+                         kind=None, agent=None):
     """Durable identity row; COALESCE keeps existing values when a field isn't
     supplied, so the per-request last_seen bump never erases title/cwd/kind."""
     if not session_id:
@@ -51,14 +51,15 @@ def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
         with warmth_mod._DB_LOCK:
             con.execute(
                 "INSERT INTO session_meta(session_id, title, cwd, model, "
-                "first_seen, last_seen, kind) VALUES(?,?,?,?,?,?,?) "
+                "first_seen, last_seen, kind, agent) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
                 "title=COALESCE(excluded.title, session_meta.title), "
                 "cwd=COALESCE(excluded.cwd, session_meta.cwd), "
                 "model=COALESCE(excluded.model, session_meta.model), "
                 "kind=COALESCE(excluded.kind, session_meta.kind), "
+                "agent=COALESCE(excluded.agent, session_meta.agent), "
                 "last_seen=excluded.last_seen",
-                (session_id, title, cwd, model, now, now, kind))
+                (session_id, title, cwd, model, now, now, kind, agent))
             con.commit()
     except Exception as e:
         print(f"[meta] session_meta upsert failed for {session_id[:12]}…: {e}",
@@ -170,10 +171,11 @@ def _is_title_call(obj):
     return any(t.startswith(_TITLE_SYS_PREFIX) for t in texts)
 
 
-def _capture_session_meta(session_id, obj, model):
+def _capture_session_meta(session_id, obj, model, agent=None):
     """Per-request meta hook (handler, post-parse): bump last_seen/model every
     turn; hunt for the cwd only until found (capped attempts — sessions with a
-    custom system prompt may simply not carry an env block)."""
+    custom system prompt may simply not carry an env block). `agent` = the
+    /agent/<name>/ route identity (None for plain traffic)."""
     if not session_id:
         return
     pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
@@ -184,4 +186,4 @@ def _capture_session_meta(session_id, obj, model):
         if cwd:
             _META_CWD_DONE.add(session_id)
             _META_CWD_TRIES.pop(session_id, None)
-    writer_mod._enqueue_meta(session_id, cwd=cwd, model=model)
+    writer_mod._enqueue_meta(session_id, cwd=cwd, model=model, agent=agent)

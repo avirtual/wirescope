@@ -48,7 +48,7 @@ def _status_snapshot(session=None, all_sessions=False):
         con = warmth_mod._warmth_db()
         with warmth_mod._DB_LOCK:
             q = ("SELECT session_id, title, cwd, model, first_seen, last_seen, "
-                 "kind, ended_at, end_reason FROM session_meta")
+                 "kind, ended_at, end_reason, agent FROM session_meta")
             if session:
                 cur = con.execute(q + " WHERE session_id=?", (session,))
             elif all_sessions:
@@ -86,11 +86,18 @@ def _status_snapshot(session=None, all_sessions=False):
         ended = meta_mod._ENDED.get(sid)
         if not ended and r and r[7]:
             ended = {"ts": r[7], "reason": r[8] or "unspecified"}
+        # No title (SDK/headless sessions never make the title side-call) →
+        # fall back to the route agent name, bracketed so a label reads as a
+        # label, not a generated summary. Consumers wanting the raw split
+        # have the `agent` field.
+        agent_name = r[9] if r else None
         sessions.append({
             "session_id": sid,
             "kind": kind,
             "ended": ended,
-            "title": r[1] if r else None,
+            "agent": agent_name,
+            "title": (r[1] if r else None) or
+                     (f"[{agent_name}]" if agent_name else None),
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
             "first_seen": r[4] if r else None,

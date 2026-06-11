@@ -93,7 +93,7 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
             pinger_mod._clear_session_ended(session_id)   # live turn = resume
             # /_session context view (NOT replayable — pinger declines openai)
             pinger_mod._cache_last_request_openai(session_id, obj, upstream_path)
-            fields = {"model": model}
+            fields = {"model": model, "agent": agent}
             try:
                 texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
                          for c in (it.get("content") or [])
@@ -443,7 +443,8 @@ async def handler(request: Request) -> Response:
         # until found; flag the title side-call so the response capture can
         # harvest the session title the CLI generates anyway.
         if upstream_path.split("?")[0].endswith("/v1/messages"):
-            meta_mod._capture_session_meta(session_id, obj, model)
+            meta_mod._capture_session_meta(session_id, obj, model,
+                                           agent=(agent if m else None))
             title_call = meta_mod._is_title_call(obj)
             # heaviness snapshot from the model-visible history (main line
             # only: a subagent's small history must not clobber the parent's)

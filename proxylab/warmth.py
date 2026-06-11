@@ -121,8 +121,14 @@ def _warmth_db():
             # stats, /_session view, last answer) worth debugging. Ended is
             # a durable FACT about the session (resumable — a live turn
             # clears it); cleanup belongs to the staleness sweeper.
+            # `agent` (2026-06-12): the /agent/<name>/ route identity, for any
+            # wire. SDK-driven sessions never make the title side-call, so the
+            # route name is the only human-readable label they'll ever have;
+            # /_status falls back to it when title is NULL. Plain (un-routed)
+            # traffic stays NULL.
             for ddl in ("ALTER TABLE session_meta ADD COLUMN ended_at REAL",
-                        "ALTER TABLE session_meta ADD COLUMN end_reason TEXT"):
+                        "ALTER TABLE session_meta ADD COLUMN end_reason TEXT",
+                        "ALTER TABLE session_meta ADD COLUMN agent TEXT"):
                 try:
                     con.execute(ddl)
                 except sqlite3.OperationalError:

@@ -392,6 +392,35 @@ check("real sessions carry kind=None",
 check("admin marks proxy-spawned sessions (robot badge)",
       "&#129302; bootstrap" in lp._render_admin_html(st_all, host="t:7800"))
 
+# --- session meta: agent route name as title fallback ----------------------------
+# SDK-driven sessions (workbench agents) never make the title side-call; the
+# /agent/<name>/ route identity is their only label. /_status falls back to
+# "[<agent>]" when no title was ever learned; a real title, once seen, wins.
+lp._capture_session_meta("sess-agent-1", {"system": [], "messages": []},
+                         "claude-sonnet-4-6", agent="executor-1")
+lp._WRITE_Q.join()
+st_ag = lp._status_snapshot(session="sess-agent-1")["sessions"][0]
+check("untitled agent-routed session: title falls back to [agent]",
+      st_ag["agent"] == "executor-1" and st_ag["title"] == "[executor-1]")
+lp._upsert_session_meta("sess-agent-1", title="Run the test matrix")
+st_ag2 = lp._status_snapshot(session="sess-agent-1")["sessions"][0]
+check("a learned title beats the agent fallback; agent field stays",
+      st_ag2["title"] == "Run the test matrix"
+      and st_ag2["agent"] == "executor-1")
+lp._capture_session_meta("sess-agent-1", {"system": [], "messages": []},
+                         "claude-sonnet-4-6")   # plain turn: agent=None
+lp._WRITE_Q.join()
+check("agent survives later agent-less upserts (COALESCE)",
+      lp._status_snapshot(session="sess-agent-1")["sessions"][0]["agent"]
+      == "executor-1")
+check("plain (ext) sessions carry agent=None and stay untitled",
+      st_ended["agent"] is None)
+check("admin renders the agent fallback title",
+      "[executor-1]" in lp._render_admin_html(
+          lp._status_snapshot(all_sessions=True), host="t:7800")
+      or "Run the test matrix" in lp._render_admin_html(
+          lp._status_snapshot(session="sess-agent-1")))
+
 # --- session meta: cwd extraction + title-call detection -------------------------
 check("cwd from system text", lp._extract_cwd(
     {"system": [{"type": "text",
