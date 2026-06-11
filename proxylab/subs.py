@@ -222,9 +222,11 @@ def _match(agent, event):
     if not SUBSCRIBERS or not agent or agent == "ext":
         return []
     with _SUBS_LOCK:
+        # fnmatchCASE: plain fnmatch case-normalizes per-platform (lowercases
+        # on Windows) — namespace routing must not depend on the host OS.
         return [s for s in _SUBS.values()
                 if not s["suspended"] and event in s["events"]
-                and any(fnmatch.fnmatch(agent, pat) for pat in s["agents"])]
+                and any(fnmatch.fnmatchcase(agent, pat) for pat in s["agents"])]
 
 
 # --- delivery --------------------------------------------------------------------

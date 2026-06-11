@@ -72,6 +72,10 @@ check("registry holds one entry", len(subs.list_subscribers()) == 1)
 check("glob matches agent", len(subs._match("wb-alice", "text.delta")) == 1)
 check("second glob matches too", len(subs._match("clodex-bob", "turn.completed")) == 1)
 check("non-matching agent ignored", subs._match("other-x", "text.delta") == [])
+check("matching is case-sensitive on every platform",
+      subs._match("WB-Alice", "text.delta") == [])
+check("prefix alone does not match without the glob",
+      subs._match("wb", "text.delta") == [])
 check("ext (plain CC traffic) never matches even vs *",
       (reg(url="http://127.0.0.1:9001/all", agents=("*",))[0] == 200
        and subs._match("ext", "text.delta") == []))
