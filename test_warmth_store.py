@@ -132,12 +132,21 @@ con2.close()
 check("warmth survives a restart (fresh connection sees rows)",
       n_rows >= 1 and n_heads == 1)
 
+# /_end = a MARKER since 2026-06-11, not a delete: one-shot `claude -p` runs
+# fire SessionEnd the instant their answer lands; the debug state must survive.
 e = lp._end_session("sess-test-1", reason="clear")
-check("/_end drops the session head", e["dropped"]["session_head"] is True)
-check("query after /_end -> not found",
-      lp.warmth_query(session="sess-test-1")["found"] is False)
+check("/_end marks the session ended (resumable fact, not a delete)",
+      e["ended"] is True and lp._ENDED["sess-test-1"]["reason"] == "clear")
+check("warmth query still resolves after /_end (head retained)",
+      lp.warmth_query(session="sess-test-1")["found"] is True)
 check("the anonymous warmth row outlives /_end (fork-shared)",
       lp.warmth_state(lp._prefix_hashes(sobj)[2]) == "warm")
+check("/_end on a session the proxy never saw invents nothing",
+      lp._end_session("sess-ghost-1")["ended"] is False
+      and "sess-ghost-1" not in lp._ENDED)
+# a live turn on an ended session = resume -> the marker clears
+lp._clear_session_ended("sess-test-1")
+check("live turn clears the ended marker", "sess-test-1" not in lp._ENDED)
 
 # --- pricing --------------------------------------------------------------
 check("fable-5 priced (2x opus)",
@@ -244,7 +253,8 @@ ack3, rec3 = lp._arm_hold(None, "arm", 2.0)
 check("no session metadata -> not armed", rec3["armed"] is False)
 lp._arm_hold("sess-hold-2", "arm", 1.0)
 e2 = lp._end_session("sess-hold-2", reason="clear")
-check("/_end also drops the hold", e2["dropped"]["hold"] is True)
+check("/_end still disarms the hold immediately (no spend on ended sessions)",
+      e2["hold_disarmed"] is True and "sess-hold-2" not in lp._hold_snapshot())
 
 # --- hold-warm: echo transform (arming turn forwards, model speaks the ack) ------
 def echo_obj(text, sid="sess-echo-1"):
@@ -332,9 +342,27 @@ st_turns = lp._status_snapshot(session="sess-meta-1")["sessions"][0]
 check("/_status exposes turns_completed + context heaviness",
       st_turns["turns_completed"] == 1
       and st_turns["context"]["turns_in_context"] == 5)
-check("/_end drops the context snapshot",
-      (lp._end_session("sess-meta-1"),
-       "sess-meta-1" not in lp._CONTEXT_STATS)[1])
+end_meta = lp._end_session("sess-meta-1", reason="other")
+check("/_end RETAINS the context snapshot (one-shot debug state)",
+      end_meta["retained"]["context"] is True
+      and "sess-meta-1" in lp._CONTEXT_STATS)
+st_ended = lp._status_snapshot(session="sess-meta-1")["sessions"][0]
+check("/_status exposes ended + keeps turn info after /_end",
+      st_ended["ended"] is not None
+      and st_ended["ended"]["reason"] == "other"
+      and st_ended["turns_completed"] == 1
+      and st_ended["context"]["turns_in_context"] == 5)
+check("ended marker is durable (survives into a fresh load)",
+      (lp._ENDED.pop("sess-meta-1", None), lp._restore_ended(),
+       lp._ENDED.get("sess-meta-1", {}).get("reason") == "other")[2])
+check("admin page renders the ended badge",
+      "ended" in lp._render_admin_html(
+          lp._status_snapshot(session="sess-meta-1")))
+# resume: the per-turn meta hook clears the mark (memory + durable column)
+lp._capture_session_meta("sess-meta-1", {"system": [], "messages": []}, "m")
+check("a live turn through the meta hook clears ended everywhere",
+      "sess-meta-1" not in lp._ENDED
+      and (lp._restore_ended(), "sess-meta-1" not in lp._ENDED)[1])
 
 # --- session meta: kind tag (proxy-spawned bootstrap sessions) -------------------
 # The auth bootstrap pre-registers its spawn's session id with kind=bootstrap;
@@ -451,7 +479,31 @@ con7 = sqlite3.connect(os.environ["WARMTH_DB"])
 left = con7.execute("SELECT COUNT(*) FROM last_request "
                     "WHERE session_id='sess-lr-1'").fetchone()[0]
 con7.close()
-check("/_end drops the persisted last_request row too", left == 0)
+check("/_end retains the replayable entry + its mirror row (sweeper's job now)",
+      left == 1 and "sess-lr-1" in lp._LAST_REQUEST)
+# the staleness sweep reaps the ended session's whole debug bundle in step
+# (make the prefix REALLY stale: drop its warmth row so the predicate falls
+# back to the entry ts, which we backdate past ttl+grace)
+with lp._LAST_REQUEST_LOCK:
+    lp._LAST_REQUEST["sess-lr-1"]["ts"] = time.time() - 7200
+    _h_lr = lp._prefix_hash(lp._LAST_REQUEST["sess-lr-1"]["obj"],
+                            len(lp._LAST_REQUEST["sess-lr-1"]["obj"]["messages"]))
+con7b = sqlite3.connect(os.environ["WARMTH_DB"])
+con7b.execute("DELETE FROM warmth WHERE hash=?", (_h_lr,))
+con7b.commit(); con7b.close()
+lp._CONTEXT_STATS["sess-lr-1"] = {"turns_in_context": 1}
+lp._LAST_RESPONSE["sess-lr-1"] = {"text": "bye"}
+lp._sweep_state()
+con8 = sqlite3.connect(os.environ["WARMTH_DB"])
+left8 = con8.execute("SELECT COUNT(*) FROM last_request "
+                     "WHERE session_id='sess-lr-1'").fetchone()[0]
+con8.close()
+check("sweep reaps stale entry + mirror + context + last answer together",
+      left8 == 0 and "sess-lr-1" not in lp._LAST_REQUEST
+      and "sess-lr-1" not in lp._CONTEXT_STATS
+      and "sess-lr-1" not in lp._LAST_RESPONSE)
+check("the ended marker outlives the sweep (durable identity, not runtime state)",
+      lp._ENDED.get("sess-lr-1", {}).get("reason") == "clear")
 
 # stale rows (cold past the grace) are reaped at restore, not resurrected
 lp._persist_last_request_row("sess-lr-stale", "acct-1", "/v1/messages",

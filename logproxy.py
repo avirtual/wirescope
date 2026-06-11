@@ -1765,6 +1765,19 @@ def _warmth_db():
                 con.execute("ALTER TABLE session_meta ADD COLUMN kind TEXT")
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # `ended_at`/`end_reason` (2026-06-11): the SessionEnd MARKER.
+            # /_end no longer deletes runtime state — a one-shot `claude -p`
+            # fires SessionEnd the instant its answer lands, and instant
+            # teardown destroyed exactly the post-mortem state (context
+            # stats, /_session view, last answer) worth debugging. Ended is
+            # a durable FACT about the session (resumable — a live turn
+            # clears it); cleanup belongs to the staleness sweeper.
+            for ddl in ("ALTER TABLE session_meta ADD COLUMN ended_at REAL",
+                        "ALTER TABLE session_meta ADD COLUMN end_reason TEXT"):
+                try:
+                    con.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass  # column already exists
             # RESTART-AMNESIA (open item h): per-proxy runtime state, mirrored on
             # every change and reloaded at startup, so a restart recovers what
             # the process held. owner = LOG_DIR (see _OWNER).
@@ -1829,6 +1842,8 @@ _CWD_RE = re.compile(r"Primary working directory:\s*(.+)")
 _TITLE_SYS_PREFIX = "Generate a concise, sentence-case title"
 _META_CWD_TRIES = collections.defaultdict(int)  # sid -> scans attempted
 _META_CWD_DONE = set()                          # sids whose cwd is stored
+_ENDED = {}     # sid -> {"ts","reason"}: SessionEnd markers (mirror of
+                # session_meta.ended_at; a live turn = resume, clears both)
 _META_CWD_MAX_TRIES = 5    # env block shows up in the first turns or never
 
 
@@ -1969,6 +1984,7 @@ def _capture_session_meta(session_id, obj, model):
     custom system prompt may simply not carry an env block)."""
     if not session_id:
         return
+    _clear_session_ended(session_id)    # live turn on an ended session = resume
     cwd = None
     if session_id not in _META_CWD_DONE and _META_CWD_TRIES[session_id] < _META_CWD_MAX_TRIES:
         _META_CWD_TRIES[session_id] += 1
@@ -2434,33 +2450,68 @@ _WARMTH_PURGE_SLACK = int(os.environ.get("WARMTH_PURGE_SLACK", str(7 * 86400)))
 
 
 def _end_session(session_id, reason="unspecified"):
-    """Forget a finished session's replayable last request and its head index.
-    Idempotent. We leave the (anonymous, ttl-bounded, possibly fork-shared) warmth
-    row to expire on its own rather than risk blinding a concurrent sibling."""
-    with _LAST_REQUEST_LOCK:
-        dropped_lr = _LAST_REQUEST.pop(session_id, None) is not None
+    """SessionEnd MARKER (2026-06-11 redesign; was a hard delete). A /clear or
+    CLI exit marks the session ended instead of erasing its runtime state — a
+    one-shot `claude -p` fires SessionEnd the moment its answer lands, and the
+    old instant teardown destroyed exactly the post-mortem debug state
+    (/_session view, context stats, last answer) those runs need. Ended is a
+    durable fact in session_meta (a session can always be --resume'd; a live
+    turn clears the mark). The HOLD is still disarmed immediately (never spend
+    autonomously on an ended session); everything else stays until the
+    staleness sweeper reaps it like any idle session's state. Idempotent."""
+    now = time.time()
     with _HOLD_LOCK:
         dropped_hold = _HOLD_STATE.pop(session_id, None) is not None
-    _CONTEXT_STATS.pop(session_id, None)
-    _LAST_RESPONSE.pop(session_id, None)
-    dropped_head = False
+    with _LAST_REQUEST_LOCK:
+        has_lr = session_id in _LAST_REQUEST
+    known = (has_lr or session_id in _CONTEXT_STATS
+             or session_id in _SESSION_TOTALS or session_id in _ENDED)
+    marked = False
     try:
         con = _warmth_db()
         with _DB_LOCK:
-            cur = con.execute("DELETE FROM session_head WHERE session_id=?",
-                              (session_id,))
             con.execute("DELETE FROM hold_state WHERE owner=? AND session_id=?",
                         (_OWNER, session_id))
-            con.execute("DELETE FROM last_request WHERE owner=? AND session_id=?",
-                        (_OWNER, session_id))
+            # UPDATE, not upsert: the hook fires for unproxied sessions too —
+            # never invent identity rows for sessions this proxy never saw.
+            cur = con.execute(
+                "UPDATE session_meta SET ended_at=?, end_reason=?, last_seen=? "
+                "WHERE session_id=?", (now, reason, now, session_id))
+            if cur.rowcount == 0:   # meta-less but head-indexed = still ours
+                known = known or bool(con.execute(
+                    "SELECT 1 FROM session_head WHERE session_id=?",
+                    (session_id,)).fetchone())
             con.commit()
-            dropped_head = cur.rowcount > 0
+            marked = cur.rowcount > 0
     except Exception:
         pass
+    if marked or known:
+        _ENDED[session_id] = {"ts": now, "reason": reason}
+        marked = True
     return {"ok": True, "session": session_id, "reason": reason,
-            "dropped": {"last_request": dropped_lr, "session_head": dropped_head,
-                        "hold": dropped_hold},
+            "ended": marked, "hold_disarmed": dropped_hold,
+            "retained": {"last_request": has_lr,
+                         "context": session_id in _CONTEXT_STATS},
             "remaining_sessions": len(_LAST_REQUEST)}
+
+
+def _clear_session_ended(session_id):
+    """A live turn on an ended session = a resume: drop the marker (memory +
+    durable column). Cheap no-op for the common (never-ended) case."""
+    if session_id not in _ENDED:
+        return False
+    _ENDED.pop(session_id, None)
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            con.execute("UPDATE session_meta SET ended_at=NULL, end_reason=NULL "
+                        "WHERE session_id=?", (session_id,))
+            con.commit()
+    except Exception:
+        pass
+    print(f"[end] session={session_id[:12]}… RESUMED — ended marker cleared",
+          flush=True)
+    return True
 
 
 def _prefix_age_ttl(entry, now):
@@ -2490,6 +2541,12 @@ def _sweep_state(now=None):
                  if (lambda a, t: a > t + _LAST_REQUEST_GRACE)(*_prefix_age_ttl(e, now))]
         for sid in stale:
             _LAST_REQUEST.pop(sid, None)
+    for sid in stale:
+        # companion debug state rides the same staleness verdict (since the
+        # /_end redesign nothing else deletes it; ended markers + session_meta
+        # identity stay — they're durable facts, not runtime state)
+        _CONTEXT_STATS.pop(sid, None)
+        _LAST_RESPONSE.pop(sid, None)
     purged = heads = 0
     try:
         con = _warmth_db()
@@ -3362,12 +3419,29 @@ def _restore_cwd_done():
         return 0
 
 
+def _restore_ended():
+    """Reload SessionEnd markers so a restart doesn't forget which sessions
+    ended (and so a post-restart live turn still clears the right mark)."""
+    try:
+        con = _warmth_db()
+        with _DB_LOCK:
+            rows = con.execute("SELECT session_id, ended_at, end_reason "
+                               "FROM session_meta WHERE ended_at IS NOT NULL"
+                               ).fetchall()
+        for sid, ts, reason in rows:
+            _ENDED[sid] = {"ts": ts, "reason": reason or "unspecified"}
+        return len(rows)
+    except Exception:
+        return 0
+
+
 def _restore_state():
     now = time.time()
     _RESTORED["holds"] = _restore_holds(now)
     _RESTORED["last_requests"] = _restore_last_requests(now)
     _RESTORED["totals"], _RESTORED["session_totals"] = _restore_totals()
     _RESTORED["cwd_done"] = _restore_cwd_done()
+    _RESTORED["ended"] = _restore_ended()
     print(f"[restore] holds={_RESTORED['holds']} "
           f"last_requests={_RESTORED['last_requests']} (auth-less until live "
           f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
@@ -3391,7 +3465,7 @@ def _status_snapshot(session=None, all_sessions=False):
         con = _warmth_db()
         with _DB_LOCK:
             q = ("SELECT session_id, title, cwd, model, first_seen, last_seen, "
-                 "kind FROM session_meta")
+                 "kind, ended_at, end_reason FROM session_meta")
             if session:
                 cur = con.execute(q + " WHERE session_id=?", (session,))
             elif all_sessions:
@@ -3426,9 +3500,13 @@ def _status_snapshot(session=None, all_sessions=False):
             hold["expected_pings"] = min(
                 WARMTH_HOLD_MAX_PINGS,
                 max(1, int((hold["until"] - ref) // ttl)))
+        ended = _ENDED.get(sid)
+        if not ended and r and r[7]:
+            ended = {"ts": r[7], "reason": r[8] or "unspecified"}
         sessions.append({
             "session_id": sid,
             "kind": kind,
+            "ended": ended,
             "title": r[1] if r else None,
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
@@ -3597,6 +3675,11 @@ def _render_admin_html(snap, host=""):
         sid = s["session_id"]
         kindb = (f' <span class="badge off">&#129302; {e(s["kind"])}</span>'
                  if s.get("kind") else "")
+        en = s.get("ended")
+        if en:   # ended but resumable; debug state stays until the sweep
+            kindb += (f' <span class="badge off">&#127937; ended'
+                      f'{" · " + e(str(en["reason"])) if en.get("reason") else ""}'
+                      f'</span>')
         rows.append(
             f'<tr><td>{warmth}</td>'
             f'<td><b><a href="/_session?session={e(sid)}">'
@@ -3881,6 +3964,7 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
         # (codex has no title side-call)
         if session_id and base_path.rstrip("/").endswith(("/responses",
                                                           "/chat/completions")):
+            _clear_session_ended(session_id)   # live turn = resume
             fields = {"model": model}
             try:
                 texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
@@ -4060,8 +4144,8 @@ async def handler(request: Request) -> Response:
                             status_code=400, media_type="application/json")
         res = _end_session(sess, reason=request.query_params.get("reason", "unspecified"))
         print(f"[end] session={sess[:12]}… reason={res['reason']} "
-              f"dropped={res['dropped']} remaining={res['remaining_sessions']}",
-              flush=True)
+              f"ended={res['ended']} hold_disarmed={res['hold_disarmed']} "
+              f"retained={res['retained']} (sweeper reaps later)", flush=True)
         return Response(json.dumps(res), media_type="application/json")
 
     n = next(_counter)
