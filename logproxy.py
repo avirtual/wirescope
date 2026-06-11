@@ -150,6 +150,25 @@ def _is_chatgpt_backend(upstream):
     return "chatgpt.com/backend-api" in (upstream or "")
 
 
+def _is_openai_body(obj):
+    """Responses-API request shape (codex) vs anthropic messages shape — the
+    discriminator for mixed-provider stores (_LAST_REQUEST, last_request rows)."""
+    return (isinstance(obj, dict) and "messages" not in obj
+            and ("input" in obj or "instructions" in obj))
+
+
+def _is_prompt_item_openai(item):
+    """Prompt-bearing user input item (the openai-wire analogue of
+    _is_prompt_msg): a user message with real text — codex wraps machine
+    context (<environment_context>, <permissions instructions>) in <…> blocks."""
+    if not (isinstance(item, dict) and item.get("type") == "message"
+            and item.get("role") == "user"):
+        return False
+    return any((c.get("text") or "").lstrip()
+               and not (c.get("text") or "").lstrip().startswith("<")
+               for c in (item.get("content") or []) if isinstance(c, dict))
+
+
 def _read_codex_auth(path=None):
     """(access_token, account_id) from codex's auth.json; (None, None) on any
     error — the request then forwards as-is and upstream rejects it cleanly."""
@@ -2085,6 +2104,28 @@ def _cache_last_request(session_id, obj, fwd_headers, upstream_path,
         _enqueue_last_request_delete(evicted)
 
 
+def _cache_last_request_openai(session_id, obj, upstream_path):
+    """Codex flavor of _cache_last_request: stored for the /_session context
+    view (+ restart parity via the same mirror table), NOT for replay — the
+    pinger declines openai bodies (caching is server-side; there is no
+    client-side TTL to slide). No headers kept: nothing here is ever re-sent."""
+    if not (session_id and isinstance(obj, dict)):
+        return
+    ts = time.time()
+    evicted = None
+    with _LAST_REQUEST_LOCK:
+        _LAST_REQUEST[session_id] = {"obj": obj, "headers": {},
+                                     "path": upstream_path, "ts": ts,
+                                     "account": None, "provider": "openai",
+                                     "needs_auth": False}
+        if len(_LAST_REQUEST) > _LAST_REQUEST_MAX:
+            evicted = min(_LAST_REQUEST.items(), key=lambda kv: kv[1]["ts"])[0]
+            _LAST_REQUEST.pop(evicted, None)
+    _enqueue_last_request(session_id, None, upstream_path, ts, obj, {})
+    if evicted:
+        _enqueue_last_request_delete(evicted)
+
+
 def _resolve_auth(session_id):
     """Return the session's cached entry, re-attaching account-level credentials
     to a restored (auth-less) one when its account has since sent live traffic.
@@ -2360,6 +2401,12 @@ async def _warm_session(session_id, force=False):
                                "(auth never persists); waiting for live traffic "
                                "from the same account to re-attach them"}
     src = entry["obj"]
+    if _is_openai_body(src):
+        return 200, {"ok": True, "warmed": False, "skipped": "openai_wire",
+                     "session": session_id,
+                     "reason": "codex/openai session — caching is server-side, "
+                               "there is no client TTL to slide; entry kept for "
+                               "the /_session view only"}
     msgs = src.get("messages") or []
     if not msgs:
         return 400, {"ok": False, "session": session_id,
@@ -3347,9 +3394,12 @@ def _restore_last_requests(now=None):
     loaded, stale = 0, []
     for sid, acct, path, ts, body, hdrs in rows:
         try:
-            entry = {"obj": json.loads(body), "headers": json.loads(hdrs),
+            bobj = json.loads(body)
+            oai = _is_openai_body(bobj)   # view-only entries never need auth
+            entry = {"obj": bobj, "headers": json.loads(hdrs),
                      "path": path, "ts": ts, "account": acct,
-                     "needs_auth": True}
+                     "needs_auth": not oai,
+                     **({"provider": "openai"} if oai else {})}
             age, ttl = _prefix_age_ttl(entry, now)
         except Exception:
             stale.append(sid)
@@ -3457,7 +3507,8 @@ def _status_snapshot(session=None, all_sessions=False):
     in-memory by design (nothing replayable survives a restart anyway)."""
     now = time.time()
     with _LAST_REQUEST_LOCK:
-        last_real = {sid: (e["ts"], bool(e.get("needs_auth")))
+        last_real = {sid: (e["ts"], bool(e.get("needs_auth")),
+                           _is_openai_body(e.get("obj")))
                      for sid, e in _LAST_REQUEST.items()}
     holds = _hold_snapshot()
     meta_rows, meta_err = {}, None
@@ -3513,8 +3564,10 @@ def _status_snapshot(session=None, all_sessions=False):
             "first_seen": r[4] if r else None,
             "last_seen": (r[5] if r else None) or (lr[0] if lr else None),
             "last_real_turn_ts": lr[0] if lr else None,
-            "pingable": bool(lr and not lr[1]),
-            "awaiting_auth": bool(lr and lr[1]),
+            # openai-wire entries are view-only — never pingable, never
+            # awaiting auth (nothing is ever replayed on that wire)
+            "pingable": bool(lr and not lr[1] and not lr[2]),
+            "awaiting_auth": bool(lr and lr[1] and not lr[2]),
             "warmth": {"state": ("warm" if wq.get("warm")
                                  else "cold" if wq.get("found") else "absent"),
                        "remaining_s": wq.get("remaining_s"),
@@ -3737,8 +3790,10 @@ def _load_last_request_row(session_id):
                             "WHERE owner=? AND session_id=?",
                             (_OWNER, session_id)).fetchone()
         if r:
-            return {"obj": json.loads(r[2]), "path": r[0], "ts": r[1],
-                    "needs_auth": True}
+            body = json.loads(r[2])
+            # openai rows never need auth — they exist for the view only
+            return {"obj": body, "path": r[0], "ts": r[1],
+                    "needs_auth": not _is_openai_body(body)}
     except Exception as e:
         print(f"[session] last_request read failed for {session_id[:12]}…: {e}",
               flush=True)
@@ -3772,6 +3827,111 @@ def _prevu(text, cap=350, full_cap=60000):
             f"<pre>{html.escape(t[:full_cap])}{html.escape(more)}</pre></details>")
 
 
+def _render_session_openai_body(entry, resp=None):
+    """The /_session body for a codex/openai-wire entry: Responses-API shape —
+    instructions (one system-like block), tools (name OR built-in type), input
+    items (message / function_call / function_call_output / reasoning). No
+    cache badges: caching is server-side (prompt_cache_key shown instead)."""
+    e = html.escape
+    obj = entry.get("obj") or {}
+    tools = obj.get("tools") or []
+    instr = obj.get("instructions") or ""
+    inp = [it for it in (obj.get("input") or []) if isinstance(it, dict)]
+    t_ch = len(json.dumps(tools)) if tools else 0
+    i_ch = len(json.dumps(inp)) if inp else 0
+    n_turns = sum(1 for it in inp if _is_prompt_item_openai(it))
+    pck = obj.get("prompt_cache_key") or ""
+    bar = (f'<p class="kv"><span>captured <b>{e(_fmt_ago(entry.get("ts")))}</b> '
+           f'<span class="badge on">openai wire</span></span>'
+           f'<span>tools <b>{len(tools)}</b> &approx;{e(_fmt_tok(t_ch // 4))} tok</span>'
+           f'<span>instructions <b>{len(instr):,}</b> ch</span>'
+           f'<span>input <b>{len(inp)}</b> items &approx;{e(_fmt_tok(i_ch // 4))} tok</span>'
+           f'{f"<span>turns <b><a href=#turn-{n_turns}>{n_turns}</a></b></span>" if n_turns else ""}'
+           f'<span class="dim">server-side cache'
+           f'{" · key " + e(pck[:13]) + "…" if pck else ""}</span></p>')
+    if tools:
+        trs = "".join(
+            f'<tr><td><b>{e(t.get("name") or t.get("type") or "?")}</b></td>'
+            f'<td class="dim">{len(json.dumps(t)):,} ch</td>'
+            f'<td class="dim">{e((t.get("description") or "")[:120])}</td></tr>'
+            for t in sorted(tools, key=lambda t: -len(json.dumps(t))))
+        tools_html = (f'<details><summary>tools · {len(tools)} · '
+                      f'&approx;{e(_fmt_tok(t_ch // 4))} tok</summary>'
+                      f'<table>{trs}</table></details>')
+    else:
+        tools_html = '<p class="dim">no tools</p>'
+    sb = ""
+    if instr:
+        heads = _MD_HEADING_RE.findall(instr)
+        hl = " · ".join(e(h.lstrip("# ")) for h in heads[:12])
+        sb = (f'<div class="blk sysb"><span class="sz">{len(instr):,} ch</span>'
+              f'<span class="role">instructions</span> '
+              f'<span class="dim">{hl}</span>{_prevu(instr, cap=160)}</div>')
+    rows = []
+    turn = 0
+    for i, it in enumerate(inp):
+        t = it.get("type")
+        if _is_prompt_item_openai(it):
+            turn += 1
+            cur = (' · <span class="warm">current</span>'
+                   if turn == n_turns else '')
+            rows.append(f'<div class="turnhdr" id="turn-{turn}">'
+                        f'turn {turn}{cur}</div>')
+        if t == "message":
+            role = it.get("role", "?")
+            for c in (it.get("content") or []):
+                if not isinstance(c, dict):
+                    continue
+                txt = c.get("text") or ""
+                machine = (' <span class="warn">[context]</span>'
+                           if txt.lstrip().startswith("<") else "")
+                cls = "assistant" if role == "assistant" else e(role)
+                rows.append(f'<div class="blk {cls}">'
+                            f'<span class="sz">{len(txt):,} ch</span>'
+                            f'<span class="role">#{i} {e(role)}</span>'
+                            f'{machine}{_prevu(txt)}</div>')
+        elif t == "function_call":
+            args = it.get("arguments") or ""
+            rows.append(f'<div class="blk tooluse">'
+                        f'<span class="sz">{len(args):,} ch</span>'
+                        f'<span class="role">#{i} assistant</span> '
+                        f'function_call <b>{e(it.get("name") or "?")}</b>'
+                        f'{_prevu(args, cap=200)}</div>')
+        elif t == "function_call_output":
+            out = it.get("output")
+            txt = out if isinstance(out, str) else json.dumps(out or "")
+            rows.append(f'<div class="blk toolres">'
+                        f'<span class="sz">{len(txt):,} ch</span>'
+                        f'<span class="role">#{i} tool</span> '
+                        f'function_call_output{_prevu(txt, cap=200)}</div>')
+        elif t == "reasoning":
+            enc = it.get("encrypted_content") or ""
+            summ = "\n".join(s.get("text") or "" for s in (it.get("summary") or [])
+                             if isinstance(s, dict))
+            rows.append(f'<div class="blk assistant">'
+                        f'<span class="sz">{len(enc):,} ch</span>'
+                        f'<span class="role">#{i} assistant</span> reasoning '
+                        f'<span class="dim">(encrypted)</span>'
+                        f'{_prevu(summ, cap=120)}</div>')
+        else:
+            rows.append(f'<div class="blk"><span class="role">#{i}</span> '
+                        f'<span class="dim">{e(str(t))}</span></div>')
+    if (resp and resp.get("text")
+            and (resp.get("ts") or 0) >= (entry.get("ts") or 0)):
+        rtxt = resp["text"]
+        trunc = (' <span class="dim">(preview capped)</span>'
+                 if resp.get("truncated") else '')
+        rows.append(f'<div class="turnhdr">answer · turn {turn or "?"} '
+                    f'<span class="dim">from the wire response — not yet '
+                    f'part of the next request</span></div>')
+        rows.append(f'<div class="blk assistant">'
+                    f'<span class="sz">{len(rtxt):,} ch</span>'
+                    f'<span class="role">assistant (response)</span> '
+                    f'<span class="dim">{e(str(resp.get("stop_reason") or ""))}'
+                    f'</span>{trunc}{_prevu(rtxt)}</div>')
+    return bar + tools_html + sb + "".join(rows)
+
+
 def _render_session_html(sid, entry, snap, resp=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
@@ -3786,6 +3946,15 @@ def _render_session_html(sid, entry, snap, resp=None):
             f'<span>model <b>{e(_short_model(s.get("model")))}</b></span>'
             f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
             f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
+    if entry and _is_openai_body(entry.get("obj") or {}):
+        body = _render_session_openai_body(entry, resp=resp)
+        foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
+                f'<a href="/_status?session={e(sid)}">raw json</a> · '
+                f'static snapshot (reload to refresh)</p>')
+        return ('<!doctype html><html><head><meta charset="utf-8">'
+                f'<title>logproxy · {e((s.get("title") or sid)[:60])}</title>'
+                f'<style>{_SESSION_CSS}</style></head><body>'
+                + head + body + foot + "</body></html>")
     if not entry:
         body = ('<p class="warn">no replayable request tracked for this session '
                 '— nothing captured yet, evicted, or ended via /_end.</p>')
@@ -3965,6 +4134,8 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
         if session_id and base_path.rstrip("/").endswith(("/responses",
                                                           "/chat/completions")):
             _clear_session_ended(session_id)   # live turn = resume
+            # /_session context view (NOT replayable — pinger declines openai)
+            _cache_last_request_openai(session_id, obj, upstream_path)
             fields = {"model": model}
             try:
                 texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
@@ -4052,6 +4223,13 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                 _CODEX_STATS["reasoning_tokens"] += reason or 0
                 if up.status_code >= 400 or meta.get("error"):
                     _CODEX_STATS["errors"] += 1
+                if session_id and meta.get("text"):
+                    # /_session's "last answer" block (same as anthropic path)
+                    _LAST_RESPONSE[session_id] = {
+                        "text": meta["text"],
+                        "truncated": len(meta["text"]) >= _META_TEXT_CAP,
+                        "stop_reason": meta.get("status"),
+                        "ts": time.time()}
                 _enqueue_json(out_dir / f"{stem}.response.json",
                     {"seq": n, "agent": agent, "provider": "openai",
                      "model": model, "session_id": session_id,

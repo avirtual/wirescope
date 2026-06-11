@@ -907,6 +907,56 @@ check("codex stats surfaced in /_status",
       lp._status_snapshot()["proxy"].get("codex", {}).get("requests") == 0
       and "upstream_openai" in lp._status_snapshot()["proxy"])
 
+# --- codex /_session view: entry cached for the VIEW, never for replay --------
+_cbody = {"model": "gpt-5.4", "instructions": "# Personality\nYou are codex.",
+          "prompt_cache_key": "pck-1",
+          "tools": [{"type": "function", "name": "exec_command",
+                     "description": "run a command"},
+                    {"type": "web_search"}],
+          "input": [
+              {"type": "message", "role": "developer",
+               "content": [{"type": "input_text",
+                            "text": "<permissions instructions>x</permissions>"}]},
+              {"type": "message", "role": "user",
+               "content": [{"type": "input_text",
+                            "text": "<environment_context>cwd</environment_context>"}]},
+              {"type": "message", "role": "user",
+               "content": [{"type": "input_text", "text": "What is 6*7?"}]},
+              {"type": "function_call", "name": "exec_command",
+               "arguments": '{"cmd":"echo 42"}', "call_id": "c1"},
+              {"type": "function_call_output", "call_id": "c1", "output": "42"},
+              {"type": "reasoning", "encrypted_content": "ZZZ",
+               "summary": [{"type": "summary_text", "text": "thought"}]}]}
+check("_is_openai_body discriminates the wires",
+      lp._is_openai_body(_cbody) and not lp._is_openai_body(compact_obj()))
+check("prompt-item predicate skips machine <…> context",
+      [lp._is_prompt_item_openai(it) for it in _cbody["input"][:3]]
+      == [False, False, True])
+lp._cache_last_request_openai("sess-cdx-1", _cbody, "/v1/responses")
+lp._WRITE_Q.join()
+st_cdx = lp._status_snapshot(session="sess-cdx-1")["sessions"][0]
+check("codex entry is view-only: never pingable, never awaiting auth",
+      st_cdx["pingable"] is False and st_cdx["awaiting_auth"] is False)
+code_cdx, res_cdx = asyncio.run(lp._warm_session("sess-cdx-1", force=True))
+check("pinger declines openai entries even with force=1",
+      code_cdx == 200 and res_cdx.get("skipped") == "openai_wire")
+row_cdx = lp._load_last_request_row("sess-cdx-1")
+check("restored codex row needs no auth (view-only)",
+      row_cdx is not None and row_cdx["needs_auth"] is False)
+lp._LAST_RESPONSE["sess-cdx-1"] = {"text": "42", "truncated": False,
+                                   "stop_reason": "completed",
+                                   "ts": time.time() + 1}
+page_cdx = lp._render_session_html(
+    "sess-cdx-1", lp._LAST_REQUEST["sess-cdx-1"],
+    lp._status_snapshot(session="sess-cdx-1"),
+    resp=lp._LAST_RESPONSE["sess-cdx-1"])
+check("/_session renders the codex payload end to end",
+      "openai wire" in page_cdx and "Personality" in page_cdx
+      and "exec_command" in page_cdx and "What is 6*7?" in page_cdx
+      and "function_call_output" in page_cdx and 'id="turn-1"' in page_cdx
+      and "assistant (response)" in page_cdx and "reasoning" in page_cdx
+      and "awaiting auth" not in page_cdx)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
