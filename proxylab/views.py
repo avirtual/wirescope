@@ -152,10 +152,14 @@ def _render_admin_html(snap, host=""):
             kindb += (f' <span class="badge off">&#127937; ended'
                       f'{" · " + e(str(en["reason"])) if en.get("reason") else ""}'
                       f'</span>')
+        # title is [agent] when routed; keep the learned summary visible too
+        summ = s.get("summary")
+        summ = (f' <span class="dim">{e(summ)}</span>'
+                if summ and summ != s.get("title") else "")
         rows.append(
             f'<tr><td>{warmth}</td>'
             f'<td><b><a href="/_session?session={e(sid)}">'
-            f'{e(s.get("title") or "(untitled)")}</a></b>{kindb}<br>'
+            f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}<br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span><br>'
             f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'

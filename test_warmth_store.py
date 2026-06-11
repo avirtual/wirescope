@@ -416,11 +416,9 @@ check("agent survives later agent-less upserts (COALESCE)",
       == "executor-1")
 check("plain (ext) sessions carry agent=None and stay untitled",
       st_ended["agent"] is None)
-check("admin renders the agent fallback title",
-      "[executor-1]" in lp._render_admin_html(
-          lp._status_snapshot(all_sessions=True), host="t:7800")
-      or "Run the test matrix" in lp._render_admin_html(
-          lp._status_snapshot(session="sess-agent-1")))
+page_ag = lp._render_admin_html(lp._status_snapshot(session="sess-agent-1"))
+check("admin renders [agent] as the name AND the learned summary beside it",
+      "[executor-1]" in page_ag and "Run the test matrix" in page_ag)
 
 # --- session meta: cwd extraction + title-call detection -------------------------
 check("cwd from system text", lp._extract_cwd(
