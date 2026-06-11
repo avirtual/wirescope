@@ -4,604 +4,245 @@
 
 @HANDOFF.local.md
 
-The session-end NOTE TO SELF (what shipped, what's live, the NEXT build
-target, pending carryovers) lives in **`HANDOFF.local.md`** — local-only,
-gitignored, imported above so every fresh context still loads it. **Update
-THAT file at session end, not this one** — future plans and in-flight state
-must not leak into git commits. CLAUDE.md is for DURABLE conclusions + how to
-run; commit it only when those change. If `HANDOFF.local.md` is missing
-(fresh clone), recreate it from this convention — nothing durable is lost.
+Session-end NOTE TO SELF (what shipped, what's live, NEXT build target,
+carryovers) lives in **`HANDOFF.local.md`** — local-only, gitignored, imported
+above. **Update THAT file at session end, not this one.** CLAUDE.md = durable
+conclusions + how to run; commit only when those change. If `HANDOFF.local.md`
+is missing (fresh clone), recreate it from this convention.
 
-A HANDOFF note, not an archive. Goal: get a fresh context productive fast.
-The blow-by-blow record (every experiment, session-id, intermediate
-correction) lives in `CLAUDE.md.archive-2026-06-09` — read it only if you need
-to re-derive *why* a conclusion holds. This file = the conclusions + how to run.
+This file is a HANDOFF, not an archive. Full history with every experiment and
+rationale: `CLAUDE.md.archive-2026-06-09` (the early era) and
+`CLAUDE.md.archive-2026-06-11` (the detailed version of THIS file + the
+2026-06-10/11 handoff notes). Read them only to re-derive *why* a conclusion
+holds or for verbatim flag-mechanics detail.
 
 ## What this is
 
 `logproxy.py` = a transparent analytical forward-proxy between the `claude` CLI
-and `api.anthropic.com`. Point the CLI at it via `ANTHROPIC_BASE_URL`. It
-forwards bytes verbatim and **captures** every request/response to study agentic
-traffic. **Mission: find & price context waste; stay non-intrusive (no visible
-overhead).** All disk I/O runs on a background writer thread + queue; the handler
-only parses + enqueues.
+and `api.anthropic.com` (plus codex/ChatGPT-backend routing). Point the CLI at
+it via `ANTHROPIC_BASE_URL`. Forwards bytes verbatim, captures everything.
+**Mission: find & price context waste; stay non-intrusive.** Disk I/O on a
+background writer thread; the handler only parses + enqueues.
 
-Driving experiments live in a sibling project:
-`/Users/bogdan/projects/proxy-experiments/` (own CLAUDE.md). proxy-lab = the
-mechanism; proxy-experiments = scripts that drive `claude -p` through a proxy
-port and analyze captures. Only coupling: the proxy port + `LOG_DIR`.
+Driving experiments live in `/Users/bogdan/projects/proxy-experiments/` (own
+CLAUDE.md). Only coupling: the proxy port + `LOG_DIR`.
+
+**Code layout (since 2026-06-11): `logproxy.py` is a thin compat shim
+(uvicorn `logproxy:app` + `import logproxy` keep working); the real code is
+the `proxylab/` package — see "Module map" below. Zoom into the module you
+need; don't load the whole thing.**
 
 ## The thesis (proven on the wire)
 
-**Cost is context carriage, not "the model thinking."** Over an 18-turn trivial
-session: carriage (input+cache_read+cache_write) = $2.72; actual output (950
-tok) = $0.07 — carriage is 38× the cost. `cache_read` = the same ~38k context
-re-shipped every turn.
-- **"Cached so it's cheap" is backwards.** The right baseline for junk context is
-  *zero*. Cache bills 10% of something that should be 0, every turn. Cached
-  content is still fully in the payload (bandwidth + context-window occupancy are
-  NOT discounted — only compute price is).
-- A "2+2" turn loaded 31 tools (~23k tok), used 0 — deadweight, re-read every turn.
+**Cost is context carriage, not "the model thinking."** 18-turn trivial
+session: carriage = $2.72, actual output = $0.07 — 38×. "Cached so it's cheap"
+is backwards: the right baseline for junk context is ZERO; cache bills 10% of
+something that should be 0, every turn, and cached content still occupies
+bandwidth + context window. A "2+2" turn loaded 31 tools (~23k tok), used 0.
 
-## Biggest practical lever: TOOL-SET TRIMMING (native, no proxy)
+## Biggest practical levers (native first; proxy only for what needs the wire)
 
-Default `claude` ships **~33 tools ≈ 24k tok EVERY turn**; a normal session uses
-~4. `Workflow` tool alone = 5,223 tok (disable via `CLAUDE_CODE_DISABLE_WORKFLOWS=1`);
-the Team/Task/Cron/etc orchestration tools ~15k more. **Fix:**
-`claude --tools "Read Edit Write Bash Glob Grep"` (trims tools[] on the wire —
-unlike `--allowedTools` which only gates permissions) + `CLAUDE_CODE_DISABLE_WORKFLOWS=1`.
-Measured chatty 14-msg dev session: **−72.7% tokens, −50% USD, same work.**
+- **Tool-set trimming:** default CLI ships ~33 tools ≈ 24k tok every turn; a
+  normal session uses ~4. `claude --tools "Read Edit Write Bash Glob Grep"`
+  (trims tools[] on the wire; `--allowedTools` only gates permissions) +
+  `CLAUDE_CODE_DISABLE_WORKFLOWS=1` (Workflow alone = 5.2k tok). Measured:
+  −72.7% tokens, −50% USD, same work.
+- **`@file`** inlines the file AND writes `readFileState` → 0 Reads, Edit runs
+  directly. A/B 2026-06-11: −47.6% tokens, −16% USD, half the latency vs
+  letting the model Read. (A bare path without `@` does NOT help.)
+- **`--system-prompt-file`** natively REPLACES the whole agent-prompt block
+  (verified on wire); billing header + 62-ch SDK preamble + msg0 context
+  bundle still ship. Beats proxy system-editing for headless drivers.
+- **`--exclude-dynamic-system-prompt-sections`** = the CLI's native version of
+  our `RELOCATE_ENV_TO_TAIL`. NOT yet A/B'd against ours — do that before
+  trusting ours on.
+- Reserve the PROXY for: turn-collapse, durable response mutation, warmth
+  management, capture/analytics.
 
-## Native answers that beat the proxy (use these first)
-
-- **`@file`** — the CLI inlines it AND writes `readFileState`, so `@sample.py`
-  → 0 Reads, Edit runs directly, −33% tokens, fully safe. Most injection tricks
-  were reinventing `@`. (Volunteering just a PATH without `@` does NOT help.)
-- **`--system-prompt-file` / `--system-prompt`** — natively REPLACES the whole
-  Anthropic agent-prompt block (verified on the wire, sysprompt-probe
-  2026-06-09): the ~11.7k-ch block becomes your text (own 1h cache marker);
-  CLI still prepends the 85-ch billing header (uncached) + the 62-ch "You are
-  a Claude agent, built on Anthropic's Claude Agent SDK." preamble; msg0
-  context bundle (CLAUDE.md/userEmail/env) still ships. This outclasses
-  STRIP_SYSTEM_SECTIONS for headless drivers — whole-prompt control, no proxy.
-- **`--exclude-dynamic-system-prompt-sections`** — the CLI's NATIVE version of
-  our `RELOCATE_ENV_TO_TAIL` ("move per-machine sections from the system prompt
-  into the first user message; improves cross-user prompt-cache reuse"; ignored
-  with `--system-prompt`). Found 2026-06-09 in `--help`; NOT yet A/B'd against
-  our transform — do that before keeping ours on.
-- Use native `@`/`!`/`/`/hooks for context & read-collapse. Reserve the PROXY for
-  what only a wire intermediary can do: turn-collapse (request piggyback) and
-  DURABLE response mutation.
-
-## Hard facts (don't re-derive)
+## Hard facts (don't re-derive; full detail in the archives)
 
 **Cache mechanics**
-- Caching is **prefix-based, content-addressed, byte-exact**. Tail edits (last
-  user msg) are cache-safe; system/tools/history edits bust downstream.
-- Canonical cache order is **tools → system → messages** regardless of JSON key
-  order. ≤4 `cache_control` breakpoints; each = "cache the cumulative prefix up
-  to and including this block." Typical layout: M1 = tools+attribution+preamble
-  (SEGMENT A), M2 = system prose + `# Environment` (SEGMENT B), M3 = messages
-  (rolling, SEGMENT C).
-- **CLAUDE.md is USER space**, not system — a `<system-reminder>`/`# claudeMd`
-  text block in `messages[0]`. cwd's project CLAUDE.md auto-loads → run clean
-  experiments from a neutral cwd.
-- **TTL: 5m is the default; 1h is an override the CLI adds ONLY to the main
-  agent** (subagents stay bare = 5m). `FORCE_PROMPT_CACHING_5M=1` works by
-  *dropping* the 1h field. TTL is a **sliding idle timer** (resets on every read),
-  not fixed-from-creation. Write premium: 5m = 1.25×, 1h = 2×; reads = 0.10× in
-  both. **5m-vs-1h is purely the reuse-gap:** gap <5m → 5m; 5m–1h → 1h; >1h →
-  neither/no-cache. **Rule: ephemeral one-shot agents → 5m, persistent brains →
-  1h; default to 5m when unsure** (mis-1h on the ephemeral majority wastes +12–22%).
-- **Mid-turn eviction is real** — a tool step longer than the TTL between dispatch
-  and continuation of one turn re-writes the prefix. 1h's real value = shielding a
-  slow in-flight tool/approval-pause.
-- **CLI `total_cost_usd` UNDER-reports 1h-cached sessions** (2026-06-10,
-  reconciled to the cent on `aac68362`): the CLI prices cache writes at the 5m
-  rate (1.25×) even when the wire's `message_start` usage says
-  `ephemeral_1h_input_tokens` (2× premium — which main-agent sessions always
-  are, the CLI adds `[1m]` itself). cli $0.5548 vs proxy $0.6542 = exactly
-  13,246 write tok × (20−12.5)/MTok on fable. The statusline's dual cost will
-  always show cli < px by 0.75×base×cw1h; the PROXY number is the real bill.
-- **Org/proxy scope caveat:** a custom `ANTHROPIC_BASE_URL` (our proxy) flips the
-  client to 3P → org cache scope → the static/dynamic system boundary is never
-  inserted → static+dynamic system are bundled. So no system cache survives an env
-  change (cwd/git-commit/CLAUDE.md edit all bust `rest`). Everything we measure is
-  this degraded org path. The `# Environment` block carries cwd/dirs/platform/model
-  — NOT git branch/commits in this CLI; the real buster is CWD.
+- Prefix-based, content-addressed, byte-exact. Tail edits cache-safe;
+  system/tools/history edits bust downstream. Canonical order tools → system →
+  messages regardless of JSON key order. ≤4 `cache_control` breakpoints, each
+  caches the cumulative prefix. Typical: M1 tools+preamble, M2 system prose +
+  `# Environment`, M3 messages.
+- **CLAUDE.md is USER space** (a `<system-reminder>` block in `messages[0]`),
+  auto-loaded from cwd → run clean experiments from a neutral cwd.
+- **TTL: 5m default; 1h is a CLI override on the main agent only** (subagents
+  5m). Sliding idle timer, resets on every read. Write premium 5m=1.25×,
+  1h=2×; reads 0.10×. **Choose by reuse-gap:** <5m→5m, 5m–1h→1h, >1h→neither;
+  ephemeral one-shots → 5m, persistent brains → 1h; default 5m when unsure.
+  Mid-turn eviction is real (slow tool step re-writes the prefix); 1h's real
+  value = shielding slow in-flight pauses.
+- **CLI `total_cost_usd` UNDER-reports 1h sessions** (prices writes at the 5m
+  rate; reconciled to the cent). The PROXY number is the real bill.
+- **Custom `ANTHROPIC_BASE_URL` flips the client to 3P → org cache scope** →
+  static/dynamic system boundary never inserted; everything we measure is this
+  degraded org path. The real env-buster is CWD (the `# Environment` block).
+- The read-before-edit gate is CLIENT-side (`readFileState`, never on the
+  wire) → a transparent proxy CANNOT forge it. `@file` is the clean answer.
+- **Response text mutation persists** into the transcript (CLI does no
+  signature check on text — never touch THINKING blocks, they're signed).
+  Request injection is transient and desyncs history.
+- **/compact** is not a `-p` text command — drive it via
+  `--input-format stream-json` (one user line); emits `compact_boundary` with
+  pre/post tokens. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100` disables auto.
+  To drive a live multi-turn stream-json session you MUST hold stdin open
+  (FIFO + held write fd); EOF alone doesn't terminate `claude -p` stream-json.
+- `/clear` DOES fire SessionEnd (reason "clear") and rotates the session_id.
 
-**The read-before-edit gate (SKIP-THE-READ, resolved)**
-- `FileEditTool.validateInput` checks client-side `readFileState.get(path)` BEFORE
-  old_string — empty ⇒ errorCode 6 "File has not been read yet." `readFileState`
-  is written in 6 LOCAL spots (Read/Write/Edit/NotebookEdit/Bash/attachments),
-  **none on the API wire** → a transparent proxy CANNOT forge it live.
-  Proxy-forged Read-pair is a predictable NULL; don't run it.
-- The mutation Read IS collapsible by **tool substitution** (the gate is
-  FileEditTool-specific): Bash/Write have no read-precondition, or a custom
-  read-internally MCP edit tool (keeps integrity). But `@file` is the clean native
-  win — use it.
+**Warmth / compact economics (condensed verdicts)**
+- Warmth lives on the PREFIX LINEAGE, not the session_id; the proxy LEARNS it
+  from response receipts (`cache_creation>0 or cache_read>0`) into a shared
+  SQLite ledger (`warmth.sqlite`, WAL, all ports). TWO-STATE: warm = row
+  exists AND `expires_at > now`; absence ≈ expiry (durable receipt-confirmed
+  store makes that honest). Correctness lives in the read predicate; the
+  sweeper is hygiene-only. Gates: **ping IFF warm; strip IFF not-warm;
+  can't-judge ⇒ decline both.**
+- Compact-on-busted-cache: compact wins the first turn iff `read + 5S <
+  premium·H` → S<0.20·H at 1h, S<0.05·H at 5m; typical summaries (5–15%) win
+  ~immediately at 1h. `STRIP_COMPACT_CACHE` (warmth-gated) reclaims the
+  discarded write premium on a cold compact; stripping a WARM compact is a
+  big loss — hence the gate.
+- Ping economics: at 1h, one warm read buys an hour ≈ 19:1; at 5m it's a bad
+  bet. Hold caps pings (24) + clamps duration (12h).
 
-**Response mutation persists**
-- The CLI accepts altered text responses with ZERO pushback (no signature check on
-  text — never touch THINKING blocks, they carry signatures). Response edits
-  PERSIST into the transcript (durable conversation state), unlike request
-  injection (transient, desyncs history).
+**SHORTCIRCUIT (SC) — elide the "Done." wrap-up turn** (all priors 4.x!)
+- Synthetic end_turn on a successful terminal edit whose dispatch text carried
+  the sentinel. Use canned-ack + SYSPATCH delivery (system prompt, cache-rides;
+  tool-description delivery is ignored by models). Blunt prohibition + worked
+  exemplar → sonnet 3/3 trivial AND build, −49.5% tokens; gentle phrasing 0/3.
+  Only sonnet front-loads; opus/haiku DEFER under adaptive thinking. A miss is
+  free. Re-validate on fable before relying on it.
 
-**/compact**
-- NOT a text `-p` command — send via `--input-format stream-json --output-format
-  stream-json`, one line `{"type":"user","message":{"role":"user","content":"/compact"}}`.
-  Emits a `system/compact_boundary` event (`pre_tokens`/`post_tokens`) and persists;
-  `--resume`/`--fork-session` continue from the SUMMARY. Disable auto-compact with
-  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=100`.
+## Module map (proxylab/ package)
 
-## Code feature map (logproxy.py)
+Split 2026-06-11 (AST-driven, verbatim slices; def-parity 140/140 vs the
+monolith). `proxylab/__init__.py` imports submodules in the monolith's
+top-to-bottom order — import-time side effects (env parsing → writer thread →
+sweeper → server's `_restore_state()`) depend on it. The shim resolves any
+name lazily (PEP 562), so rebindable globals read live; to FLIP a flag from
+outside, assign on the owning module (`lp.warmth.WARMTH_LEDGER = …`), not on
+the shim. Modules (size · job):
+core 3k (constants/routes/httpx client) · codex 9k (openai provider + zstd
+capture) · wb 8k (workbench intent tee) · transforms 51k (inject/SC/relocate/
+strip/sort/compact-strip + gates) · canary 8k (drift detector) · writer 6k
+(disk-writer thread, _classify_role, NO_SESSION) · warmth 20k (SQLite ledger,
+prefix hashing, _record_warmth) · meta 8k (session metadata, turn stats,
+_ENDED/_CONTEXT_STATS/_LAST_RESPONSE) · pinger 21k (last-request cache,
+_ACCOUNT_AUTH, /_ping replay, session teardown + sweeper) · hold 21k
+(/warm-cache driver, echo transform, auth bootstrap) · billing 14k (SSE usage
+parse, PRICES, totals) · restore 8k (restart-amnesia) · status 7k (/_status
+snapshot) · views 25k (/_admin + /_session HTML) · server 38k (handlers +
+Starlette app).
 
-Core (always on): per-session log dirs `LOG_DIR/<sid>/<seq>-<agent>-<role>-<model>-<HHMMSS>.{request,response}.json(+.sse)`;
-`_totals.json`/`_session.json`; off-hot-path writer thread; session_id parsing
-(nested in `metadata.user_id`); inbound transport + redacted headers capture.
+## Feature map (flags; mechanics detail in archive-2026-06-11)
 
-| Flag | Default | What it does |
+| Flag | Default | One-liner |
 |---|---|---|
-| `RELOCATE_ENV_TO_TAIL` / `RELOCATE_CLAUDEMD_PATHSTAMP` | **on** | Peel volatile `# Environment`/`# currentDate` down to a tail reminder before the prompt; give static CLAUDE.md its own cache marker; dedupe the abspath stamp → CLAUDE.md becomes an env-independent, cross-session-shared segment (−94% claudeMd write on a cwd change). Marker TTL mirrors the preceding system marker (the 5m-after-1h 400 bug is fixed). Falls back to the userEmail bundle when no CLAUDE.md. |
-| `SORT_TOOLS` | **on** | Alphabetize `body.tools`; idempotent. Predictability only, not a carriage win. |
-| `WB_INTENT_DISPATCH` (+ `WB_URL`=:9000, `WB_PARSER_TOKEN`, `WB_INTENT_PARSER`) | **on** | **Workbench integration (2026-06-10):** absorbs the standalone wb proxy's response-side job (agent-workbench `components/proxy/proxy.py`, runs on :8999). For requests arriving via `/agent/<name>/anthropic/…` ONLY (plain CC traffic = `agent:"ext"`, never dispatches; chained 8999→7800 traffic arrives prefix-stripped → no double fire), an incremental SSE tee (`_WbIntentTee`) accumulates assistant text deltas and POSTs `[wb:action target]` intents to `WB_URL/api/intent` (bearer `WB_PARSER_TOKEN`), fire-and-forget on a separate 5s httpx client — never blocks client-bound bytes. Parsing delegates to the CANONICAL workbench `intent_parser.parse_intents`, loaded by file path (`WB_INTENT_PARSER`, default `~/projects/agent-workbench/intent_parser.py`); load failure prints loudly + disables, proxy forwards regardless. Boundary discipline = wb proxy's (intent N dispatches when N+1 locks its body; tail flushes on stream close, incl. mid-stream drop). Dispatch count lands in response.json `wb_intents` + `/_status` flags/`wb_intents` counters. **Migration state (2026-06-11): the openai/codex provider branch is PORTED (next row) — the `WB_PROXY_PORT→7800` flip is UNBLOCKED.** Remaining pre-flip checklist: `WB_PARSER_TOKEN` into start_proxy.sh's env (else /api/intent POSTs 401); optional usage-emit to `/api/proxy/usage` if wb's cost views need it post-flip; RESP_*/relay/SC stay OFF for agent routes. (Workbench auto-detects any proxy on `WB_PROXY_PORT` — bare TCP probe, workbench.py:2140 — and suppresses JSONL dispatch.) Interim chain still works: `WB_PROXY_UPSTREAM_ANTHROPIC=http://127.0.0.1:7800` on the wb proxy daemon. |
-| *(provider)* openai/codex routing (+ `UPSTREAM_OPENAI`, `CODEX_AUTH_FILE`, `CODEX_MODELS_STUB`) | **on** (not a flag) | **Codex support (2026-06-11), capture+routing ONLY.** `/agent/<name>/openai/<rest>` → `UPSTREAM_OPENAI` (default `chatgpt.com/backend-api/codex`; set `https://api.openai.com` for API-key traffic — no rewrite then). ChatGPT-backend mode ported from wb proxy #2342/#2346: strip `/v1` (backend serves `/responses`), swap in OAuth bearer + `chatgpt-account-id` RE-READ PER REQUEST from `~/.codex/auth.json` (never persisted/copied; both headers redacted in captures), stub `GET …/models` (`CODEX_MODELS_STUB`, default `gpt-5.4` — codex only needs the `{"models":[…]}` shape), treat `POST /responses|/chat/completions` as SSE by PATH (success responses may ship NO content-type). Requests are zstd-compressed → decoded OBSERVER-SIDE (stdlib 3.14 `compression.zstd`), original bytes forward verbatim. Session dirs keyed by the `session-id` HEADER (fallback thread-id → prompt_cache_key); role `codex`; session_meta gets model + cwd (from `<cwd>` in environment_context) + first-prompt head as title (no title side-call on this wire). NO transforms/warmth/canary/SC/billing: caching is SERVER-side and content-addressed ACROSS sessions (`prompt_cache_key` is a routing hint; verified live — cached_tokens grew across distinct session uuids); usage (`input_tokens`, `…details.cached_tokens`, `…reasoning_tokens`) parsed from `response.completed` (which echoes the FULL instructions+tools — a 1-word answer is a ~91KB response) into `.response.json` + `/_status` `codex` token counters (subscription traffic: tokens, no USD). WB intent tee runs on agent routes with the openai delta dialect (`response.output_text.delta` + chat-completions deltas). **Codex 0.139+ WS-first bug:** tries a WebSocket to `/responses`, 403s on any HTTP proxy, ~5 retries (~3–8s + error spam), then falls back to HTTP — long-standing codex bug, NOT fixable proxy-side (`features.*` flags don't disable it; a custom model_provider with `supports_websockets=false` + `requires_openai_auth=true` does, see HANDOFF; WS passthrough = future work). Codex CLI's "tokens used" = uncached input + output. Verified live: drill `logs_codex_drill/019eb808-*` (answer "42", in=10410 cached=10112, stub 200, redaction, /_status row). |
-| `CANARY` (`CANARY_DIR`) | **on** | Read-only version-drift detector: structural fingerprint per (model, anthropic-beta) — tool count/names, system block shapes, cache_control marker counts. Fires on CLI/wire changes (not our transforms; message content excluded). Early-warning for every version-fragile lever; flags when the CLI ever ships a 4th cache marker (baseline=3). Appends `_canary/changes.jsonl`. |
-| `WARMTH_LEDGER` (+ `WARMTH_LOG_FILE`, `WARMTH_PING_SENTINEL`, `WARMTH_DB`) | **on** | See "Warmth ledger" below. **SQLite-backed since 2026-06-09**: `warmth.sqlite` next to logproxy.py (override `WARMTH_DB`), WAL mode, shared by ALL proxy ports, survives restarts. `WARMTH_LEDGER_MAX` is gone (expiry is the GC). |
-| `WARMTH_BLOCK_COLD_PING` | off | **Warm-only ping gate.** A ping pays off ONLY on a `warm` prefix (a 0.10× read that slides the TTL); on any non-warm state (`cold`/`absent`/store error) a replay is a cache WRITE at the premium for no gain. So **ping IFF warm; decline everything else** (sentinel path short-circuits with a synthetic `end_turn`, 0 tokens). The replay pinger (`/_ping`) enforces warm-only unconditionally; `force=1` is the only override. Principle: **never higher cost.** (The "native-TTL store's EXISTS is the perfect primitive" insight is now implemented — the SQLite expiry predicate IS the gate.) |
-| `WARMTH_PINGER` (+ `WARMTH_PINGER_MAX`) | **on** | Replay-pinger: caches each session's post-transform last messages request **in memory** (incl. auth/beta headers, never on disk; oldest-evicted past cap). `POST`/`GET /_ping?session=<id>[&force=1]` replays it with thinking off + `max_tokens:1` → a cache READ that slides the TTL, ~1 output tok. Collapses the old `--resume --fork-session` sentinel dance to one HTTP call with just the session_id. Skips any non-warm prefix (warm-only; force=1 to establish). |
-| `WARMTH_HOLD` (+ `_MAX_HOURS`=12, `_MARGIN`=300s, `_INTERVAL`=60s, `_MAX_PINGS`=24) | **on** | **The hold driver (2026-06-10)** — decides WHEN to ping. User arms a session in-band via `/warm-cache <n>` (`~/.claude/commands/warm-cache.md` → `<proxy:warm-cache hours=N>` sentinel): the proxy arms **n hours of IDLE INSURANCE** — `until` re-anchors to last-organic-turn + n on EVERY real turn (2026-06-10 fix: "keep me warm until n hours after I walk away", NOT n hours from the arming timestamp; pings/failures reset with each slide; `hours` persisted in hold_state, legacy rows derive it from until−armed_at). Asyncio task pings armed sessions whose WARM prefix has `< margin` left (`_warm_session` warm-only gate is the final arbiter). Not-warm SKIPS (a real turn re-warms → hold resumes); disarm on expiry / `off` / `/_end` / ping cap / 2 consecutive failures. Spends nothing until armed. Requires PINGER+LEDGER. **Echo-forward arming (2026-06-10 redesign, replaces the synthetic ack):** the arming turn is FORWARDED with a `[logproxy]` echo instruction injected into the final user message (`_hold_echo_transform`) and the MODEL ITSELF speaks the ack — the earlier synthetic end_turn left an assistant message later turns knew they never wrote, and fable kept flagging the skill as prompt injection (the `[logproxy]` attribution stopped retractions but not the editorializing). Liveness is structural: only a live proxy can inject the block, so the command file is default-dead ("no [logproxy] block → reply 'proxy not active — hold NOT armed'"), no history-scoping caveats needed. Arming costs one normal turn — ~a ping when warm, a fresh cache write when cold (which IS the warmth the hold then maintains: "re-establishes the cache"); user-typed = consented spend. The forwarded turn self-heals pingability (becomes the replayable last request, donates auth). Known desync: the injected block isn't in the CLI transcript → one-time tail re-write of a few hundred tok on the next turn. Verified live 2026-06-10 (haiku drill `logs_main/5ae00ab7-*`: echo exact, cache_creation=5474 on cold arm, SessionEnd teardown; tripwire fires correctly unproxied). |
-| *(endpoint)* `GET /_status[?session=][&all=1]` | — | Read-only session inventory: title (harvested from the CLI's title side-call; structured-outputs JSON unwrapped), cwd ("Primary working directory:" line), model, warmth, hold state, per-session cost + refusals + `pingable`/`awaiting_auth`, proxy flags/totals + `totals_since_start` + `restored_at_start`. Identity rows are DURABLE (`session_meta`); holds/last-request-bodies/totals are persisted too since 2026-06-10 (see restart-amnesia below). Default window: sessions seen <24h. Sessions the proxy SPAWNED itself (auth bootstrap) carry `kind:"bootstrap"` in `session_meta` and are HIDDEN from the default list here and in `/_admin` — visible via `?all=1` (🤖 badge in admin) or direct `?session=`. **Turn accounting (2026-06-10):** `turns_completed` = receipt-counted terminal responses (`stop_reason != tool_use`; refusal/max_tokens still end a turn; title calls + subagents excluded; persists via `_session.json`), and `context` = `{turns_in_context, max_tool_result_chars, n_messages}` derived STATELESSLY from each request's model-visible history — the wire IS the transcript, so it's resume/fork/restart-proof and resets at `/compact` naturally (summary counts as 1). Feeds the statusline (single `/_status` poll replaced its JSONL heuristics; jq scan kept as unproxied fallback). In-memory only — but `/_end` no longer drops it: **SessionEnd = a MARKER, not a delete (2026-06-11, user request).** One-shot `claude -p` runs fire SessionEnd the instant their answer lands, and instant teardown destroyed exactly the post-mortem debug state (context/turns, /_session view, last answer) those runs need. `/_end` now: disarms the hold (never spend on an ended session), stamps durable `ended_at`/`end_reason` in session_meta (UPDATE only — the hook fires for unproxied sessions too, never invent rows), keeps everything else; the staleness sweeper reaps later. Sessions are resumable: a live turn clears the mark (memory + column, `_clear_session_ended`). `/_status` rows expose `ended:{ts,reason}`; `/_admin` shows a 🏁 badge. |
-| *(endpoint)* `GET /_admin[?session=][&all=1]` | — | The `/_status` snapshot rendered as HTML for humans (the "proxy admin page"): dark single-page table — warmth (🔥 + time left / ❄️ / ∅), title+sid+cwd+model, hold (until HH:MM, pings n/expected — the WHOLE hold restarts at the user's last organic turn: a real turn re-warms for free, so `until` slides to turn + armed hours, the counter resets, and expected = armed window ÷ ttl; the 24 cap is only the safety bound and is likewise per idle stretch), pingable/awaiting-auth, per-session cost, refusals; header has flags, totals and a since-restart delta. Server-rendered, zero JS, `html.escape` on everything (titles are model output), meta-refresh 10s. Same lab-grade auth posture as the other endpoints (none — localhost). |
-| `WARMTH_AUTH_BOOTSTRAP` (+ `_MODEL`, `_MAX`=2, `_COOLDOWN`=600s) | **on** | **Auth self-bootstrap (user idea 2026-06-10):** when a hold tick finds an ARMED hold stuck on an auth gap, the proxy closes the gap ITSELF — it spawns one minimal trimmed-tools haiku turn (`claude -p "…" --tools Bash`, cwd /tmp; PROMPT BEFORE `--tools`, the flag is variadic and eats a trailing positional — that bug silently killed both live attempts 2026-06-10 until fixed; spawn stderr now surfaces on failure) pointed at its own port (start_proxy.sh exports PORT); the turn flows through the normal handler and re-donates the account's headers. TWO triggers (both = the same needs_auth skip path): the post-restart gap (`restored without credentials`) and **stale-OAuth 401s (added 2026-06-10 after a live hold died of them):** a 401'd ping calls `_invalidate_stale_auth` (drops `_ACCOUNT_AUTH[account]`, flips the entry to needs_auth) and fires the bootstrap — NOT a disarm strike (`last_result:auth_stale`); fresh donation re-attaches via `_resolve_auth` and pings resume. Credentials still never touch the proxy's disk — the spawned CLI reads them from where the CLI always keeps them. Spends real (tiny, ~$0.003) credits autonomously ⇒ tightly bounded: only for a hold that needs it, max 2 consecutive failed attempts **per auth outage** (any fresh donation resets the budget — a long hold legitimately re-auths every OAuth expiry), 10-min cooldown, one in flight, kill switch `WARMTH_AUTH_BOOTSTRAP=0`. The spawn runs under a pre-chosen `--session-id` registered `kind=bootstrap` BEFORE launch (2026-06-10), so the whole session incl. its title side-call is tagged proxy-spawned and stays out of the human's status/admin list. |
-| *(persistence)* restart-amnesia fix | **on** (not a flag) | **Open item (h), SHIPPED 2026-06-10.** Per-proxy runtime state is mirrored to warmth.sqlite and reloaded at startup, scoped by `owner = LOG_DIR` (a scratch port never resurrects the main proxy's sessions): `_HOLD_STATE` → `hold_state` table (mirrored on arm/disarm/every ping; expired rows reaped at load); `_LAST_REQUEST` → `last_request` table (post-transform body + NON-SECRET headers on the writer thread; **auth headers never touch disk** — restored entries are `needs_auth` and pings DECLINE cleanly (`skipped:no_auth`, no failure count, no hold ping-slot burned) until the account's first live request re-donates credentials via the in-memory `_ACCOUNT_AUTH` registry (auth is account-level, not session-level)); `_TOTALS`/`_SESSION_TOTALS` reloaded from the `_totals.json`/`_session.json` snapshots (LOG_DIR-lifetime semantics; `/_status` adds a `totals_since_start` delta); `_META_CWD_DONE` derived from `session_meta`. `/_end` + sweeper delete the mirror rows in step. Explicitly NOT restored (fine to lose): `_SC_FIRED`, `_PENDING_RELAY`, `_UNPRICED_WARNED`. |
-| `WARMTH_SWEEP_INTERVAL` / `WARMTH_LAST_REQUEST_GRACE` / `WARMTH_PURGE_SLACK` | 300s / 600s / 7d | **Housekeeping-only** sweeper (runs when pinger OR ledger on): drops in-memory cached last-requests whose prefix lapsed past the grace (judged by the ledger's last-touch, so an actively-pinged session survives) **plus their companion debug state (context stats, last answer) in step — since the /_end-marker redesign the sweeper is the ONLY cleanup path** (≈ttl+grace retention, ~70min for a 1h one-shot; ended markers + session_meta identity are durable facts and stay), purges warmth rows expired longer than the slack, prunes stale heads. Correctness lives in the READ PREDICATE (`expires_at > now`), never in these deletions — the sweep can run late or never without changing any gate decision. |
-| `STRIP_COMPACT_CACHE` (`STRIP_COMPACT_FORCE`) | off | Drop MESSAGE-level cache_control on a `/compact` request (keep system markers) when history is **not warm** — reclaims the discarded write premium. TWO-STATE gate (2026-06-09): `warm` declines; `cold`/`absent` strip; ledger-off/store-error decline. |
-| `SPLIT_SYSTEM_REST` (`SPLIT_SYSTEM_REST_MARKER`) | off | Move the static system-prose head onto the preceding marked block so it rides as cache_READ not WRITE. Byte-identical text. Win is ~60% of system-prefix carriage **only** for trimmed-tool layouts (which get no global fleet warming anyway, so the split forfeits nothing); for full-tool layouts vanilla's free global warming wins. |
-| `STRIP_SYSTEM_SECTIONS` | on (strips `# Session-specific guidance`) | Remove whole `# Heading` system sections. Marginal carriage; real use = system-prompt-edit mechanism. Set empty if a session needs that section. |
-| `INJECT*` family | off | Request injection: unconditional / marker-gated / `INJECT_FILE` volunteer-context (+`INJECT_FILE_NOTE`). |
-| `RESP_APPEND` / `RESP_REPLACE` | off | Mutate the response text (buffers SSE, re-emits once). |
-| `SHORTCIRCUIT_*` | off | Elide the post-edit "Done." wrap-up turn. See below. |
+| `RELOCATE_ENV_TO_TAIL` / `RELOCATE_CLAUDEMD_PATHSTAMP` | on | Peel volatile `# Environment`/`# currentDate` to a tail reminder; own cache marker for static CLAUDE.md → env-independent shared segment. |
+| `SORT_TOOLS` | on | Alphabetize tools[]; predictability only. |
+| `WB_INTENT_DISPATCH` (+`WB_URL` :9000, `WB_PARSER_TOKEN`, `WB_INTENT_PARSER`) | on | On `/agent/<name>/anthropic/…` routes only: SSE tee POSTs `[wb:action]` intents to the workbench, fire-and-forget; parser loaded from the canonical workbench file. Plain CC traffic never dispatches. |
+| *(provider)* openai/codex routing (`UPSTREAM_OPENAI`, `CODEX_AUTH_FILE`, `CODEX_MODELS_STUB`) | on | `/agent/<name>/openai/…` → ChatGPT codex backend: strip `/v1`, OAuth headers re-read per request from `~/.codex/auth.json` (redacted in captures), models stub, SSE-by-path, zstd decoded observer-side. Server-side caching (`prompt_cache_key` = routing hint only) → NO warmth/transform stack applies. Codex 0.139+ tries a WebSocket first, 403s, falls back (~3–8s) — known codex bug; custom model_provider with `supports_websockets=false` avoids it. |
+| `CANARY` (`CANARY_DIR`) | on | Read-only structural drift detector per (model, beta); appends `_canary/changes.jsonl`. Gaps #1–#3 open: system-block heading lists, control-plane keys, message roles not fingerprinted. |
+| `WARMTH_LEDGER` (`WARMTH_DB`) | on | The SQLite warmth store (see verdicts above). |
+| `WARMTH_BLOCK_COLD_PING` | off (script: on) | Warm-only ping gate; never higher cost. |
+| `WARMTH_PINGER` (`WARMTH_PINGER_MAX`) | on | In-memory replay of a session's last request: `POST /_ping?session=<id>[&force=1]` → cache read, TTL slides, ~1 tok. Auth headers in memory only. |
+| `WARMTH_HOLD` (`_MAX_HOURS` 12, `_MARGIN` 300s, `_INTERVAL` 60s, `_MAX_PINGS` 24) | on | `/warm-cache <n>` arms n hours of IDLE INSURANCE (until = last organic turn + n; every real turn re-anchors + resets counters). Echo-forward arming: proxy injects a `[logproxy]` echo block, the MODEL speaks the ack; command file is default-dead without the proxy. Disarm on expiry/`off`/`/_end`/ping cap/2 failures. |
+| `WARMTH_AUTH_BOOTSTRAP` (`_MODEL`, `_MAX` 2, `_COOLDOWN` 600s) | on | A hold stuck on missing/stale auth (post-restart gap or 401'd ping) makes the proxy spawn ONE minimal haiku turn through itself to re-donate account headers. Bounded; kill switch `=0`. PROMPT BEFORE `--tools` (variadic flag eats positionals). |
+| *(persistence)* restart-amnesia fix | on | Holds / last-request bodies (non-secret headers) / totals / session identity persist in warmth.sqlite scoped by `owner = LOG_DIR`; reload at startup. CREDENTIALS never persist — restored sessions are `awaiting_auth` until the account's next live request re-donates (in-memory `_ACCOUNT_AUTH`, account-level). |
+| *(endpoints)* `GET /_status[?session=][&all=1]`, `GET /_admin`, `GET /_session?session=`, `GET/POST /_ping`, `/_warm`, `/_end` | — | Status JSON (titles/cwd/model/warmth/hold/cost/turns/context); admin = dark HTML render, 10s refresh; /_session = HTML view of the replayable last request (turn-grouped timeline + last answer; codex sessions render view-only, never pingable). `/_end` (SessionEnd hook) = MARKER not delete: disarms hold, stamps ended_at, keeps debug state for the sweeper to reap (~ttl+grace). Bootstrap-spawned sessions tagged `kind:bootstrap`, hidden unless `?all=1`. All unauthenticated, localhost lab-grade (open item g). |
+| `WARMTH_SWEEP_INTERVAL` / `WARMTH_LAST_REQUEST_GRACE` / `WARMTH_PURGE_SLACK` | 300s/600s/7d | Hygiene-only sweeper; correctness never depends on it. |
+| `STRIP_COMPACT_CACHE` | off (script: on) | Warmth-gated: strip message-level cache markers on a cold `/compact`. |
+| `SPLIT_SYSTEM_REST` | off | Ride static system-prose head as cache READ; wins only for trimmed-tool layouts. |
+| `STRIP_SYSTEM_SECTIONS` | on (strips `# Session-specific guidance`) | Remove whole `# Heading` system sections. |
+| `INJECT*` family | off | Request injection (transient, desyncs history — prefer `@file`). |
+| `RESP_APPEND` / `RESP_REPLACE` | off | Mutate response text (durable). |
+| `SHORTCIRCUIT_*` | off | See SC verdict above. RESP_*/relay/SC stay OFF for agent-routed (workbench) traffic. |
 
-`analyze_tools.py` — offline tool-utilization ledger (keys off file CONTENT):
-`python3 analyze_tools.py <dir> --by role|session [--min-turns N]`. Loaded-vs-called
-per tool, prices deadweight.
+`analyze_tools.py` — offline tool-utilization ledger:
+`python3 analyze_tools.py <dir> --by role|session`. Prices deadweight.
 
-## Warmth ledger (SQLite, TWO-STATE) + warmth-gated compact-strip (redesigned 2026-06-09)
-
-The bust-detector for `STRIP_COMPACT_CACHE` and the ping gate. A forked
-keep-warm ping refreshes the ORIGINAL session's content-addressed prefix cache,
-but never lands in the original's JSONL — so **warmth lives on the PREFIX
-LINEAGE, not the session_id**. The proxy can't know warmth from a request alone,
-so it LEARNS it from responses and stores it.
-
-- **STORE: shared SQLite** (`warmth.sqlite` next to logproxy.py; `WARMTH_DB`
-  overrides), WAL mode. Durable across proxy restarts; ONE ledger shared by all
-  proxy ports (was: eight blind in-process dicts). Chosen over Redis: stdlib, no
-  daemon, durable per-commit by default, and no "store unreachable" runtime state
-  to mishandle now that absence triggers action. Only anonymous prefix hashes +
-  timestamps touch disk; `_LAST_REQUEST` (bodies + auth) stays in-process.
-- **TWO-STATE (the 2026-06-09 decision; replaces warm/cold/unknown):** the expiry
-  predicate IS the answer — warm = row exists AND `expires_at > now`; everything
-  else is not-warm. Durable + receipt-confirmed ⇒ **absence ≈ expiry**, so the
-  compact gate may act on absence; the residual loss case (absent-but-warm:
-  pre-store sessions, bypassed traffic) is one bounded ~0.9×H overpay on a
-  one-shot compact. Gates: **ping IFF warm**; **strip IFF not-warm**
-  (`cold`/`absent`); ledger-off/store-error DECLINE on both (can't judge ≠
-  evidence). `warmth_state` still reports `cold` (lapsed row awaiting purge) vs
-  `absent` for logs only — no gate distinguishes them.
-- **EXPIRY IS THE GC:** correctness lives in the read predicate, never in row
-  deletion; the sweeper is hygiene-only (purge slack `WARMTH_PURGE_SLACK`=7d).
-  This fixed a REAL BUG the redesign surfaced: the old in-memory sweeper reaped
-  lapsed entries at bare ttl, erasing the cold evidence the three-state gate
-  required — the strip could only fire within ≤1 sweep interval (300s) of expiry,
-  so the canonical come-back-after-an-hour-and-compact case read `unknown` and
-  silently declined. (The 360s-idle verification run passed only because it sat
-  inside that window.)
-- **WRITE side** (`_record_warmth`): hashes the just-cached POST-transform prefix
-  (blake2b chain over `_stable_sys_text` + messages, cache_control stripped) and
-  upserts `(hash, now, ttl, now+ttl)`. **RESPONSE-CONFIRMED stamp** unchanged:
-  stamps IFF usage proves caching happened (`cache_creation>0` or `cache_read>0`);
-  both-zero is NOT stamped — request is intent, response is the receipt (this
-  discipline is what makes absence≈expiry honest). Failed stamps print LOUDLY
-  (a silent miss would degrade warm→absent, which now strips).
-- **Don't regress:** (1) **depth-scan** — the reused breakpoint sits several
-  messages back from the tail; `_compact_history_warmth` checks every cumulative
-  prefix below the compact prompt (one batched `IN` query); any warm depth ⇒
-  decline. (2) **Exclude the attribution block** (`sys[0]` billing-header with the
-  per-turn `cch=N` counter, out-of-band, does NOT cache) — `_stable_sys_text`.
-- **Verdicts:** live (haiku, 5m): WARM arm declined strip → cache_read=7086;
-  COLD arm (idle 360s) stripped → input=23748, cache_read=0. Plus
-  **`test_warmth_store.py`** (24 offline checks: warm-declines / cold-strips /
-  absent-strips / purge-invariance / off-declines / receipt discipline /
-  restart-durability / session-head + `/_end` / pricing). Run it after any
-  warmth or pricing edit: `python3 test_warmth_store.py`.
-
-## Compact-on-busted-cache economics (verdict, 2026-06-07)
-
-On a busted cache, compacting the **conversation layer** (tools/system are
-identical in both arms and must be subtracted) beats continuing when the summary
-is small. Rule: **compact wins the first turn iff `read + 5S < premium·H`** →
-S < 0.20·H at 1h, S < 0.05·H at 5m (H=history, S=summary). Typical compaction is
-5–15% → wins ~immediately at 1h. The summary's OUTPUT cost (5× input) is the only
-thing keeping it off op1; at 1h it's covered by the 2× write premium that
-continuing pays. `STRIP_COMPACT_CACHE` is the lever that flips 1h from a liability
-to an asset (the stripped compact reads history 1×; continuing cold-rewrites at
-2×). On a WARM cache, stripping is a big LOSS (read 0.10× → input 1.0×) — hence
-the warmth gate.
-
-## SHORTCIRCUIT (SC) — elide the terminal-edit wrap-up turn
-
-A `tool_use` response always gets `stop_reason:"tool_use"`, so even a successful
-terminal edit costs a whole turn to say "Done." SC supplies the missing "last
-action" affordance: when a tool_result continuation is for a SUCCESSFUL terminal
-tool whose dispatch message carried a sentinel in TEXT, the proxy returns a
-synthetic end_turn WITHOUT calling upstream. Config: `SHORTCIRCUIT_DONE=<sc_done>`
-+ `SHORTCIRCUIT_SYSPATCH=1` (best delivery). `SHORTCIRCUIT_ACK` = canned reply.
-- **Use canned-ack, NOT relay** — relay strips the dispatch text block, the CLI
-  rejects the synthetic end_turn and re-sends → 0 net savings on builds.
-- **Delivery axis (controlled A/B):** the model obeys a same-message
-  output-composition directive in a CONVERSATION channel (system OR user msg) but
-  IGNORES one in a tool DESCRIPTION. Winner = **SYSPATCH** (system prompt:
-  cache-rides, invisible, fires 3/3 on sonnet). toolpatch = negative control (0/3).
-- **Prompt strength is the build lever:** BLUNT PROHIBITION + worked exemplar
-  ("the SAME message MUST also contain a past-tense summary ending `<sc_done>`;
-  never send a lone tool call; never defer; no forward narration; assume success")
-  → sonnet trivial 3/3 AND build 3/3, **−49.5% tokens**. GENTLE/temporal/"if it
-  fails react" phrasing → 0/3 (legitimizes deferral).
-- **Model-specific:** only **sonnet** reliably front-loads under "assume success."
-  **opus and haiku DEFER** with adaptive thinking on (emit `[thinking, bare
-  tool_use]`, summarize on the wrap-up turn). Likely lever = thinking mode
-  (untested thinking-off). A miss is FREE (normal wrap-up, no corruption). SC is a
-  high-end optimization — don't bother on haiku.
+**Test suite: `python3 test_warmth_store.py`** (161 offline checks) — run after
+any warmth/pricing/hold/persistence edit.
 
 ## Operational state (VERIFY before continuing)
 
-- **Always launch proxies via `./start_proxy.sh`** (nohup+disown → PPID 1,
-  survives /clear + CLI exit). A Claude Code `run_in_background` Bash job is a
-  CHILD of the CLI and gets reaped on exit — never launch the proxy that way.
-  Kill a port: `kill $(lsof -nP -tiTCP:<port> -sTCP:LISTEN)`.
-- **ONE PROXY (consolidated 2026-06-09, late evening — user decision):** the
-  organic 8-port zoo (7800–7803, 7810–7813) is DECOMMISSIONED. Bare
-  `./start_proxy.sh` = THE proxy: **`:7800` → `logs_main`**, all levers on —
-  code defaults (RELOCATE_*, SORT_TOOLS, CANARY, STRIP_SYSTEM_SECTIONS,
-  WARMTH_LEDGER, WARMTH_PINGER) + script defaults (`STRIP_COMPACT_CACHE=1
-  WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1`). Features are env vars; an
-  experiment arm is just an override on a scratch port:
-  `PORT=7802 LOG_DIR=logs_scratch <flags> ./start_proxy.sh`. The script uses
-  `${VAR-default}` so an explicit `=0`/empty from the caller sticks.
-  - This config has all transforms ON. For a transform-free warmth arm
-    (the retired `:7813` config): `STRIP_COMPACT_CACHE=1` + warmth stack, but
-    `RELOCATE_ENV_TO_TAIL=0 RELOCATE_CLAUDEMD_PATHSTAMP=0 SORT_TOOLS=0 CANARY=0
-    STRIP_SYSTEM_SECTIONS=`.
-  - Retired port→corpus map (for provenance; dirs kept): 7800→logs_live (clean
-    observer), 7801→logs_inject (INJECT_MARKER=Math:), 7802→logs_chatty,
-    7803→logs_inject (SC: SYSPATCH+DONE), 7810→logs_opus (defaults),
-    7811→logs_compact_strip, 7812→logs_forkcache, 7813→logs_compact_warmth.
-  - Restart caveat (DEFANGED 2026-06-10 by the restart-amnesia fix): armed
-    holds, replayable request bodies, totals, session identity and the warmth
-    ledger ALL survive a restart now. The one thing that doesn't is
-    CREDENTIALS (never persisted): restored sessions show `awaiting_auth` in
-    `/_status` and pings resume only after the account's next live request
-    through the proxy re-donates auth. Still avoid restarting mid-experiment
-    (a few seconds of downtime + the auth gap).
-  - `:7800` last restarted 2026-06-10 ~11:26 on the restart-amnesia + /_admin
-    code; the `[logproxy]` ack-attribution (anti-ambush) fix went live with
-    the same restart. The user hold armed until ~13:34 was carried ACROSS the
-    restart by pre-seeding the new `hold_state`/`last_request` tables from the
-    old process's `/_status` + newest capture (one-off migration; future
-    restarts carry state automatically). Sanity-check anytime:
-    `curl -s localhost:7800/_status` or eyeball `localhost:7800/_admin`.
-  - (`:7799` and `8080` are the human's — leave alone.)
-- **`/warm-cache` registers as a SKILL in Claude Code sessions** (the
-  user-level command file `~/.claude/commands/warm-cache.md` shows up in the
-  skill list). It works from ANY project whose session routes through the
-  proxy; without the proxy it self-diagnoses ("proxy not active — hold NOT
-  armed", one cheap real turn).
-- **Git: repo initialized 2026-06-09** (first commit = post-rework code).
-  `.gitignore` excludes `logs*/`, `*.out`, `warmth.sqlite*`, `_canary/`. Commit
-  after meaningful changes — the lab finally has undo.
-- **Key captures:** `logs_live/` (38× carriage data + subagent spawns) ·
-  `logs_chatty/` (tool-trim, fat 4bcf519f / lean a0f0c609) · `logs_compact_warmth/`
-  (warm fork cdcd1b7e / cold f5c27104) · split/reloc A/B pairs (`logs_split5m_on|off`,
-  `logs_reloc2_on|off`) · `logs_scratch/329a6d9b-*` (hold-warm live drill
-  2026-06-10: arm sentinel intercept `004-*`, auto-ping WARMED, disarm, `/_end`).
+- **RELEASE MODEL (since v0.1.0, 2026-06-11): the official `:7800` proxy runs
+  FROM `releases/current`** (a frozen git worktree of a tag), NOT from this
+  working tree — dev edits/restarts here never disturb the agents on :7800.
+  Cut: `./release.sh vX.Y.Z` (clean tree + test suite gated, tags, worktree,
+  flips the `releases/current` symlink). Deploy: `./run_release.sh` (restarts
+  :7800 from releases/current; LOG_DIR/WARMTH_DB/OUT pinned to the lab root so
+  state+captures carry across releases; sources gitignored `release.env` —
+  the home for `WB_PARSER_TOKEN` at the workbench flip).
+- **Proxies launch via `./start_proxy.sh` / `./restart_proxy.sh`**
+  (nohup+disown → PPID 1; a `run_in_background` Bash job dies with the CLI —
+  never launch the proxy that way). start refuses a bound port; restart kills
+  + starts. Script defaults add `STRIP_COMPACT_CACHE=1 WARMTH_BLOCK_COLD_PING=1
+  WARMTH_LOG_FILE=1`; `${VAR-default}` so an explicit 0/empty sticks.
+  Experiment arm = scratch port from the dev tree: `PORT=7802
+  LOG_DIR=logs_scratch <flags> ./start_proxy.sh`.
+  Sanity: `curl -s localhost:7800/_status` or `localhost:7800/_admin`.
+- **`:7799` and `:8080` are the human's — leave alone** (:7799 is an old
+  logproxy writing to `logs/` — don't archive/touch `logs/`).
+- Restarts are safe-ish (state persists; only credentials gap, which the auth
+  bootstrap closes) but avoid mid-experiment. This Claude Code session does
+  NOT route through :7800 — drills must set `ANTHROPIC_BASE_URL` explicitly.
+- **`/warm-cache` is a user-level skill** (`~/.claude/commands/warm-cache.md`);
+  works from any project routed through the proxy, self-diagnoses otherwise.
+  SessionEnd→`/_end` hook installed user-level in `~/.claude/settings.json`
+  (pinned to :7800; scratch ports rely on the sweeper).
+- **Old experiment captures moved to `logs_archive/` (2026-06-11)** — dir
+  names unchanged (logs_live, logs_chatty, logs_compact_warmth, logs_inject,
+  logs_codexprobe, …; retired port→corpus map in archive-2026-06-11). Live
+  dirs at root: `logs_main` (:7800) and `logs` (:7799). All gitignored.
+- Git since 2026-06-09; commit after meaningful changes.
 
 ## Open / next
 
-- (a) **DONE (2026-06-09): proxy-side replay pinger** (`WARMTH_PINGER`, on). The
-  old plan ("wire `WARMTH_PING_SENTINEL` to a fork-ping") was overkill — a fork
-  has to reconstruct tools/cwd/system/history just to smuggle a sentinel turn the
-  proxy then recognizes. Replaced by: the proxy caches each session's exact
-  post-transform last request in memory; `POST /_ping?session=<id>` replays it
-  (thinking off, `max_tokens:1`) → cache read, TTL slides, ~1 output tok. The
-  caller needs only the session_id. Non-warm prefixes (cold/unknown) self-skip — ping only refreshes warm (force=1 to override).
-  **DONE (2026-06-10): the outer driver** — shipped IN-PROXY as the
-  `/warm-cache` hold (user decision: in-band arming beats an external loop —
-  the session_id rides in free, the duration is dynamic per arm). See the
-  `WARMTH_HOLD` flag-table row + NOTE TO SELF. **Ping economics:** at 1h TTL
-  one ping ≈ one warm read buys a full hour ≈ 19:1 → a 1h-main-agent move; the
-  hold CAPS the count (24) + clamps duration (12h). At 5m it's a bad bet (~12
-  pings/hour — the arming ack warns). The sentinel path (`WARMTH_PING_SENTINEL`
-  + `_is_warm_ping`) is now legacy/optional — kept only because
-  `WARMTH_BLOCK_COLD_PING` and `_record_warmth` still recognize it; the replay
-  pinger is the recommended route.
-  **Session teardown (2026-06-09; SUPERSEDED 2026-06-11 — `/_end` is now a
-  MARKER, not a delete, see the `/_status` flag-table row):** `GET/POST
-  /_end?session=<id>[&reason=]` forgets
-  a session's cached request — wire to the CLI **SessionEnd hook** (`reason` =
-  clear/logout/prompt_input_exit/other; hook gets `session_id`+`reason` on stdin).
-  Hook is precise but misses crashes/`kill -9` → the background sweeper is the
-  backstop. All in-memory soft-state: over-eager cleanup only costs a re-cache.
-  **Verified live (2026-06-09, `logs_endexp` + `/tmp/clearexp`):**
-  - **Hook session_id == wire session_id** (the open caveat — RESOLVED). SessionEnd's
-    `session_id` matched the proxy's `metadata.user_id` session; `/_end` dropped the
-    cached entry (`last_request:true, session_head:true`), and a later `/_ping`/`/_warm`
-    for it correctly returns not-found.
-  - **`/clear` DOES emit `SessionEnd reason:"clear"` mid-session AND rotates the
-    session_id** (turns before ran under sid-A, turns after under a fresh sid-B). The
-    hook fired while the process was still alive and `/_end` dropped sid-A. NOTE: a
-    first, BROKEN run had concluded the opposite ("/clear fires nothing, one session,
-    reason other") — that was an ARTIFACT of piping all stdin then immediate EOF, so
-    `claude -p` drained the buffer and exited before `/clear` could act mid-stream.
-    **To drive a live multi-turn stream-json session you MUST hold stdin open** (FIFO
-    + a held write fd; send turns with pauses; close the fd only to end). Lesson:
-    don't trust a streaming-CLI result from a here-string/`printf | claude` — it EOFs.
-  - **EOF alone does NOT terminate headless `claude -p` stream-json** — after closing
-    the write fd, our claude stayed alive (deadlocked our `wait`); it took a `kill`,
-    which then fired the 2nd SessionEnd (`reason:"other"`) for sid-B. So a long-lived
-    stream-json driver needs an explicit shutdown signal, not just stdin close.
-  - **Replay pinger works on the real wire:** `/_ping` returned `cache_read=5681,
-    output=1`, `remaining_s` reset to 3600. **BUGFIX found by the live test:** the
-    CLI request carries `context_management: clear_thinking_*`, which 400s if you
-    strip `thinking` ("requires thinking enabled") — so `_warm_session` now drops
-    BOTH `thinking` and `context_management` (neither is in the cached prefix).
-    Note a tiny `cache_creation` (~760 tok) per ping: the cached tail message sits
-    just past the last breakpoint so it re-writes incrementally — bulk still reads.
-- (b) **DONE (2026-06-10): statusline cache-warmth display.** Script:
-  `~/tmp/proxy-sl-test/.claude/status-line.sh` — polls
-  `GET /_warm?session=<sid>` (0.2s curl timeout) and renders the expiry as
-  wall-clock (`🔥cache→HH:MM` / `❄️cache busted /compact` / dim `cache ∅`),
-  plus dual cost (CLI stdin `.cost.total_cost_usd` vs the proxy's
-  `_session.json` `est_usd`). statusline-stdin session_id == wire session_id
-  (verified). Next iteration: read `/_status` for title + hold display.
-- (c) Deterministic transcript CLEANER (Tier-1 lossless bookkeeping-noise strip,
-  Tier-2 supersession: stale Read before a later Edit/Write → stub) before any AI
-  compaction. Stubs must stay non-empty + keep tool_use/tool_result paired.
-  Measure % reclaimed on a heavy edit session.
-- (d) **DONE (2026-06-09): external warmth store.** SQLite chosen over Redis
-  (stdlib/no daemon; durable per-commit by default vs RDB/AOF config care;
-  no "store unreachable" state to mishandle once absence triggers action) —
-  see the Warmth ledger section. Two-state superseded the `ttl+grace`
-  positive-bust carve-out: with a durable receipt-stamped store, absence≈expiry
-  and the compact gate acts on it directly. `_LAST_REQUEST` (bodies+auth)
-  stayed in-process as specified.
-- (e) Fix `_classify_role` mislabeling opus parents as `unknown` (cosmetic — opus's
-  headless system prompt lacks the "Claude Code" signature). **fable-5 has the same
-  issue** (its 4-tool parent turn logged `ext/unknown`) — capture to diff:
-  `logs_compact_warmth/7bc2d1d6-*/`.
-- (f) **DONE (2026-06-09): pricing blindness fixed.** Totals now carry
-  `unpriced_requests`/`unpriced_models`, `[dump]` flags `UNPRICED` traffic and a
-  once-per-model warning fires; `analyze_tools.py` no longer silently prices
-  unknown models at sonnet rates (flags the assumption instead). **fable-5 rates
-  added: $10/$50 per MTok = exactly 2× opus-4.8** (cache: write 12.5/20, read 1.0).
-  Fixing this surfaced TWO latent pricing bugs, both fixed: (1) `_price_for`
-  claimed longest-prefix matching but returned first-dict-hit; (2) `PRICES` had
-  ONE `claude-opus-4` entry at $15/$75 — that's 4.0/4.1 pricing; **opus repriced
-  at 4.5 to $5/$25**, so all opus-4.5+ captures (e.g. `logs_opus`) were priced
-  ~3× too high — re-derive any USD conclusion drawn from them (token counts are
-  unaffected). Also: `_billing` now prices a flat `cache_creation_input_tokens`
-  (at the 5m rate, flagged in `price_basis`) instead of silently dropping write
-  cost when the 5m/1h split is absent.
-- (g) Endpoint hardening (lab-grade today): `/_ping` `/_end` `/_warm` `/_status`
-  `/_admin` are unauthenticated on localhost. Also note the proxy can now SPAWN
-  a CLI turn on its own (auth self-bootstrap — bounded to 2 attempts/process,
-  hold-triggered only, kill switch `WARMTH_AUTH_BOOTSTRAP=0`). `/_ping` SPENDS user credits (replays with
-  cached auth headers), `force=1` can even cold-write big prefixes repeatedly;
-  `/_end` lets any local proc drop state; `/_status` exposes titles/cwds/costs
-  (read-only); the armed hold spends a ping (~0.10× prefix read) per TTL window
-  autonomously — bounded by clamp + ping cap. Fine for a private lab box; gate
-  with a token before any shared-host use. Related known gaps: ~~cached auth
-  headers can go STALE (OAuth expiry) → ping 401s, no refresh~~ **FIXED
-  2026-06-10** after a live hold died exactly this way (aac68362, two 401s →
-  disarm → the 18:48 /compact found cold): a 401'd ping now invalidates the
-  stale bearer + fires the auth bootstrap (see the flag-table row) instead of
-  counting a disarm strike; `_cache_last_request` stores at REQUEST
-  time, so a failed turn leaves an unconfirmed last-request whose hash the ledger
-  never stamped → pings decline (`unknown`) until the next good turn (fail-safe but
-  loses pingability); ping TOCTOU (warm check vs arrival) — the hold pings inside
-  the margin (default 300s), never at the TTL edge.
-- (h) **DONE (2026-06-10): restart-amnesia / state reconstruction.** Shipped
-  exactly per the piece-by-piece plan — see the "(persistence) restart-amnesia
-  fix" row in the flag table for what persists where and the auth re-donation
-  mechanism (`_ACCOUNT_AUTH`, account-level). Verified: 16 new offline checks
-  in `test_warmth_store.py` (holds survive / expired reaped / secrets never on
-  disk / no_auth declines / donation / stale-row reap / totals+since_start /
-  cwd_done) + a live drill on `:7802` (arm → kill → restart → hold+body
-  restored `awaiting_auth` → live turn from another session of the account
-  donated auth → `/_ping` WARMED with cache_read=30901 on a body the new
-  process never saw live). Design choices worth remembering: rows are scoped
-  by `owner = LOG_DIR` so scratch ports don't double-ping the main proxy's
-  sessions; restore applies the sweeper's own staleness predicate (warmth-
-  ledger-based, NOT row ts) so actively-pinged sessions survive but stale rows
-  are reaped instead of resurrected; `_hold_decision` gained `has_auth` so an
-  auth-less hold SKIPS without burning a ping slot.
+- (c) Deterministic transcript cleaner (Tier-1 bookkeeping strip, Tier-2
+  supersession stubs; must be warmth-gated). Measure % reclaimed.
+- (e) `_classify_role` mislabels headless parents (`ext/unknown`) — accept the
+  "Claude Agent SDK" header (fable capture to diff:
+  `logs_archive/logs_compact_warmth/7bc2d1d6-*/`).
+- (g) Endpoint hardening before any shared-host use (token-gate /_ping /_end
+  /_warm /_status /_admin; /_ping spends credits, bootstrap spawns turns).
+- Canary gaps #1–#3: fingerprint system-block heading lists, control-plane
+  keys (`thinking.type`, `output_config`, `context_management`), message
+  roles. Plus: refusal counter in totals (canary can't see responses).
+- A/B `--exclude-dynamic-system-prompt-sections` vs RELOCATE_ENV_TO_TAIL.
+- WB flip remainder: `WB_PARSER_TOKEN` into start_proxy.sh env; optional
+  usage-emit to `/api/proxy/usage`; then flip `WB_PROXY_PORT→7800`.
+- Statusline TITLE display (statusline already polls /_status for
+  warmth/hold/turn; script `~/tmp/proxy-sl-test/.claude/status-line.sh`).
+- Measured A/B: proxied all-levers vs vanilla 1P.
+- Carryovers: writer thread swallows exceptions (`except: pass` — add dropped
+  counter); `_LAST_REQUEST` cap generous; `_META_CWD_TRIES`/`_ACCOUNT_AUTH`
+  grow unbounded (tiny); SC priors are 4.x-only.
 
-## Model-switch day (2026-06-09): claude-fable-5 observations
+## fable-5 intel (2026-06-09/10; condensed — full notes in archives)
 
-User switched the CLI default to **`claude-fable-5`** (`/model`). Verified ON THE
-WIRE (captures: `logs_compact_warmth/7bc2d1d6-*/`):
-- The model is REAL upstream: CLI sends `claude-fable-5[1m]` (same `[1m]` 1h-cache
-  suffix convention), backend `resolved_model: claude-fable-5`, answers correct.
-- **CANARY VALIDATED LIVE:** first fable traffic fired `new namespace baseline`
-  for both namespaces (bare + claude-code beta) exactly as designed — this is the
-  drift detector doing its job on a brand-new model id.
-- **Wire shape is structurally IDENTICAL to haiku-4-5:** 3 sys blocks (same headers
-  + size buckets: billing-header / "You are a Claude agent…" / interactive-agent
-  block), 4 tools, 3 cache markers, no 4th marker. So the version-fragile
-  transforms (RELOCATE_*/STRIP_SYSTEM_SECTIONS/SPLIT) most likely still apply — but
-  A/B-verify before trusting numbers on fable.
-- **NEW beta flags** vs haiku namespaces: `effort-2025-11-24`,
-  `mid-conversation-system-2026-04-07`, `fallback-credit-2026-06-01`,
-  `context-1m-2025-08-07`. `mid-conversation-system` smells relevant to our
-  system-edit levers — investigate.
-- Known immediate impacts: pricing blind (open item f), role classifier `unknown`
-  (open item e). Model-specific priors (SC defer behavior, tool-trim token counts,
-  prompt-strength results) were measured on 4.x — re-validate on fable before
-  relying on them.
-- **Identity caveat for sessions**: a mid-session `/model` switch does NOT rewrite
-  the already-in-context system prompt — a session started under model X keeps
-  claiming to be X. Self-reports are context text, not weight introspection; trust
-  the wire (`resolved_model`), not the label.
-
-### fable's control-plane keys (2026-06-10, capture key-diff; user-prompted)
-
-Fable requests carry body keys with SERVER-side semantics we can't see
-structurally — "reacts to unknown keys" (user). Key diff across captures:
-- `thinking: {"type": "adaptive"}` — FABLE-ONLY (haiku: enabled+31999 budget,
-  opus: disabled). Unknown trigger semantics; likely implicated in SC defer
-  behavior; coupled to `context_management` (clear_thinking edits 400 without
-  thinking — the pinger bug). **Rule: mutate `thinking`/`context_management`
-  together or not at all.**
-- `output_config: {"effort":"high"}` — fable+opus (haiku none); materializes
-  `CLAUDE_EFFORT` via beta `effort-2025-11-24`. If effort modulates output
-  depth it scales the 5×-priced side silently. **Rule: pin CLAUDE_EFFORT in
-  every A/B arm; re-derive fable output economics with effort in mind.**
-- `context_management: clear_thinking_20251015, keep:"all"` — all models,
-  currently a no-op that CONSTRAINS request shape (see coupling above).
-- **CANARY GAP #2:** none of these keys are fingerprinted (betas/tools/system
-  only) — a default flip of `effort`/`thinking.type` would never fire. Cheap
-  fix alongside the heading-list idea: fingerprint control-plane keys
-  (`thinking.type`, `output_config` sans schemas, `context_management` edit
-  types).
-- **`mid-conversation-system` SEEN LIVE (2026-06-10, `logs_main/aac68362-*`):**
-  the CLI ships the Agent-tool roster as a trailing `role:"system"` message in
-  `messages[]`, appended AFTER the final user message of the turn where it
-  first materializes. Because the CLI's cache markers go on USER messages
-  only, such trailing system content is structurally uncacheable on its debut
-  turn: billed 1× input once, cache-written on the NEXT turn, cached
-  thereafter (verified by exact arithmetic: 007 read 6405 + wrote 657 = 7062
-  = 008's and 009's read). Not worth a proxy fix (a marker costs one of 4
-  breakpoints to save a one-time 1× ride). **CANARY GAP #3:** message roles
-  aren't fingerprinted — a CLI moving content into mid-conversation system
-  messages is invisible; cheap fix: add the set/count of non-user/assistant
-  roles to the fingerprint. Code that assumes user/assistant-only messages
-  (`_classify_role`, relocate, `/_session` renderer) should be audited
-  against this shape.
-
-### fable's server-side refusal classifier (2026-06-10, caught live by the proxy)
-
-A user-run interactive CLI through `:7800` with a custom **workbench**
-multi-agent system prompt (32k ch: `[wb:dm]/[wb:post]` intent syntax,
-wrap-daemon/forge-event/transcript-path prose) sent user message "2+2" and got
-hard-blocked UPSTREAM. Capture: `logs_main/396a2918-*/021`.
-
-- **Wire shape (NEW):** `message_start` → `message_delta` with
-  `stop_reason:"refusal"` and structured `stop_details: {type:"refusal",
-  category:"reasoning_extraction", explanation:"…Terms of Service restrictions
-  on reverse engineering or duplicating model outputs…", fallback_credit_token:
-  null, fallback_has_prefill_claim:null}` → `message_stop`. ZERO content
-  blocks, `thinking_tokens:0` — the model never ran; this is a classifier in
-  front of it, a separate enforcement layer from text-level refusals.
-  `fallback_credit_*` ties to the `fallback-credit-2026-06-01` beta — possibly
-  a credit-refund path for blocked requests (null here; nothing refunded).
-- **Trigger = system prompt CONTENT, not the message and not the proxy.** The
-  classifier reads descriptions, not behavior: our proxy (which actually
-  captures every byte) sails through because its wire shape stays canonical;
-  the workbench prompt merely *describes* transcript/event logging and gets
-  convicted. Keyword cluster suspected: `transcript_path` / "log every CLI
-  session event" / wrap-daemon prose.
-- **MODEL-GATED:** fable-only; the identical prompt runs fine on opus-4.8 and
-  haiku same day ⇒ classifier sits on the new model's endpoint (asset
-  protection for the newest weights, not account-level ToS enforcement).
-- **Soft threshold, not a rule:** a 2-line intent-system preamble up front
-  clears turn 1, but it re-fires non-deterministically on later turns as
-  protocol-flavored text accumulates in context. Worst failure mode for a
-  persistent agent: random mid-session kills.
-- **CLI hides the truth:** the visible error is a generic "Session paused —
-  Fable 5 has safety measures that flag … cybersecurity or biology topics"
-  toast (+ /feedback link). Category, ToS claim, and request_id are all wire-
-  only. Anyone debugging from the UI would blame their *message* forever.
-- **Billing/warmth interactions:** the refused turn still bills the full
-  prefix cache write (47,374 tok 1h ≈ $0.97 here), and `_record_warmth`
-  correctly stamps it (`cache_creation>0` — caching DID happen). A refused
-  prefix is a warm prefix; a mid-session block that forces a retry pays
-  carriage twice.
-- **TODO hook:** refusal counter in `_totals.json` + `[dump]` flag (see NOTE
-  TO SELF). Canary can't see this — it fingerprints requests, not responses.
-
-### fable-probe (2026-06-09, first experiment on THE consolidated proxy)
-
-Scenario `fable-probe` in proxy-experiments (`--session <uuid>` re-verdicts free).
-Capture: `logs_main/b3618fc5-*`. Procedure: seed `logs_main/_canary` from the old
-`logs_compact_warmth/_canary` baselines (canary state is per-LOG_DIR and
-lazy-loads on first messages request — seed BEFORE first traffic), then one
-headless 4-tool fable-5 Write task through `:7800`. Verdicts:
-- **Structure unchanged, TEXT IS NOT — see "Prompt families" below.** The
-  canary verdict ("same 3-block structure, same 3-marker layout, 1h ttl on the
-  headless main agent") is STRUCTURE-ONLY: hdr-prefix + coarse size buckets,
-  and it never compares ACROSS models (namespace = model|beta). The USER then
-  eyeballed the capture and found a real model-gated text difference the
-  fingerprint is blind to. Beta deltas vs interactive baseline (offline fp
-  diff): headless DROPS `context-1m-2025-08-07`; build stamp differs
-  (`cc_version=2.1.170.3` vs `2.1.170.ba7`).
-- **Detector works end-to-end:** new (model|beta) namespaces fired `baseline`
-  exactly once, the follow-up request fired `match`; the offline
-  `_fp_diff_offline` (in experiments.py) pinpointed the deltas above.
-- **Transforms HOLD on fable headless:** `env_relocate` fired (`# Environment` +
-  `# currentDate` → tail reminder, userEmail-bundle fallback path — scratch cwd
-  has no CLAUDE.md), `system_strip` removed `# Session-specific guidance`
-  (528 ch), tool_sort idempotent no-op (already alphabetical). 3 markers, no 4th.
-- **NEW: per-session TITLE-GENERATOR side-call** (seq 2 of the session): 0 tools,
-  0 markers, own namespace (beta adds `structured-outputs-2025-12-15`), system =
-  "Generate a concise, sentence-case title (3-7 words)…", `cc_entrypoint=sdk-cli`.
-  Tiny but it's real traffic through the proxy — remember it when counting turns.
-- **Open item (e) root cause confirmed:** headless sys[1] says "Claude Agent
-  SDK", not "Claude Code" — that's the exact header `_classify_role` should also
-  accept to stop logging headless parents as `ext/unknown`.
-
-### Prompt families are MODEL-GATED (2026-06-09, user-spotted, verified on wire)
-
-User noticed `# Communicating with the user` in the fable capture — absent from
-opus-4.8. Verified by running opus-4.8 through `:7800` the SAME day, same CLI,
-plus heading-diffs of old main-agent captures:
-- **classic family** (~13–14k ch): `# System / # Doing tasks / # Executing
-  actions with care / # Using your tools / # Tone and style / # Text output /
-  # Session-specific guidance / # Environment / # Context management` —
-  sonnet-4-6 (Jun 3) AND haiku-4-5 interactive on Jun 9 (same CLI era as fable).
-- **harness family** (~2.3–3.1k ch): `# Harness / # Context management`
-  (+ guidance) — opus-4.8, both Jun 6 captures and TODAY's live probe
-  (`logs_main/aeea8dcd-*`). No `# Communicating with the user`.
-- **harness + `# Communicating with the user`** (~6.3k ch post-strip): fable-5
-  ONLY — a big new output-style/communication section (lead-with-outcome,
-  readable-over-concise…). Same day, same CLI, haiku still classic ⇒ the family
-  is keyed on MODEL, not CLI version. Relevant to SC prompt-strength priors
-  (output-composition directives!) — re-validate SC on fable with this in mind.
-- **SAMPLING TRAP (burned us in this very analysis):** the first request of a
-  `claude -p` session is the 1,213-ch TITLE-GENERATOR side-call (0 tools, flat
-  prompt). Naively sampling "first request per session dir" reads the title
-  prompt, not the main-agent prompt — filter `tools > 0` first.
-- **Canary gap exposed:** size buckets + 48-ch hdr prefix missed a multi-kchar
-  section swap (and cross-model diffs are out of scope by design). CHEAP FIX
-  CANDIDATE: add the `^# heading` list of each sys block to the fingerprint —
-  section-level rewrites within a namespace would then fire drift.
-- **Family-map nuance (sysprompt-probe arm A):** headless haiku TODAY = classic
-  family too (11.9k ch, `# System/# Doing tasks/…`), so classic-vs-harness is
-  model-gated in BOTH modes. The "You are an interactive agent…" OPENING LINE is
-  shared by both families — it is NOT a family discriminator; use the heading
-  list. (Headless classic carries no `# Environment` in system — env rides the
-  msg0 bundle; interactive classic has it in system.)
-
-### sysprompt-probe (2026-06-09): --system-prompt-file + canary positive test
-
-Scenario `sysprompt-probe` (A=control vs B=`--system-prompt-file` sentinel,
-haiku, captures `logs_main/3cdb9570*/1e8a97c5*` + rerun `ce935492*`):
-- Replacement semantics: see the new bullet in "Native answers" above.
-- Our transforms coexist with a custom prompt: `env_relocate` still fired on
-  arm B; `system_strip` fired on the default prompt (headless classic also has
-  `# Session-specific guidance`, 528 ch).
-- **CANARY POSITIVE TEST PASSED, both directions:** B fired
-  `structural_change` (interactive-agent block → TESTBOT, size_bucket 13→7)
-  inside the namespace arm A had just touched; the RERUN's arm A then fired the
-  drift BACK (TESTBOT → default). Detect-and-rebaseline works as designed. A
-  deliberate prompt swap is now the canonical way to smoke-test the detector.
+- Wire shape structurally identical to 4.x (3 sys blocks, 3 markers);
+  transforms hold. New betas incl. `effort`, `mid-conversation-system`
+  (SEEN LIVE: Agent-roster as trailing `role:"system"` message — uncacheable
+  on debut turn, 1× once, cached next; audit user/assistant-only assumptions).
+- **Control-plane keys:** `thinking:{type:adaptive}` (fable-only) is COUPLED
+  to `context_management` — mutate both or neither (the pinger 400 bug).
+  `output_config:{effort:high}` scales the 5×-priced output side — pin
+  CLAUDE_EFFORT in every A/B arm.
+- **Server-side refusal classifier** (fable endpoint only): can hard-block on
+  system-prompt CONTENT (`stop_reason:"refusal"`, structured stop_details,
+  zero content blocks, model never ran). Workbench-style "log every event"
+  prose triggers it; non-deterministic on later turns; CLI shows a generic
+  toast — the truth is wire-only. A refused turn still bills (and warms) the
+  full prefix write. Workbench stays on 4.x; classifier-weather probe =
+  workbench prompt + "2+2" through :7800.
+- **Prompt families are MODEL-gated** (same CLI, same day): classic (~13k ch,
+  sonnet/haiku) vs harness (~2-3k, opus) vs harness+`# Communicating with the
+  user` (fable). Sampling trap: a session's FIRST request is the 1.2k-ch
+  title side-call — filter `tools > 0` before sampling prompts.
+- Mid-session `/model` switch does NOT rewrite the in-context system prompt —
+  trust `resolved_model` on the wire, not self-reports.
+- fable pricing: $10/$50 per MTok (2× opus-4.8); cache write 12.5/20, read 1.0.
