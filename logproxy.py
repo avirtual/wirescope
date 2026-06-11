@@ -69,12 +69,178 @@ _ROUTE = re.compile(r"^/agent/(?P<name>[A-Za-z0-9_.-]+)/anthropic(?P<rest>/.*)?$
 # pre-flights, but the CLI stamps these on EVERY request, and they identify the
 # calling CLI process/build/account (the "who sent this" the metadata omits).
 # Secrets are redacted — never write the caller's API key to disk.
-_SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization"}
+_SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization",
+                   "chatgpt-account-id", "openai-api-key"}
 
 
 def _safe_headers(headers):
     return {k: ("<redacted>" if k.lower() in _SECRET_HEADERS else v)
             for k, v in headers.items()}
+
+
+# --- OPENAI / CODEX PROVIDER (route + capture only; 2026-06-11) ----------------
+# /agent/<name>/openai/<rest> routes to the OpenAI-side upstream. Default
+# upstream is the ChatGPT backend — the only OpenAI-wire client in the fleet is
+# codex in ChatGPT-OAuth subscription mode; set UPSTREAM_OPENAI=
+# https://api.openai.com for platform API-key traffic (no rewrite then).
+#
+# CAPTURE + ROUTING only. None of the Anthropic levers (cache transforms,
+# warmth ledger/pinger/hold, canary, SC) applies on this wire: caching is
+# SERVER-side (prompt_cache_key is a routing hint; the cache itself is
+# content-addressed across sessions — verified live, cached_tokens grew across
+# distinct session uuids) and usage exposes it per turn
+# (input_tokens_details.cached_tokens). Codex request bodies are
+# zstd-compressed; we decode OBSERVER-SIDE for the capture and forward the
+# ORIGINAL bytes + content-encoding untouched.
+#
+# ChatGPT-backend mode (ported from agent-workbench components/proxy/proxy.py
+# #2342/#2346, probed live in logs_codexprobe/):
+#   * strip the /v1 path prefix (backend serves /responses, not /v1/responses)
+#   * replace Authorization with the OAuth bearer + chatgpt-account-id from
+#     ~/.codex/auth.json, RE-READ PER REQUEST (codex's own refresh rewrites it;
+#     never copied anywhere — same never-persist posture as _ACCOUNT_AUTH)
+#   * stub GET /v1/models (the backend has no platform model-list endpoint)
+#   * treat POST /responses as SSE no matter the content-type (success
+#     responses can arrive with NO content-type header at all)
+# Codex 0.139+ tries a WebSocket to /responses first; we don't speak WS, codex
+# retries ~5x (~3-8s) then falls back to HTTP POST — long-standing codex bug,
+# nothing to fix proxy-side (a WS passthrough is the eventual cure).
+_ROUTE_OPENAI = re.compile(r"^/agent/(?P<name>[A-Za-z0-9_.-]+)/openai(?P<rest>/.*)?$")
+UPSTREAM_OPENAI = os.environ.get("UPSTREAM_OPENAI",
+                                 "https://chatgpt.com/backend-api/codex")
+CODEX_AUTH_FILE = Path(os.environ.get(
+    "CODEX_AUTH_FILE", str(Path.home() / ".codex" / "auth.json")))
+# model ids served by the /v1/models stub (content barely matters to codex —
+# it only needs a 200 with the {"models":[...]} shape)
+CODEX_MODELS_STUB = [m for m in os.environ.get(
+    "CODEX_MODELS_STUB", "gpt-5.4").split(",") if m]
+_CODEX_STATS = {"requests": 0, "responses": 0, "input_tokens": 0,
+                "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
+                "errors": 0}
+
+try:                                    # stdlib since 3.14
+    from compression import zstd as _zstd
+except Exception:                       # pragma: no cover — py<3.14
+    _zstd = None
+
+
+def _content_decode(raw, encoding):
+    """Observer-side body decode for the capture. Returns (bytes, error|None);
+    on any failure the RAW bytes come back — capture degrades, forward never."""
+    enc = (encoding or "").lower().strip()
+    if not raw or enc in ("", "identity"):
+        return raw, None
+    try:
+        if enc == "zstd":
+            if _zstd is None:
+                return raw, "zstd: stdlib compression.zstd unavailable"
+            return _zstd.decompress(raw), None
+        if enc == "gzip":
+            import gzip
+            return gzip.decompress(raw), None
+        if enc == "deflate":
+            import zlib
+            return zlib.decompress(raw), None
+    except Exception as e:
+        return raw, f"{enc}: {e}"
+    return raw, f"unknown content-encoding: {enc}"
+
+
+def _is_chatgpt_backend(upstream):
+    return "chatgpt.com/backend-api" in (upstream or "")
+
+
+def _read_codex_auth(path=None):
+    """(access_token, account_id) from codex's auth.json; (None, None) on any
+    error — the request then forwards as-is and upstream rejects it cleanly."""
+    try:
+        data = json.loads((path or CODEX_AUTH_FILE).read_text())
+        tokens = data.get("tokens") or {}
+        return tokens.get("access_token"), tokens.get("account_id")
+    except Exception:
+        return None, None
+
+
+def _rewrite_chatgpt_request(upstream_path, headers, auth_path=None):
+    """Strip the /v1 prefix and swap in ChatGPT OAuth headers (mutates and
+    returns `headers`). Path untouched when auth.json is unreadable — a clean
+    upstream 401 beats a half-rewritten request."""
+    access_token, account_id = _read_codex_auth(auth_path)
+    if not access_token:
+        return upstream_path, headers
+    if upstream_path.startswith("/v1/"):
+        upstream_path = upstream_path[3:]
+    elif upstream_path.split("?")[0] == "/v1":
+        upstream_path = "/" + upstream_path[3:].lstrip("/")
+    for k in list(headers):
+        if k.lower() == "authorization":
+            del headers[k]
+    headers["authorization"] = f"Bearer {access_token}"
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    # mirror codex's native headers so upstream's client classifier stays happy
+    headers.setdefault("originator", "codex_cli_rs")
+    headers.setdefault("openai-beta", "responses=experimental")
+    return upstream_path, headers
+
+
+def _sse_text_delta(obj, wire):
+    """Assistant text out of one decoded SSE data object, per wire dialect."""
+    if wire == "openai":
+        if obj.get("type") == "response.output_text.delta":      # Responses API
+            d = obj.get("delta")
+            return d if isinstance(d, str) and d else None
+        choices = obj.get("choices")                             # Chat Completions
+        if isinstance(choices, list) and choices:
+            c = (choices[0].get("delta") or {}).get("content")
+            return c if isinstance(c, str) and c else None
+        return None
+    if obj.get("type") != "content_block_delta":                 # anthropic
+        return None
+    delta = obj.get("delta") or {}
+    if delta.get("type") == "text_delta":
+        return delta.get("text") or None
+    return None
+
+
+def _parse_openai_response(blob):
+    """Usage/meta out of a captured Responses-API SSE stream (or a plain JSON
+    error body — 4xx come back unframed). response.completed carries the FULL
+    response object incl. usage; text is capped (the .sse has the real thing)."""
+    meta = {"text": "", "usage": None, "resolved_model": None,
+            "response_id": None, "status": None, "error": None}
+    s = blob.decode("utf-8", "replace")
+    if "data:" not in s:
+        try:
+            meta["error"] = json.loads(s)
+        except Exception:
+            meta["error"] = s[:500] or None
+        return meta
+    for frame in re.split(r"\r?\n\r?\n", s):
+        data_lines = [ln[5:].lstrip() for ln in frame.split("\n")
+                      if ln.startswith("data:")]
+        if not data_lines:
+            continue
+        try:
+            obj = json.loads("\n".join(data_lines))
+        except Exception:
+            continue
+        t = obj.get("type")
+        if t == "response.output_text.delta":
+            if len(meta["text"]) < _META_TEXT_CAP:
+                meta["text"] += obj.get("delta") or ""
+        elif t in ("response.completed", "response.incomplete", "response.failed"):
+            r = obj.get("response") or {}
+            meta["usage"] = r.get("usage")
+            meta["resolved_model"] = r.get("model")
+            meta["response_id"] = r.get("id")
+            meta["status"] = r.get("status")
+            if t == "response.failed" and r.get("error"):
+                meta["error"] = r.get("error")
+        elif t == "error":
+            meta["error"] = obj
+    meta["text"] = meta["text"][:_META_TEXT_CAP]
+    return meta
 
 
 # --- EXPERIMENTAL: payload injection (OFF by default; observer mode is default) -
@@ -221,11 +387,13 @@ class _WbIntentTee:
     the whole buffer per feed is O(N²) in turn size — fine for kB of text.
     """
 
-    def __init__(self, agent, req_id, parse_fn=None, dispatch_fn=None):
+    def __init__(self, agent, req_id, parse_fn=None, dispatch_fn=None,
+                 wire="anthropic"):
         self.agent = agent
         self.req_id = req_id
         self.parse = parse_fn if parse_fn is not None else _parse_intents
         self.dispatch_fn = dispatch_fn if dispatch_fn is not None else _wb_dispatch
+        self.wire = wire            # "anthropic" | "openai" delta dialect
         self.buf = bytearray()      # undecoded SSE bytes
         self.text = ""              # accumulated assistant text
         self.dispatched = 0
@@ -255,12 +423,10 @@ class _WbIntentTee:
             try:
                 obj = json.loads("\n".join(data_lines))
             except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "content_block_delta":
-                continue
-            delta = obj.get("delta") or {}
-            if delta.get("type") == "text_delta" and delta.get("text"):
-                self.text += delta["text"]
+                continue                 # incl. openai's bare "data: [DONE]"
+            t = _sse_text_delta(obj, self.wire)
+            if t:
+                self.text += t
                 got_text = True
         if got_text:
             intents = self.parse(self.text)
@@ -3287,12 +3453,14 @@ def _status_snapshot(session=None, all_sessions=False):
         })
     sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
     res = {"proxy": {"log_dir": str(LOG_DIR), "upstream": UPSTREAM,
+                     "upstream_openai": UPSTREAM_OPENAI,
                      "uptime_s": round(now - _START_TS, 1),
                      "flags": {"hold": WARMTH_HOLD, "pinger": WARMTH_PINGER,
                                "ledger": WARMTH_LEDGER,
                                "block_cold_ping": WARMTH_BLOCK_COLD_PING,
                                "wb_intent_dispatch": bool(_parse_intents)},
                      "wb_intents": dict(_WB_STATS),
+                     "codex": dict(_CODEX_STATS),
                      "hold_config": {"margin_s": WARMTH_HOLD_MARGIN,
                                      "interval_s": WARMTH_HOLD_INTERVAL,
                                      "max_hours": WARMTH_HOLD_MAX_HOURS,
@@ -3659,6 +3827,167 @@ def _render_session_html(sid, entry, snap, resp=None):
             + head + body + foot + "</body></html>")
 
 
+async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
+    """The /agent/<name>/openai/... path: forward to UPSTREAM_OPENAI with the
+    chatgpt-backend rewrite, capture request+response, tee workbench intents.
+    Deliberately NO transform/warmth/canary/billing machinery — see the
+    OPENAI/CODEX PROVIDER block up top."""
+    base_path = upstream_path.split("?")[0]
+    chatgpt_mode = _is_chatgpt_backend(UPSTREAM_OPENAI)
+    _CODEX_STATS["requests"] += 1
+
+    # ---- observer-side decode + parse (forward the ORIGINAL bytes) ----
+    body_bytes, dec_err = _content_decode(
+        raw, request.headers.get("content-encoding"))
+    obj = None
+    try:
+        obj = json.loads(body_bytes) if body_bytes else {}
+    except Exception:
+        pass
+    model = (obj or {}).get("model")
+    # codex carries session identity in HEADERS (plus prompt_cache_key in-body)
+    session_id = (request.headers.get("session-id")
+                  or request.headers.get("thread-id")
+                  or (obj or {}).get("prompt_cache_key"))
+    session_key = session_id or NO_SESSION
+    out_dir = LOG_DIR / session_key
+    stem = f"{n:03d}-{agent}-codex-{_short_model(model)}-{ts}"
+
+    client = request.client
+    record = {"seq": n, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "agent": agent, "provider": "openai",
+              "method": request.method, "path": upstream_path,
+              "client": {"host": client.host, "port": client.port} if client else None,
+              "request_headers": _safe_headers(request.headers)}
+    if dec_err:
+        record["decode_error"] = dec_err
+    if isinstance(obj, dict):
+        record["body"] = obj
+        inp = obj.get("input") or []
+        record["summary"] = {
+            "model": model, "session_id": session_id,
+            "instructions_chars": len(obj.get("instructions") or ""),
+            "n_input": len(inp) if isinstance(inp, list) else None,
+            "n_tools": len(obj.get("tools") or []),
+            "tool_names": [t.get("name") or t.get("type")
+                           for t in (obj.get("tools") or [])
+                           if isinstance(t, dict)],
+            "reasoning": obj.get("reasoning"),
+            "prompt_cache_key": obj.get("prompt_cache_key"),
+            "store": obj.get("store"), "stream": obj.get("stream"),
+        }
+        # session identity for /_status//_admin: model + cwd (from the
+        # environment_context input item) + first-prompt head as the title
+        # (codex has no title side-call)
+        if session_id and base_path.rstrip("/").endswith(("/responses",
+                                                          "/chat/completions")):
+            fields = {"model": model}
+            try:
+                texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
+                         for c in (it.get("content") or [])
+                         if isinstance(c, dict)]
+                joined = "\n".join(texts)
+                mcwd = re.search(r"<cwd>([^<]+)</cwd>", joined)
+                if mcwd:
+                    fields["cwd"] = mcwd.group(1)
+                prompts = [tx for it in inp if isinstance(it, dict)
+                           and it.get("role") == "user"
+                           for c in (it.get("content") or []) if isinstance(c, dict)
+                           for tx in [c.get("text") or ""]
+                           if tx and not tx.lstrip().startswith("<")]
+                if prompts:
+                    fields["title"] = prompts[0].strip().splitlines()[0][:80]
+            except Exception:
+                pass
+            _enqueue_meta(session_id, **fields)
+    elif raw:
+        record["body_raw"] = body_bytes.decode("utf-8", "replace")[:4000]
+    _enqueue_json(out_dir / f"{stem}.request.json", record)
+
+    # ---- /v1/models stub (chatgpt backend has no platform model list) ----
+    if chatgpt_mode and base_path.rstrip("/").endswith("/models"):
+        out = {"models": [{"id": mid, "object": "model",
+                           "created": int(time.time()), "owned_by": "openai"}
+                          for mid in CODEX_MODELS_STUB],
+               "object": "list"}
+        _enqueue_json(out_dir / f"{stem}.response.json",
+                      {"seq": n, "agent": agent, "provider": "openai",
+                       "endpoint": "models", "status_code": 200,
+                       "stub": True, "body": out})
+        return Response(json.dumps(out), media_type="application/json")
+
+    # ---- forward (original bytes; auth rewritten for the chatgpt backend) ----
+    fwd_headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in _HOP}
+    fwd_headers["accept-encoding"] = "identity"   # readable SSE for the capture
+    up_path = upstream_path
+    if chatgpt_mode:
+        up_path, fwd_headers = _rewrite_chatgpt_request(up_path, fwd_headers)
+    req = _client.build_request(request.method, UPSTREAM_OPENAI + up_path,
+                                headers=fwd_headers, content=raw)
+    up = await _client.send(req, stream=True)
+    resp_headers = {k: v for k, v in up.headers.items()
+                    if k.lower() not in {"connection", "transfer-encoding",
+                                         "content-length", "keep-alive"}}
+    # POST /responses|/chat/completions IS the model wire — capture + tee it
+    # path-based, never content-type-based (success can ship with NO
+    # content-type header at all on the chatgpt backend)
+    is_model_call = (request.method == "POST"
+                     and base_path.rstrip("/").endswith(("/responses",
+                                                         "/chat/completions")))
+    chunks = []
+    wb_tee = (_WbIntentTee(agent, f"{n}-{ts}", wire="openai")
+              if _parse_intents is not None and is_model_call else None)
+
+    async def body_iter():
+        try:
+            async for chunk in up.aiter_raw():
+                if is_model_call:
+                    chunks.append(chunk)
+                yield chunk
+                if wb_tee is not None:   # after yield: client bytes come first
+                    wb_tee.feed(chunk)
+        finally:
+            if wb_tee is not None:
+                wb_tee.close()
+                if wb_tee.dispatched:
+                    print(f"[wb] #{n} {agent} dispatched {wb_tee.dispatched} "
+                          f"intent(s) to {WB_URL}/api/intent", flush=True)
+            await up.aclose()
+            if is_model_call and chunks:
+                blob = b"".join(chunks)
+                _enqueue_bytes(out_dir / f"{stem}.response.sse", blob)
+                meta = _parse_openai_response(blob)
+                u = meta.get("usage") or {}
+                cached = (u.get("input_tokens_details") or {}).get("cached_tokens", 0)
+                reason = (u.get("output_tokens_details") or {}).get("reasoning_tokens", 0)
+                _CODEX_STATS["responses"] += 1
+                _CODEX_STATS["input_tokens"] += u.get("input_tokens") or 0
+                _CODEX_STATS["cached_tokens"] += cached or 0
+                _CODEX_STATS["output_tokens"] += u.get("output_tokens") or 0
+                _CODEX_STATS["reasoning_tokens"] += reason or 0
+                if up.status_code >= 400 or meta.get("error"):
+                    _CODEX_STATS["errors"] += 1
+                _enqueue_json(out_dir / f"{stem}.response.json",
+                    {"seq": n, "agent": agent, "provider": "openai",
+                     "model": model, "session_id": session_id,
+                     "endpoint": "responses", "status_code": up.status_code,
+                     "response_headers": dict(up.headers),
+                     # subscription traffic: tokens are the accounting, no USD
+                     "billing": None, "usage": u, "meta": meta,
+                     "wb_intents": (wb_tee.dispatched if wb_tee else None)})
+                print(f"[codex] #{n} {agent} {meta.get('resolved_model') or model} "
+                      f"-> {up.status_code} in={u.get('input_tokens')} "
+                      f"cached={cached} out={u.get('output_tokens')} "
+                      f"think={reason} status={meta.get('status')}"
+                      f"{' ERROR' if meta.get('error') else ''} "
+                      f"sid={(session_id or '-')[:12]}", flush=True)
+
+    return StreamingResponse(body_iter(), status_code=up.status_code,
+                             headers=resp_headers,
+                             media_type=up.headers.get("content-type"))
+
+
 async def handler(request: Request) -> Response:
     # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
     # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
@@ -3739,13 +4068,20 @@ async def handler(request: Request) -> Response:
     raw = await request.body()
     ts = time.strftime("%H%M%S")
 
-    # ---- route: strip /agent/<name>/anthropic prefix, capture agent name ----
+    # ---- route: strip /agent/<name>/<provider> prefix, capture agent name ----
     path = request.url.path
     m = _ROUTE.match(path)
     if m:
         agent = m.group("name")
         upstream_path = m.group("rest") or "/"
     else:
+        mo = _ROUTE_OPENAI.match(path)
+        if mo:
+            up_rest = mo.group("rest") or "/"
+            if request.url.query:
+                up_rest += "?" + request.url.query
+            return await _handle_openai(request, n, raw,
+                                        mo.group("name"), up_rest, ts)
         agent = "ext"
         upstream_path = path
     if request.url.query:

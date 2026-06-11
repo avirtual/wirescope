@@ -761,6 +761,100 @@ check("wb intent dispatch flag is surfaced in /_status",
       "wb_intent_dispatch" in lp._status_snapshot()["proxy"]["flags"]
       and "wb_intents" in lp._status_snapshot()["proxy"])
 
+# --- OPENAI / CODEX provider (2026-06-11) -------------------------------------
+_m = lp._ROUTE_OPENAI.match("/agent/codex/openai/v1/responses")
+check("openai route matches /agent/<name>/openai/...",
+      _m is not None and _m.group("name") == "codex"
+      and _m.group("rest") == "/v1/responses")
+check("openai route ignores anthropic + bare paths",
+      lp._ROUTE_OPENAI.match("/agent/x/anthropic/v1/messages") is None
+      and lp._ROUTE_OPENAI.match("/v1/responses") is None)
+check("anthropic route unaffected by openai paths",
+      lp._ROUTE.match("/agent/codex/openai/v1/responses") is None)
+
+check("chatgpt-backend detect", lp._is_chatgpt_backend(
+      "https://chatgpt.com/backend-api/codex")
+      and not lp._is_chatgpt_backend("https://api.openai.com"))
+
+from pathlib import Path as _P
+_authf = _P(tempfile.mkdtemp(prefix="codexauth_")) / "auth.json"
+_authf.write_text(json.dumps(
+    {"tokens": {"access_token": "tok123", "account_id": "acct456"}}))
+_hdrs = {"Authorization": "Bearer client-sent", "originator": "codex_exec"}
+_p2, _h2 = lp._rewrite_chatgpt_request("/v1/responses", dict(_hdrs),
+                                       auth_path=_authf)
+check("chatgpt rewrite strips /v1 + swaps auth + keeps client originator",
+      _p2 == "/responses" and _h2["authorization"] == "Bearer tok123"
+      and _h2["chatgpt-account-id"] == "acct456"
+      and "Authorization" not in _h2 and _h2["originator"] == "codex_exec")
+_p3, _h3 = lp._rewrite_chatgpt_request(
+    "/v1/responses", {"authorization": "Bearer x"},
+    auth_path=_P("/nonexistent/auth.json"))
+check("unreadable auth.json leaves the request untouched (clean upstream 401)",
+      _p3 == "/v1/responses" and _h3 == {"authorization": "Bearer x"})
+
+check("codex auth headers are redacted in captures",
+      lp._safe_headers({"chatgpt-account-id": "a", "Authorization": "b",
+                        "session-id": "s"})
+      == {"chatgpt-account-id": "<redacted>", "Authorization": "<redacted>",
+          "session-id": "s"})
+
+if lp._zstd is not None:
+    _blob = json.dumps({"model": "gpt-5.4", "input": []}).encode()
+    _dec, _err = lp._content_decode(lp._zstd.compress(_blob), "zstd")
+    check("zstd request body decodes for capture", _dec == _blob and _err is None)
+else:
+    print("SKIP  zstd decode (py<3.14, no stdlib compression.zstd)")
+_dec2, _err2 = lp._content_decode(b"\x00garbage", "zstd")
+check("corrupt body degrades to raw + error, never raises",
+      _dec2 == b"\x00garbage" and _err2 is not None)
+check("identity/empty encodings pass through",
+      lp._content_decode(b"x", None) == (b"x", None)
+      and lp._content_decode(b"x", "identity") == (b"x", None))
+
+check("openai delta extraction (Responses API + chat completions + DONE-safe)",
+      lp._sse_text_delta({"type": "response.output_text.delta", "delta": "hi"},
+                         "openai") == "hi"
+      and lp._sse_text_delta({"choices": [{"delta": {"content": "yo"}}]},
+                             "openai") == "yo"
+      and lp._sse_text_delta({"type": "response.completed"}, "openai") is None)
+check("anthropic delta extraction unchanged through the shared helper",
+      lp._sse_text_delta({"type": "content_block_delta",
+                          "delta": {"type": "text_delta", "text": "t"}},
+                         "anthropic") == "t"
+      and lp._sse_text_delta({"type": "message_delta", "delta": {}},
+                             "anthropic") is None)
+
+_seen = []
+_tee = lp._WbIntentTee("codex", "t1", parse_fn=lambda s: [], wire="openai",
+                       dispatch_fn=lambda p: _seen.append(p))
+_tee.feed(b'event: response.output_text.delta\n'
+          b'data: {"type":"response.output_text.delta","delta":"[wb:dm u] a"}\n\n')
+_tee.feed(b'data: [DONE]\n\n')
+check("openai tee accumulates text from codex SSE frames",
+      _tee.text == "[wb:dm u] a")
+
+_sse = (b'event: response.output_text.delta\n'
+        b'data: {"type":"response.output_text.delta","delta":"4"}\n\n'
+        b'event: response.completed\n'
+        b'data: {"type":"response.completed","response":{"id":"resp_1",'
+        b'"model":"gpt-5.4","status":"completed","usage":{"input_tokens":100,'
+        b'"input_tokens_details":{"cached_tokens":80},"output_tokens":5,'
+        b'"output_tokens_details":{"reasoning_tokens":2},"total_tokens":105}}}\n\n')
+_meta = lp._parse_openai_response(_sse)
+check("openai response parse: usage + model + text from response.completed",
+      _meta["text"] == "4" and _meta["resolved_model"] == "gpt-5.4"
+      and _meta["usage"]["input_tokens"] == 100
+      and _meta["usage"]["input_tokens_details"]["cached_tokens"] == 80
+      and _meta["status"] == "completed" and _meta["error"] is None)
+_meta_err = lp._parse_openai_response(b'{"detail":"The model is not supported"}')
+check("openai response parse: unframed JSON error body lands in meta.error",
+      _meta_err["error"] == {"detail": "The model is not supported"})
+
+check("codex stats surfaced in /_status",
+      lp._status_snapshot()["proxy"].get("codex", {}).get("requests") == 0
+      and "upstream_openai" in lp._status_snapshot()["proxy"])
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
