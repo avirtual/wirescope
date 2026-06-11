@@ -190,10 +190,14 @@ any warmth/pricing/hold/persistence edit.
 - Restarts are safe-ish (state persists; only credentials gap, which the auth
   bootstrap closes) but avoid mid-experiment. This Claude Code session does
   NOT route through :7800 — drills must set `ANTHROPIC_BASE_URL` explicitly.
-- **`/warm-cache` is a user-level skill** (`~/.claude/commands/warm-cache.md`);
-  works from any project routed through the proxy, self-diagnoses otherwise.
-  SessionEnd→`/_end` hook installed user-level in `~/.claude/settings.json`
-  (pinned to :7800; scratch ports rely on the sweeper).
+- **Client integration SHIPS with the proxy: `client/`** (warm-cache command,
+  statusline, cache-expiry + cache-state hooks, settings.example.json,
+  install.sh + README). Canonical copies — edit there, cut a release to ship;
+  project settings reference `releases/current/client/...` so wiring upgrades
+  with releases. `~/.claude/commands/warm-cache.md` is a SYMLINK through
+  releases/current (install.sh). SessionEnd→`/_end` hook installed user-level
+  in `~/.claude/settings.json` (pinned to :7800; scratch ports rely on the
+  sweeper). `~/tmp/proxy-sl-test` was the dev sandbox for these.
 - **Old experiment captures moved to `logs_archive/` (2026-06-11)** — dir
   names unchanged (logs_live, logs_chatty, logs_compact_warmth, logs_inject,
   logs_codexprobe, …; retired port→corpus map in archive-2026-06-11). Live

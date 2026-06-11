@@ -1,0 +1,35 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:7800"
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/projects/proxy-lab/releases/current/client/status-line.sh"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/projects/proxy-lab/releases/current/client/cache-expiry-hook.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/projects/proxy-lab/releases/current/client/cache-state-hook.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
