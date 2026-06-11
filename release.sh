@@ -23,9 +23,10 @@ if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
   exit 1
 fi
 
-# Gate on the offline test suite.
-echo "running test suite…"
+# Gate on the offline test suites.
+echo "running test suites…"
 python3 test_warmth_store.py >/dev/null
+python3 test_subscribers.py >/dev/null
 echo "tests OK"
 
 git tag -a "$VERSION" -m "proxy release $VERSION"
