@@ -380,6 +380,9 @@ check("ended marker is durable (survives into a fresh load)",
 check("admin page renders the ended badge",
       "ended" in lp._render_admin_html(
           lp._status_snapshot(session="sess-meta-1")))
+check("proxy self-reports its code version in /_status",
+      bool(lp._status_snapshot()["proxy"].get("version"))
+      and lp._status_snapshot()["proxy"]["version"] != "unknown")
 # resume: the per-turn meta hook clears the mark (memory + durable column)
 lp._capture_session_meta("sess-meta-1", {"system": [], "messages": []}, "m")
 check("a live turn through the meta hook clears ended everywhere",

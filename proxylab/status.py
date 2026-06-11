@@ -124,7 +124,8 @@ def _status_snapshot(session=None, all_sessions=False):
             "context": meta_mod._CONTEXT_STATS.get(sid),
         })
     sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
-    res = {"proxy": {"log_dir": str(core_mod.LOG_DIR), "upstream": core_mod.UPSTREAM,
+    res = {"proxy": {"version": core_mod.VERSION,
+                     "log_dir": str(core_mod.LOG_DIR), "upstream": core_mod.UPSTREAM,
                      "upstream_openai": codex_mod.UPSTREAM_OPENAI,
                      "uptime_s": round(now - core_mod._START_TS, 1),
                      "flags": {"hold": hold_mod.WARMTH_HOLD, "pinger": pinger_mod.WARMTH_PINGER,

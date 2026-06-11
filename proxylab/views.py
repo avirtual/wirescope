@@ -95,7 +95,8 @@ def _render_admin_html(snap, host=""):
     ref = t.get("refusals") or 0
     unp = t.get("unpriced_requests") or 0
     head = (
-        f'<h1>logproxy <small>· {e(p["log_dir"])} @ {e(host or "localhost")} '
+        f'<h1>logproxy <small>· {e(p.get("version") or "?")} '
+        f'· {e(p["log_dir"])} @ {e(host or "localhost")} '
         f'&rarr; {e(p["upstream"])}</small></h1>'
         f'<p class="kv">'
         f'<span>up <b>{e(_fmt_dur(p["uptime_s"]))}</b></span>'

@@ -60,6 +60,38 @@ _HOP = {"host", "content-length", "connection", "transfer-encoding",
 
 _counter = itertools.count(1)
 _START_TS = time.time()
+
+
+def _detect_version():
+    """Self-identify the running code so /_status//_admin say WHICH release
+    serves a port (the handoff-notes way went stale within a day). Release
+    worktrees carry a RELEASE stamp written by release.sh; a dev tree falls
+    back to git describe and says so."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        stamp = (root / "RELEASE").read_text().strip()
+        if stamp:
+            return stamp
+    except OSError:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "-C", str(root), "describe", "--tags", "--always", "--dirty"],
+            capture_output=True, text=True, timeout=3)
+        desc = out.stdout.strip()
+        if out.returncode == 0 and desc:
+            # an exact clean tag (old release worktrees predate the RELEASE
+            # stamp) is the release itself; anything else is a dev state
+            exact = "-g" not in desc and not desc.endswith("-dirty")
+            return desc if exact else desc + " (dev tree)"
+    except Exception:
+        pass
+    return "unknown"
+
+
+VERSION = _detect_version()
+print(f"[proxy] code version: {VERSION}", flush=True)
 _client = httpx.AsyncClient(timeout=httpx.Timeout(600.0), follow_redirects=False)
 
 # /agent/<name>/anthropic/<rest>  ->  (name, /<rest>)

@@ -32,6 +32,11 @@ echo "tests OK"
 git tag -a "$VERSION" -m "proxy release $VERSION"
 mkdir -p releases
 git worktree add --detach "releases/$VERSION" "$VERSION" >/dev/null
+# Stamp the worktree so the proxy self-reports WHICH release serves a port
+# (/_status proxy.version, /_admin header). Dev trees fall back to git describe.
+printf '%s %s %s\n' "$VERSION" \
+  "$(git rev-parse --short "$VERSION^{commit}")" "$(date +%F)" \
+  > "releases/$VERSION/RELEASE"
 ln -sfn "$VERSION" releases/current
 
 echo "release $VERSION cut -> releases/$VERSION (releases/current updated)"
