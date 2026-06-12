@@ -8,7 +8,6 @@ access here for back-compat (uvicorn logproxy:app, import logproxy).
 from proxylab import core  # noqa: F401,E402
 from proxylab import codex  # noqa: F401,E402
 from proxylab import transforms  # noqa: F401,E402
-from proxylab import wb  # noqa: F401,E402
 from proxylab import canary  # noqa: F401,E402
 from proxylab import writer  # noqa: F401,E402
 from proxylab import warmth  # noqa: F401,E402

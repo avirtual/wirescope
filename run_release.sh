@@ -9,8 +9,8 @@
 # holds and totals carry across (restart-amnesia). Only in-memory credentials
 # drop — the auth bootstrap / next live turn re-donates them.
 #
-# Extra env for the official instance (e.g. WB_PARSER_TOKEN for workbench
-# intent dispatch) goes in release.env (gitignored, sourced here).
+# Extra env for the official instance (e.g. SUBSCRIBERS_TOKEN) goes in
+# release.env (gitignored, sourced here).
 set -euo pipefail
 cd "$(dirname "$0")"
 LAB="$(pwd)"

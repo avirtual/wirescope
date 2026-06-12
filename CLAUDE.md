@@ -126,7 +126,7 @@ name lazily (PEP 562), so rebindable globals read live; to FLIP a flag from
 outside, assign on the owning module (`lp.warmth.WARMTH_LEDGER = …`), not on
 the shim. Modules (size · job):
 core 3k (constants/routes/httpx client) · codex 9k (openai provider + zstd
-capture) · wb 8k (workbench intent tee) · transforms 51k (inject/SC/relocate/
+capture) · transforms 51k (inject/SC/relocate/
 strip/sort/compact-strip + gates) · canary 8k (drift detector) · writer 6k
 (disk-writer thread, _classify_role, NO_SESSION) · warmth 20k (SQLite ledger,
 prefix hashing, _record_warmth) · subs 21k (subscriber push feed: /_subscribe
@@ -145,7 +145,7 @@ Starlette app).
 |---|---|---|
 | `RELOCATE_ENV_TO_TAIL` / `RELOCATE_CLAUDEMD_PATHSTAMP` | on | Peel volatile `# Environment`/`# currentDate` to a tail reminder; own cache marker for static CLAUDE.md → env-independent shared segment. |
 | `SORT_TOOLS` | on | Alphabetize tools[]; predictability only. |
-| `WB_INTENT_DISPATCH` (+`WB_URL` :9000, `WB_PARSER_TOKEN`, `WB_INTENT_PARSER`) | on | On `/agent/<name>/anthropic/…` routes only: SSE tee POSTs `[wb:action]` intents to the workbench, fire-and-forget; parser loaded from the canonical workbench file. Plain CC traffic never dispatches. **LEGACY: superseded by `SUBSCRIBERS` — retire once workbench registers via /_subscribe and parses its own intents.** |
+| *(retired 2026-06-12)* `WB_INTENT_DISPATCH` | — | REMOVED (`proxylab/wb.py` deleted): proxy-side `[wb:]` intent parsing is gone; the workbench consumes the app-agnostic `SUBSCRIBERS` feed. No app-specific protocol parsing remains in the proxy. |
 | `SUBSCRIBERS` (+`_ALLOW_REMOTE` 0, `_TOKEN`, `_DELTA_MS` 300, `_MAX_FAILURES` 10) | on | **App-agnostic push feed; protocol contract = `SUBSCRIBERS.md`** (hand that file to consumers). `POST /_subscribe` {url, token, agent globs, events} → `text.delta` (normalized streaming text, offset reassembly, both wire dialects), `turn.completed` (full text + usage/cost/session-totals/context/warmth receipts — the wire-only facts: refusals, real USD, resolved model), `session.ended`. Agent-routed traffic only (`ext` never pushed); upsert by url; at-most-once fire-and-forget, suspension after N consecutive failures (re-POST reactivates); registry persists in warmth.sqlite owner-scoped; reconciliation is pull (`/_status?session=`). Loopback-only callbacks by default (exfil guard). Verified live 2026-06-12 (all 3 events, both deltas+receipts). |
 | *(provider)* openai/codex routing (`UPSTREAM_OPENAI`, `CODEX_AUTH_FILE`, `CODEX_MODELS_STUB`) | on | `/agent/<name>/openai/…` → ChatGPT codex backend: strip `/v1`, OAuth headers re-read per request from `~/.codex/auth.json` (redacted in captures), models stub, SSE-by-path, zstd decoded observer-side. Server-side caching (`prompt_cache_key` = routing hint only) → NO warmth/transform stack applies. Codex 0.139+ tries a WebSocket first, 403s, falls back (~3–8s) — known codex bug; custom model_provider with `supports_websockets=false` avoids it. |
 | `CANARY` (`CANARY_DIR`) | on | Read-only structural drift detector per (model, beta); appends `_canary/changes.jsonl`. Gaps #1–#3 open: system-block heading lists, control-plane keys, message roles not fingerprinted. |
@@ -221,12 +221,11 @@ any warmth/pricing/hold/persistence edit — **and `python3 test_subscribers.py`
   keys (`thinking.type`, `output_config`, `context_management`), message
   roles. Plus: refusal counter in totals (canary can't see responses).
 - A/B `--exclude-dynamic-system-prompt-sections` vs RELOCATE_ENV_TO_TAIL.
-- WB flip: land it on the SUBSCRIBER contract (workbench registers via
-  /_subscribe + parses its own intents from text.delta; SUBSCRIBERS.md is the
-  spec to hand over), then flip `WB_PROXY_PORT→7800` and retire
-  `WB_INTENT_DISPATCH` + the parser import. The old remainder
-  (`WB_PARSER_TOKEN` into release.env) only matters if the legacy path ships
-  first.
+- ~~WB flip~~ DONE 2026-06-12: workbench moved to the SUBSCRIBER contract;
+  `WB_INTENT_DISPATCH` + `proxylab/wb.py` removed. Residual: verify the
+  workbench actually REGISTERS via /_subscribe on the deployed proxy before
+  the removal release goes live (at removal time :7800 showed subscribers=0
+  while legacy had dispatched 4 — likely the workbench app just wasn't up).
 - Statusline TITLE display (statusline already polls /_status for
   warmth/hold/turn; script `~/tmp/proxy-sl-test/.claude/status-line.sh`).
 - Measured A/B: proxied all-levers vs vanilla 1P.

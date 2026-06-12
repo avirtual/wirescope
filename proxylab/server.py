@@ -33,14 +33,13 @@ from proxylab import subs as subs_mod
 from proxylab import transforms as transforms_mod
 from proxylab import views as views_mod
 from proxylab import warmth as warmth_mod
-from proxylab import wb as wb_mod
 from proxylab import writer as writer_mod
 
 async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
     """The /agent/<name>/openai/... path: forward to UPSTREAM_OPENAI with the
-    chatgpt-backend rewrite, capture request+response, tee workbench intents.
-    Deliberately NO transform/warmth/canary/billing machinery — see the
-    OPENAI/CODEX PROVIDER block up top."""
+    chatgpt-backend rewrite, capture request+response, tee subscribers, price
+    the receipts (API-equivalent). Deliberately NO transform/warmth/canary
+    machinery — see the OPENAI/CODEX PROVIDER block up top."""
     base_path = upstream_path.split("?")[0]
     chatgpt_mode = codex_mod._is_chatgpt_backend(codex_mod.UPSTREAM_OPENAI)
     codex_mod._CODEX_STATS["requests"] += 1
@@ -148,8 +147,6 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                      and base_path.rstrip("/").endswith(("/responses",
                                                          "/chat/completions")))
     chunks = []
-    wb_tee = (wb_mod._WbIntentTee(agent, f"{n}-{ts}", wire="openai")
-              if wb_mod._parse_intents is not None and is_model_call else None)
     # Generic subscriber tee (SUBSCRIBERS.md); every request here is /agent/-
     # routed by construction, so the agent identity gate is the route itself.
     sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}", wire="openai")
@@ -161,16 +158,9 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                 if is_model_call:
                     chunks.append(chunk)
                 yield chunk
-                if wb_tee is not None:   # after yield: client bytes come first
-                    wb_tee.feed(chunk)
-                if sub_tee is not None:
+                if sub_tee is not None:  # after yield: client bytes come first
                     sub_tee.feed(chunk)
         finally:
-            if wb_tee is not None:
-                wb_tee.close()
-                if wb_tee.dispatched:
-                    print(f"[wb] #{n} {agent} dispatched {wb_tee.dispatched} "
-                          f"intent(s) to {wb_mod.WB_URL}/api/intent", flush=True)
             if sub_tee is not None:
                 sub_tee.close()
             await up.aclose()
@@ -211,8 +201,7 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                      "endpoint": "responses", "status_code": up.status_code,
                      "response_headers": dict(up.headers),
                      "billing": bill, "cumulative": cum,
-                     "usage": u, "meta": meta,
-                     "wb_intents": (wb_tee.dispatched if wb_tee else None)})
+                     "usage": u, "meta": meta})
                 subs_mod.emit_turn_completed_openai(
                     agent, session_id, f"{n}-{ts}", meta=meta,
                     status_code=up.status_code,
@@ -557,13 +546,9 @@ async def handler(request: Request) -> Response:
     relay = is_messages and transforms_mod._relay_active()
     buffer_resp = mutate or relay    # both need the full SSE before we can rewrite
 
-    # Workbench intent tee: only for agent-identified routes (m), never for
-    # plain Claude Code traffic — see the WB_INTENT_DISPATCH block up top.
-    wb_tee = None
-    if wb_mod._parse_intents is not None and m is not None and is_messages:
-        wb_tee = wb_mod._WbIntentTee(agent, f"{n}-{ts}")
-    # Generic subscriber tee (SUBSCRIBERS.md): same scope guard; None when no
-    # registered subscriber matches this agent, so plain traffic pays nothing.
+    # Generic subscriber tee (SUBSCRIBERS.md): agent-identified routes (m)
+    # only, never plain Claude Code traffic; None when no registered
+    # subscriber matches this agent, so plain traffic pays nothing.
     sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}")
                if m is not None and is_messages else None)
 
@@ -575,9 +560,7 @@ async def handler(request: Request) -> Response:
                     chunks.append(chunk)
                 if not buffer_resp:     # stream verbatim; when buffering we hold
                     yield chunk
-                if wb_tee is not None:  # after yield: client bytes come first
-                    wb_tee.feed(chunk)
-                if sub_tee is not None:
+                if sub_tee is not None:  # after yield: client bytes come first
                     sub_tee.feed(chunk)
             if buffer_resp and chunks:
                 full = b"".join(chunks)
@@ -585,11 +568,6 @@ async def handler(request: Request) -> Response:
                 out_blob = transforms_mod._relay_capture_and_strip(full) if relay else transforms_mod._mutate_sse(full)
                 yield out_blob          # emit rewritten response once
         finally:
-            if wb_tee is not None:
-                wb_tee.close()      # flush the held tail intent, if any
-                if wb_tee.dispatched:
-                    print(f"[wb] #{n} {agent} dispatched {wb_tee.dispatched} "
-                          f"intent(s) to {wb_mod.WB_URL}/api/intent", flush=True)
             if sub_tee is not None:
                 sub_tee.close()     # flush the tail text.delta, if any
             await up.aclose()
@@ -661,8 +639,7 @@ async def handler(request: Request) -> Response:
                      "meta": meta,           # full usage objects + ids + shape
                      "response_injection": ({"append": transforms_mod.RESP_APPEND,
                                              "replace": transforms_mod.RESP_REPLACE}
-                                            if mutate else None),
-                     "wb_intents": (wb_tee.dispatched if wb_tee else None)})
+                                            if mutate else None)})
                 if is_messages and m is not None:
                     # turn.completed receipt for subscribers: the tee's text is
                     # the FULL turn (meta["text"] is capped); _SESSION_TOTALS
