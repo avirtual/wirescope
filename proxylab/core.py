@@ -1,31 +1,32 @@
-"""Minimal standalone logging/dumper forward-proxy (throwaway, #2873/#2874).
+"""proxylab core: process identity + the constants everything else builds on.
 
-Captures the EXACT outbound request bodies AND inbound response SSE streams a
-`claude` CLI exchanges with the Anthropic API — ground truth for "what is in a
-subagent's context" (#2873, request side) and "what usage/cost the API returns"
-(#2874, response side). No model introspection.
+logproxy began as a throwaway capture proxy (#2873/#2874) and grew into the
+lab's analytical forward-proxy: byte-verbatim forwarding with full capture,
+billing receipts, prefix-warmth economics, keep-warm pinger/holds, request
+transforms, and an app-agnostic subscriber push feed (SUBSCRIBERS.md).
+Mission unchanged: FIND & PRICE CONTEXT WASTE; STAY NON-INTRUSIVE. The module
+map + durable conclusions live in CLAUDE.md; launch via start_proxy.sh /
+run_release.sh (never as a CLI background job).
 
-NOT the production proxy: no intent dispatcher, no workbench contact whatsoever.
-It only logs request + response and forwards bytes.
+This module owns the shared foundation and IMPORTS NOTHING from the package
+(everyone may import core): UPSTREAM, LOG_DIR, the request counter, version
+self-report, the shared httpx client, the /agent/<name>/ route regex, and
+header hygiene (_HOP, _SECRET_HEADERS, _safe_headers).
 
-Output layout (one subdirectory per session):
+Capture layout (one subdirectory per session):
   LOG_DIR/<session_id>/<seq>-<agent>-<role>-<model>-<ts>.request.json
   LOG_DIR/<session_id>/<seq>-...-.response.sse | .response.json
   LOG_DIR/<session_id>/_session.json   per-session running total
   LOG_DIR/_no-session/...              count_tokens + probes (carry no metadata)
   LOG_DIR/_totals.json                 global process-lifetime total
 The session_id is parsed out of metadata.user_id (itself a JSON string). All
-disk writes are handed to a background thread so the proxy byte-path never
-blocks on I/O (see _writer_loop).
+disk writes go through the writer thread — nothing on the byte path blocks.
 
-Run:
-  LOG_DIR=/tmp/proxyclone/logs python3 -m uvicorn logproxy:app --host 127.0.0.1 --port 7799
-
-Point a CLI at it either way:
-  - bare:   ANTHROPIC_BASE_URL=http://127.0.0.1:7799            -> path /v1/messages
-  - routed: ANTHROPIC_BASE_URL=http://127.0.0.1:7799/agent/<name>/anthropic
-            (the /agent/<name>/anthropic prefix is stripped before forwarding;
-             <name> is captured as the agent id in the dump filename)
+Point a CLI at the proxy either way:
+  - bare:   ANTHROPIC_BASE_URL=http://127.0.0.1:<port>
+  - routed: ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/agent/<name>/anthropic
+            (codex: .../agent/<name>/openai) — <name> becomes the session's
+            agent identity: dump filenames, /_status titles, subscriber routing.
 """
 import asyncio
 import atexit

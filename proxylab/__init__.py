@@ -1,24 +1,38 @@
-"""proxylab — the logproxy implementation, split from the monolithic
-logproxy.py (mechanical refactor 2026-06-11). Submodules are imported in
-the original file's top-to-bottom order so import-time side effects
-(env-flag parsing, writer-thread start, _restore_state) keep their
-original sequence. The repo-root `logproxy.py` shim forwards attribute
-access here for back-compat (uvicorn logproxy:app, import logproxy).
+"""proxylab — the logproxy implementation (split from the monolith 2026-06-11,
+made lazily importable 2026-06-12).
+
+THE PACKAGE IS LAZY (PEP 562): `from proxylab import billing` boots only
+billing's own dependency chain (core, writer) — no sweeper thread, no state
+restore, no server app. The parts are importable as a library by other
+projects; each module's import-time side effects live with their owner:
+
+  core   env/LOG_DIR/version + shared httpx client
+  writer the background disk-writer thread
+  pinger the staleness sweeper thread
+  server _restore_state() + the Starlette app  (importing server IS the boot)
+
+THE LAB BOOT is the repo-root `logproxy.py` shim (uvicorn logproxy:app,
+`import logproxy as lp` in tests/drivers): it imports every module eagerly in
+the original monolith order, so the full proxy behaves exactly as before.
+
+Dependency rules that keep growth sane (enforce in review):
+  * core and store import nothing from the package (writer: lazy refs only).
+  * A module CREATES ONLY ITS OWN TABLES (see proxylab.store) and mutates
+    only its own globals; cross-module access goes through functions.
+  * server/receipts may know everyone; nobody (but the shim) knows server.
 """
-from proxylab import core  # noqa: F401,E402
-from proxylab import store  # noqa: F401,E402
-from proxylab import codex  # noqa: F401,E402
-from proxylab import transforms  # noqa: F401,E402
-from proxylab import canary  # noqa: F401,E402
-from proxylab import writer  # noqa: F401,E402
-from proxylab import warmth  # noqa: F401,E402
-from proxylab import subs  # noqa: F401,E402
-from proxylab import meta  # noqa: F401,E402
-from proxylab import pinger  # noqa: F401,E402
-from proxylab import hold  # noqa: F401,E402
-from proxylab import billing  # noqa: F401,E402
-from proxylab import receipts  # noqa: F401,E402
-from proxylab import restore  # noqa: F401,E402
-from proxylab import status  # noqa: F401,E402
-from proxylab import views  # noqa: F401,E402
-from proxylab import server  # noqa: F401,E402
+import importlib
+
+_MODULES = ("core", "store", "codex", "transforms", "canary", "writer",
+            "warmth", "subs", "meta", "pinger", "hold", "billing",
+            "receipts", "restore", "status", "views", "server")
+
+
+def __getattr__(name):
+    if name in _MODULES:
+        return importlib.import_module(f"proxylab.{name}")
+    raise AttributeError(f"module 'proxylab' has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_MODULES))
