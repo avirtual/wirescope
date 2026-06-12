@@ -17,6 +17,7 @@ from proxylab import meta  # noqa: F401,E402
 from proxylab import pinger  # noqa: F401,E402
 from proxylab import hold  # noqa: F401,E402
 from proxylab import billing  # noqa: F401,E402
+from proxylab import receipts  # noqa: F401,E402
 from proxylab import restore  # noqa: F401,E402
 from proxylab import status  # noqa: F401,E402
 from proxylab import views  # noqa: F401,E402
