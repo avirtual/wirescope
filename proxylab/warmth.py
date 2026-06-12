@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
-from proxylab import core as core_mod
+from proxylab import store as store_mod
 from proxylab import writer as writer_mod
 
 # --- prefix-warmth ledger (SQLite-backed, TWO-STATE) ---------------------------
@@ -30,16 +30,8 @@ from proxylab import writer as writer_mod
 # can't know, because warmth lives on the CONTENT-ADDRESSED prefix the backend
 # caches, which a forked keep-alive ping shares but never writes back to the
 # original session's transcript. So the proxy LEARNS it from response receipts
-# and stores it here.
-#
-# STORE: one shared SQLite file (WARMTH_DB, default <proxy dir>/warmth.sqlite),
-# WAL mode — durable across proxy restarts and SHARED by every proxy port on the
-# box (one ledger, not eight blind ones). Why SQLite over Redis (2026-06-09):
-# stdlib + no daemon to babysit; durable per-commit by default (Redis RDB/AOF
-# needs deliberate config to not re-create restart-amnesia in miniature); and no
-# "store unreachable" runtime state to mishandle now that ABSENCE TRIGGERS
-# ACTION. Credentials never land here — only anonymous prefix hashes +
-# timestamps; _LAST_REQUEST (bodies + auth headers) stays in-process.
+# and stores it here. (Persistence: proxylab.store — warmth rows are the
+# GLOBAL-scope tenant there, keyed by prefix hash, shared across ports.)
 #
 # TWO-STATE SEMANTICS (2026-06-09 decision; replaces warm/cold/unknown): the
 # expiry predicate IS the answer. warm = row exists AND expires_at > now;
@@ -68,101 +60,15 @@ WARMTH_PING_SENTINEL = os.environ.get("WARMTH_PING_SENTINEL")  # tail-msg marker
 # everything else short-circuits with a synthetic end_turn (0 tokens).
 WARMTH_BLOCK_COLD_PING = os.environ.get("WARMTH_BLOCK_COLD_PING") in (
     "1", "yes", "on", "true")
-WARMTH_DB = os.environ.get("WARMTH_DB",
-                           # repo root (next to the logproxy.py shim), NOT
-                           # inside the proxylab/ package — pre-split default
-                           str(Path(__file__).resolve().parent.parent / "warmth.sqlite"))
-# Per-proxy-INSTANCE scope for persisted runtime state (holds, last-requests).
-# Warmth is global by design (it lives on the content-addressed prefix lineage,
-# shared across ports), but a hold/replayable-request belongs to THE proxy that
-# serves the session — scoping rows by LOG_DIR keeps a scratch port from
-# resurrecting (and double-pinging) the main proxy's sessions after a restart.
-_OWNER = str(core_mod.LOG_DIR.resolve())
-_DB = None
-_DB_LOCK = threading.Lock()
-
-
-def _warmth_db():
-    """Lazily open (and initialize) the shared warmth store. One connection per
-    process, serialized by _DB_LOCK (write volume is a few rows/sec at peak);
-    WAL + busy_timeout make the file safely shareable across proxy processes."""
-    global _DB
-    with _DB_LOCK:
-        if _DB is None:
-            con = sqlite3.connect(WARMTH_DB, check_same_thread=False, timeout=5.0)
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA synchronous=NORMAL")
-            con.execute("PRAGMA busy_timeout=5000")
-            con.execute("CREATE TABLE IF NOT EXISTS warmth ("
-                        "hash TEXT PRIMARY KEY, stamped_at REAL NOT NULL, "
-                        "ttl INTEGER NOT NULL, expires_at REAL NOT NULL)")
-            con.execute("CREATE TABLE IF NOT EXISTS session_head ("
-                        "session_id TEXT PRIMARY KEY, hash TEXT NOT NULL, "
-                        "updated_at REAL NOT NULL)")
-            # human-useful session identity for /_status: the CLI's own session
-            # title (harvested from its title-generator side-call) + cwd + model.
-            # Durable so /_status is useful right after a restart, when the
-            # in-memory _LAST_REQUEST is empty.
-            con.execute("CREATE TABLE IF NOT EXISTS session_meta ("
-                        "session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
-                        "model TEXT, first_seen REAL NOT NULL, "
-                        "last_seen REAL NOT NULL)")
-            # `kind` tags sessions the PROXY ITSELF spawned (auth bootstrap),
-            # so the status/admin views can keep them out of the human's
-            # session list. NULL = a real user session.
-            try:
-                con.execute("ALTER TABLE session_meta ADD COLUMN kind TEXT")
-            except sqlite3.OperationalError:
-                pass  # column already exists
-            # `ended_at`/`end_reason` (2026-06-11): the SessionEnd MARKER.
-            # /_end no longer deletes runtime state — a one-shot `claude -p`
-            # fires SessionEnd the instant its answer lands, and instant
-            # teardown destroyed exactly the post-mortem state (context
-            # stats, /_session view, last answer) worth debugging. Ended is
-            # a durable FACT about the session (resumable — a live turn
-            # clears it); cleanup belongs to the staleness sweeper.
-            # `agent` (2026-06-12): the /agent/<name>/ route identity, for any
-            # wire. SDK-driven sessions never make the title side-call, so the
-            # route name is the only human-readable label they'll ever have;
-            # /_status falls back to it when title is NULL. Plain (un-routed)
-            # traffic stays NULL.
-            for ddl in ("ALTER TABLE session_meta ADD COLUMN ended_at REAL",
-                        "ALTER TABLE session_meta ADD COLUMN end_reason TEXT",
-                        "ALTER TABLE session_meta ADD COLUMN agent TEXT"):
-                try:
-                    con.execute(ddl)
-                except sqlite3.OperationalError:
-                    pass  # column already exists
-            # RESTART-AMNESIA (open item h): per-proxy runtime state, mirrored on
-            # every change and reloaded at startup, so a restart recovers what
-            # the process held. owner = LOG_DIR (see _OWNER).
-            con.execute("CREATE TABLE IF NOT EXISTS hold_state ("
-                        "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
-                        "until REAL NOT NULL, armed_at REAL NOT NULL, "
-                        "pings INTEGER NOT NULL, failures INTEGER NOT NULL, "
-                        "last_ping_ts REAL, last_result TEXT, "
-                        "PRIMARY KEY (owner, session_id))")
-            # `hours` = the hold's INSURANCE WINDOW (2026-06-10): `until` slides
-            # to last-organic-turn + hours, so the original until/armed_at pair
-            # no longer encodes the duration. Migrate in place; legacy rows
-            # (NULL) derive hours from (until - armed_at).
-            try:
-                con.execute("ALTER TABLE hold_state ADD COLUMN hours REAL")
-            except sqlite3.OperationalError:
-                pass  # column already exists
-            # The replayable last request: BODY + NON-SECRET headers only. The
-            # body is no more secret than the LOG_DIR captures (same
-            # post-transform bytes); auth headers NEVER land on disk (standing
-            # rule) — they are re-attached at runtime from the first live
-            # request of the same account (_ACCOUNT_AUTH).
-            con.execute("CREATE TABLE IF NOT EXISTS last_request ("
-                        "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
-                        "account_uuid TEXT, path TEXT NOT NULL, ts REAL NOT NULL, "
-                        "body TEXT NOT NULL, headers TEXT NOT NULL, "
-                        "PRIMARY KEY (owner, session_id))")
-            con.commit()
-            _DB = con
-    return _DB
+# this module's tables (see proxylab.store ownership rule): the ledger itself
+# + the session->latest-head-hash index that lets /_warm resolve by session_id.
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS warmth ("
+    "hash TEXT PRIMARY KEY, stamped_at REAL NOT NULL, "
+    "ttl INTEGER NOT NULL, expires_at REAL NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS session_head ("
+    "session_id TEXT PRIMARY KEY, hash TEXT NOT NULL, "
+    "updated_at REAL NOT NULL)")
 
 
 def _warmth_rows(hashes):
@@ -171,8 +77,8 @@ def _warmth_rows(hashes):
     hashes = [h for h in hashes if h]
     if not hashes:
         return {}
-    con = _warmth_db()
-    with _DB_LOCK:
+    con = store_mod.db()
+    with store_mod.LOCK:
         q = ",".join("?" * len(hashes))
         cur = con.execute("SELECT hash, stamped_at, ttl, expires_at FROM warmth "
                           f"WHERE hash IN ({q})", hashes)
@@ -180,8 +86,8 @@ def _warmth_rows(hashes):
 
 
 def _session_head_hash(session):
-    con = _warmth_db()
-    with _DB_LOCK:
+    con = store_mod.db()
+    with store_mod.LOCK:
         r = con.execute("SELECT hash FROM session_head WHERE session_id=?",
                         (session,)).fetchone()
     return r[0] if r else None
@@ -378,8 +284,8 @@ def _record_warmth(obj, usage):
     except Exception:
         sid = None
     try:
-        con = _warmth_db()
-        with _DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
                         "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
                         "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "

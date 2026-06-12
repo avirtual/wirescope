@@ -25,6 +25,7 @@ from proxylab import codex as codex_mod
 from proxylab import core as core_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
+from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 from proxylab import writer as writer_mod
 
@@ -53,20 +54,31 @@ _LAST_REQUEST_LOCK = threading.Lock()
 # Mutated only under _LAST_REQUEST_LOCK. (Unbounded, but accounts ~ 1/box.)
 _ACCOUNT_AUTH = {}
 
+# this module's table (see proxylab.store ownership rule): the replayable last
+# request, BODY + NON-SECRET headers only. The body is no more secret than the
+# LOG_DIR captures (same post-transform bytes); auth headers NEVER land on
+# disk (standing rule) — re-attached at runtime from _ACCOUNT_AUTH.
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS last_request ("
+    "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+    "account_uuid TEXT, path TEXT NOT NULL, ts REAL NOT NULL, "
+    "body TEXT NOT NULL, headers TEXT NOT NULL, "
+    "PRIMARY KEY (owner, session_id))")
+
 
 def _persist_last_request_row(session_id, account_uuid, path, ts, obj, safe_headers):
     """Writer-thread upsert of the replayable request (body + NON-SECRET
     headers — secrets were split off before enqueue, see _cache_last_request)."""
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute(
                 "INSERT INTO last_request(owner, session_id, account_uuid, "
                 "path, ts, body, headers) VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(owner, session_id) DO UPDATE SET "
                 "account_uuid=excluded.account_uuid, path=excluded.path, "
                 "ts=excluded.ts, body=excluded.body, headers=excluded.headers",
-                (warmth_mod._OWNER, session_id, account_uuid, path, ts,
+                (store_mod.OWNER, session_id, account_uuid, path, ts,
                  json.dumps(obj, ensure_ascii=False),
                  json.dumps(safe_headers, ensure_ascii=False)))
             con.commit()
@@ -76,10 +88,10 @@ def _persist_last_request_row(session_id, account_uuid, path, ts, obj, safe_head
 
 def _delete_last_request_row(session_id):
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("DELETE FROM last_request WHERE owner=? AND session_id=?",
-                        (warmth_mod._OWNER, session_id))
+                        (store_mod.OWNER, session_id))
             con.commit()
     except Exception as e:
         print(f"[lastreq] delete failed for {session_id[:12]}…: {e}", flush=True)
@@ -311,10 +323,10 @@ def _end_session(session_id, reason="unspecified"):
              or session_id in billing_mod._SESSION_TOTALS or session_id in meta_mod._ENDED)
     marked = False
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("DELETE FROM hold_state WHERE owner=? AND session_id=?",
-                        (warmth_mod._OWNER, session_id))
+                        (store_mod.OWNER, session_id))
             # UPDATE, not upsert: the hook fires for unproxied sessions too —
             # never invent identity rows for sessions this proxy never saw.
             cur = con.execute(
@@ -345,8 +357,8 @@ def _clear_session_ended(session_id):
         return False
     meta_mod._ENDED.pop(session_id, None)
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("UPDATE session_meta SET ended_at=NULL, end_reason=NULL "
                         "WHERE session_id=?", (session_id,))
             con.commit()
@@ -393,8 +405,8 @@ def _sweep_state(now=None):
         meta_mod._LAST_USAGE.pop(sid, None)
     purged = heads = 0
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             purged = con.execute("DELETE FROM warmth WHERE expires_at < ?",
                                  (now - _WARMTH_PURGE_SLACK,)).rowcount
             heads = con.execute("DELETE FROM session_head WHERE updated_at < ?",
@@ -407,7 +419,7 @@ def _sweep_state(now=None):
             if stale:
                 con.executemany(
                     "DELETE FROM last_request WHERE owner=? AND session_id=?",
-                    [(warmth_mod._OWNER, s) for s in stale])
+                    [(store_mod.OWNER, s) for s in stale])
             con.commit()
     except Exception:
         pass

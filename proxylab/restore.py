@@ -26,7 +26,7 @@ from proxylab import core as core_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
-from proxylab import warmth as warmth_mod
+from proxylab import store as store_mod
 
 # --- RESTART-AMNESIA (open item h): reload persisted state at startup ----------
 # Principle: every relevant in-memory structure is persisted/reconstructible, so
@@ -49,17 +49,17 @@ _RESTORED = {"holds": 0, "last_requests": 0, "totals": False,
 def _restore_holds(now=None):
     now = now or time.time()
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             rows = con.execute(
                 "SELECT session_id, until, armed_at, pings, failures, "
                 "last_ping_ts, last_result, hours FROM hold_state WHERE owner=?",
-                (warmth_mod._OWNER,)).fetchall()
+                (store_mod.OWNER,)).fetchall()
             expired = [r[0] for r in rows if r[1] <= now]
             if expired:
                 con.executemany(
                     "DELETE FROM hold_state WHERE owner=? AND session_id=?",
-                    [(warmth_mod._OWNER, s) for s in expired])
+                    [(store_mod.OWNER, s) for s in expired])
                 con.commit()
     except Exception as e:
         print(f"[restore] holds failed: {e}", flush=True)
@@ -83,12 +83,12 @@ def _restore_last_requests(now=None):
     past the same staleness predicate the sweeper uses are reaped instead."""
     now = now or time.time()
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             rows = con.execute(
                 "SELECT session_id, account_uuid, path, ts, body, headers "
                 "FROM last_request WHERE owner=? ORDER BY ts DESC LIMIT ?",
-                (warmth_mod._OWNER, pinger_mod._LAST_REQUEST_MAX)).fetchall()
+                (store_mod.OWNER, pinger_mod._LAST_REQUEST_MAX)).fetchall()
     except Exception as e:
         print(f"[restore] last_requests failed: {e}", flush=True)
         return 0
@@ -114,11 +114,11 @@ def _restore_last_requests(now=None):
                 loaded += 1
     if stale:
         try:
-            con = warmth_mod._warmth_db()
-            with warmth_mod._DB_LOCK:
+            con = store_mod.db()
+            with store_mod.LOCK:
                 con.executemany(
                     "DELETE FROM last_request WHERE owner=? AND session_id=?",
-                    [(warmth_mod._OWNER, s) for s in stale])
+                    [(store_mod.OWNER, s) for s in stale])
                 con.commit()
         except Exception:
             pass
@@ -160,8 +160,8 @@ def _restore_cwd_done():
     """Sessions whose cwd is already in session_meta need no further hunting;
     the rest get their (cheap, capped) scan attempts back after a restart."""
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             rows = con.execute("SELECT session_id FROM session_meta "
                                "WHERE cwd IS NOT NULL").fetchall()
         meta_mod._META_CWD_DONE.update(r[0] for r in rows)
@@ -175,8 +175,8 @@ def _restore_ended():
     """Reload SessionEnd markers so a restart doesn't forget which sessions
     ended (and so a post-restart live turn still clears the right mark)."""
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             rows = con.execute("SELECT session_id, ended_at, end_reason "
                                "FROM session_meta WHERE ended_at IS NOT NULL"
                                ).fetchall()

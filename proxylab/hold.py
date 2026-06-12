@@ -23,6 +23,7 @@ from starlette.routing import Route
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
 from proxylab import transforms as transforms_mod
+from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 from proxylab import writer as writer_mod
 
@@ -151,14 +152,28 @@ _HOLD_RE = re.compile(r"<proxy:warm-cache\s+hours=([0-9.]+|off)\s*>")
 _HOLD_STATE = {}   # sid -> {until, armed_at, pings, failures, last_ping_ts, last_result}
 _HOLD_LOCK = threading.Lock()
 
+# this module's table (see proxylab.store ownership rule): armed holds,
+# mirrored on every change + reloaded at startup (restart-amnesia fix).
+# `hours` = the hold's INSURANCE WINDOW (2026-06-10): `until` slides to
+# last-organic-turn + hours, so until/armed_at no longer encode the duration;
+# legacy NULL rows derive hours from (until - armed_at).
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS hold_state ("
+    "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+    "until REAL NOT NULL, armed_at REAL NOT NULL, "
+    "pings INTEGER NOT NULL, failures INTEGER NOT NULL, "
+    "last_ping_ts REAL, last_result TEXT, "
+    "PRIMARY KEY (owner, session_id))",
+    "ALTER TABLE hold_state ADD COLUMN hours REAL")
+
 
 def _persist_hold_row(session_id, h):
     """Mirror a hold to SQLite (pure intent, nothing secret) so a restart can't
     silently forget a user's /warm-cache. Called OUTSIDE _HOLD_LOCK with a
     snapshot — a store failure degrades to the old in-memory-only behavior."""
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute(
                 "INSERT INTO hold_state(owner, session_id, until, armed_at, "
                 "pings, failures, last_ping_ts, last_result, hours) "
@@ -168,7 +183,7 @@ def _persist_hold_row(session_id, h):
                 "pings=excluded.pings, failures=excluded.failures, "
                 "last_ping_ts=excluded.last_ping_ts, "
                 "last_result=excluded.last_result, hours=excluded.hours",
-                (warmth_mod._OWNER, session_id, h["until"], h["armed_at"],
+                (store_mod.OWNER, session_id, h["until"], h["armed_at"],
                  h.get("pings", 0), h.get("failures", 0),
                  h.get("last_ping_ts"), h.get("last_result"),
                  h.get("hours")))
@@ -179,10 +194,10 @@ def _persist_hold_row(session_id, h):
 
 def _delete_hold_row(session_id):
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("DELETE FROM hold_state WHERE owner=? AND session_id=?",
-                        (warmth_mod._OWNER, session_id))
+                        (store_mod.OWNER, session_id))
             con.commit()
     except Exception as e:
         print(f"[hold] row delete failed for {session_id[:12]}…: {e}", flush=True)

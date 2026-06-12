@@ -21,7 +21,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 from proxylab import pinger as pinger_mod
-from proxylab import warmth as warmth_mod
+from proxylab import store as store_mod
 from proxylab import writer as writer_mod
 
 # --- session metadata (title / cwd / model) for /_status ----------------------
@@ -38,6 +38,27 @@ _ENDED = {}     # sid -> {"ts","reason"}: SessionEnd markers (mirror of
                 # session_meta.ended_at; a live turn = resume, clears both)
 _META_CWD_MAX_TRIES = 5    # env block shows up in the first turns or never
 
+# this module's table (see proxylab.store ownership rule): durable session
+# identity for /_status — title (harvested from the CLI's title side-call),
+# cwd, model — so the session list is useful right after a restart, when the
+# in-memory _LAST_REQUEST is empty. Column notes:
+#   kind     — tags sessions the PROXY ITSELF spawned (auth bootstrap), kept
+#              out of the human's session list. NULL = a real user session.
+#   ended_at/end_reason — the SessionEnd MARKER (2026-06-11): a durable FACT,
+#              not a delete (a live turn = resume, clears it); cleanup belongs
+#              to the staleness sweeper.
+#   agent    — the /agent/<name>/ route identity (2026-06-12), any wire. SDK
+#              sessions never make the title side-call, so the route name is
+#              the only label they'll ever have.
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS session_meta ("
+    "session_id TEXT PRIMARY KEY, title TEXT, cwd TEXT, "
+    "model TEXT, first_seen REAL NOT NULL, last_seen REAL NOT NULL)",
+    "ALTER TABLE session_meta ADD COLUMN kind TEXT",
+    "ALTER TABLE session_meta ADD COLUMN ended_at REAL",
+    "ALTER TABLE session_meta ADD COLUMN end_reason TEXT",
+    "ALTER TABLE session_meta ADD COLUMN agent TEXT")
+
 
 def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
                          kind=None, agent=None):
@@ -47,8 +68,8 @@ def _upsert_session_meta(session_id, title=None, cwd=None, model=None, now=None,
         return
     now = now or time.time()
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute(
                 "INSERT INTO session_meta(session_id, title, cwd, model, "
                 "first_seen, last_seen, kind, agent) VALUES(?,?,?,?,?,?,?,?) "

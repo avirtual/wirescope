@@ -85,8 +85,8 @@ res = lp._strip_compact_cache(compact_obj())
 check("WARM declines the strip", res is not None and res["condition_met"] is False)
 
 # lapse the row in place -> 'cold' (row present, expired) must STRIP
-con = lp._warmth_db()
-with lp._DB_LOCK:
+con = lp.store.db()
+with lp.store.LOCK:
     con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
                 (time.time() - 30, h_hist))
     con.commit()
@@ -99,7 +99,7 @@ check("COLD strips the discarded history marker",
 # the housekeeping purge removes the lapsed row -> 'absent' must STRIP THE SAME
 # (this is the regression the old semantic sweeper failed: cold evidence reaped
 # at bare ttl flipped the gate to decline)
-with lp._DB_LOCK:
+with lp.store.LOCK:
     con.execute("DELETE FROM warmth")
     con.commit()
 check("purged row reads 'absent'", lp.warmth_state(h_hist) == "absent")

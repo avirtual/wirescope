@@ -11,6 +11,7 @@ import httpx
 from starlette.responses import Response
 
 from proxylab import codex as codex_mod
+from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 
 # --- SUBSCRIBERS (on by default; active only for /agent/ routes) --------------
@@ -52,37 +53,27 @@ _SESSION_AGENT = {}     # session_id -> agent name (for session.ended routing;
 _sub_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0), follow_redirects=False)
 
 
-# --- persistence (subscribers table in warmth.sqlite, owner-scoped) -----------
-# The callback token persists too — it is the SUBSCRIBER's shared secret for
-# its own endpoint, not an Anthropic credential (those never persist, standing
-# rule). Documented in SUBSCRIBERS.md.
-_TABLE_READY = False
-
-
-def _subs_db():
-    global _TABLE_READY
-    con = warmth_mod._warmth_db()
-    if not _TABLE_READY:
-        with warmth_mod._DB_LOCK:
-            con.execute("CREATE TABLE IF NOT EXISTS subscribers ("
-                        "owner TEXT NOT NULL, url TEXT NOT NULL, id TEXT NOT NULL, "
-                        "name TEXT, token TEXT, agents TEXT NOT NULL, "
-                        "events TEXT NOT NULL, created_at REAL NOT NULL, "
-                        "suspended INTEGER NOT NULL DEFAULT 0, "
-                        "PRIMARY KEY (owner, url))")
-            con.commit()
-        _TABLE_READY = True
-    return con
+# --- persistence (this module's table; see proxylab.store ownership rule) -----
+# Owner-scoped registrations. The callback token persists too — it is the
+# SUBSCRIBER's shared secret for its own endpoint, not an Anthropic credential
+# (those never persist, standing rule). Documented in SUBSCRIBERS.md.
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS subscribers ("
+    "owner TEXT NOT NULL, url TEXT NOT NULL, id TEXT NOT NULL, "
+    "name TEXT, token TEXT, agents TEXT NOT NULL, "
+    "events TEXT NOT NULL, created_at REAL NOT NULL, "
+    "suspended INTEGER NOT NULL DEFAULT 0, "
+    "PRIMARY KEY (owner, url))")
 
 
 def _persist(sub):
     try:
-        con = _subs_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("INSERT OR REPLACE INTO subscribers "
                         "(owner, url, id, name, token, agents, events, created_at, suspended) "
                         "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (warmth_mod._OWNER, sub["url"], sub["id"], sub.get("name"),
+                        (store_mod.OWNER, sub["url"], sub["id"], sub.get("name"),
                          sub.get("token") or "", json.dumps(sub["agents"]),
                          json.dumps(sub["events"]), sub["created_at"],
                          1 if sub.get("suspended") else 0))
@@ -93,10 +84,10 @@ def _persist(sub):
 
 def _unpersist(url):
     try:
-        con = _subs_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             con.execute("DELETE FROM subscribers WHERE owner=? AND url=?",
-                        (warmth_mod._OWNER, url))
+                        (store_mod.OWNER, url))
             con.commit()
     except Exception as e:
         print(f"[subs] unpersist failed for {url}: {e}", flush=True)
@@ -108,11 +99,11 @@ def _load_subscribers():
     if not SUBSCRIBERS:
         return 0
     try:
-        con = _subs_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             rows = con.execute(
                 "SELECT url, id, name, token, agents, events, created_at, suspended "
-                "FROM subscribers WHERE owner=?", (warmth_mod._OWNER,)).fetchall()
+                "FROM subscribers WHERE owner=?", (store_mod.OWNER,)).fetchall()
     except Exception as e:
         print(f"[subs] load failed: {e}", flush=True)
         return 0

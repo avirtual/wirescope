@@ -28,6 +28,7 @@ from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
 from proxylab import restore as restore_mod
 from proxylab import subs as subs_mod
+from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 
 def _status_snapshot(session=None, all_sessions=False):
@@ -44,8 +45,8 @@ def _status_snapshot(session=None, all_sessions=False):
     holds = hold_mod._hold_snapshot()
     meta_rows, meta_err = {}, None
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             q = ("SELECT session_id, title, cwd, model, first_seen, last_seen, "
                  "kind, ended_at, end_reason, agent FROM session_meta")
             if session:

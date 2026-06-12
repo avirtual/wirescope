@@ -23,7 +23,7 @@ from starlette.routing import Route
 from proxylab import codex as codex_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
-from proxylab import warmth as warmth_mod
+from proxylab import store as store_mod
 from proxylab import writer as writer_mod
 
 # --- /_admin: the /_status snapshot rendered for humans ------------------------
@@ -221,11 +221,11 @@ def _load_last_request_row(session_id):
     """Read this proxy's persisted replayable request straight from SQLite —
     fallback for entries not in memory (e.g. evicted past the cap)."""
     try:
-        con = warmth_mod._warmth_db()
-        with warmth_mod._DB_LOCK:
+        con = store_mod.db()
+        with store_mod.LOCK:
             r = con.execute("SELECT path, ts, body FROM last_request "
                             "WHERE owner=? AND session_id=?",
-                            (warmth_mod._OWNER, session_id)).fetchone()
+                            (store_mod.OWNER, session_id)).fetchone()
         if r:
             body = json.loads(r[2])
             # openai rows never need auth — they exist for the view only
