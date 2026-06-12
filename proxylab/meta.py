@@ -77,6 +77,10 @@ _CONTEXT_STATS = {}
 # /_session can show the answer to the final user message — it exists only in
 # the response until the next turn re-ships it. In-memory only; /_end drops it.
 _LAST_RESPONSE = {}
+# Latest main-line token receipts per session (the billing `tokens` dict +
+# est_usd + ts), straight from the response: what was cache-read vs (re)written
+# vs shipped uncached on the last turn. /_session's header bar. In-memory only.
+_LAST_USAGE = {}
 
 
 def _is_prompt_msg(m):

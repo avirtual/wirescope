@@ -744,6 +744,39 @@ check("session view never renders headers",
 check("session view handles a missing entry",
       "no replayable request" in lp._render_session_html(
           "nope", None, lp._status_snapshot(session="nope")))
+# /_session affordances (2026-06-12): cache-boundary dividers, expand-without-
+# duplication previews, slim tool lines, last-turn token receipts in the header
+check("a marked system block draws a cache-boundary divider",
+      "cache breakpoint 1 · ttl 1h" in _sv and "prefix above" in _sv)
+check("tool churn renders as slim collapsed lines, not full blocks",
+      'class="tline tooluse"' in _sv and 'class="tline toolres"' in _sv)
+_pv = lp._prevu("HEAD!" + "y" * 100, cap=5)
+check("preview expansion continues the text instead of duplicating it",
+      _pv.count("HEAD!") == 1 and "show remaining 100 of 105 ch" in _pv
+      and "y" * 100 in _pv)
+_mk_entry = {
+    "obj": {"model": "claude-fable-5",
+            "tools": [{"name": "Bash", "input_schema": {},
+                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "system": [],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi",
+                 "cache_control": {"type": "ephemeral"}}]}]},
+    "path": "/v1/messages", "ts": time.time(), "needs_auth": False}
+_mkv = lp._render_session_html("sess-meta-1", _mk_entry,
+                               lp._status_snapshot(session="sess-meta-1"))
+check("breakpoints number through canonical order: tools first, then messages "
+      "(message markers default to 5m)",
+      "cache breakpoint 1 · ttl 1h" in _mkv
+      and "cache breakpoint 2 · ttl 5m" in _mkv)
+_uv = lp._render_session_html(
+    "sess-meta-1", _sv_entry, lp._status_snapshot(session="sess-meta-1"),
+    usage={"cache_read_input_tokens": 12000, "cache_write_1h_tokens": 300,
+           "input_tokens": 7, "output_tokens": 42, "est_usd": 0.0123,
+           "ts": time.time()})
+check("token receipts from the last response render in the header",
+      "cache read" in _uv and "12.0k" in _uv and "cache written" in _uv
+      and "$0.0123" in _uv)
 _tv_entry = {
     "obj": {"model": "claude-fable-5", "tools": [], "system": "sys",
             "messages": [

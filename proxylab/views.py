@@ -199,6 +199,19 @@ pre{white-space:pre-wrap;word-break:break-word;color:#aab2c0;margin:.3em 0;
 details>summary{cursor:pointer;color:#6ab0de}
 .turnhdr{margin:1.2em 0 .35em;padding-bottom:.15em;color:#9aa3b2;
          font-weight:bold;border-bottom:1px solid #2a2e36}
+pre.pv{margin-bottom:0}
+details.more>pre{margin-top:0}
+details.more>summary{color:#69707d;font-size:12px}
+.tline{margin:.15em 0 .15em .4em;padding:0 .6em;font-size:12px;color:#8a93a3;
+       border-left:2px solid #2a2e36}
+.tline.tooluse{border-left-color:#8a7635}
+.tline.toolres{border-left-color:#6e5577}
+.tline.assistant{border-left-color:#3f5c4a}
+.tline summary{color:#8a93a3} .tline summary:hover{color:#cdd3dd}
+.tline .sz{float:right;color:#4d535e;margin-left:1em}
+.tline pre{max-height:20em}
+.cmark{margin:.8em 0 .6em;border-top:2px dashed #b08a3e;color:#e5c07b;
+       font-size:12px;padding-top:.15em}
 """
 
 _MD_HEADING_RE = re.compile(r"(?m)^#{1,3} .+$")
@@ -239,16 +252,45 @@ def _flat_text(content):
 
 
 def _prevu(text, cap=350, full_cap=60000):
-    """Escaped preview <pre> + a <details> with the (capped) full text."""
+    """Escaped preview <pre> + a <details> holding the REMAINDER — expanding
+    continues the text where the preview stopped, it never re-shows it."""
     t = text or ""
     if not t:
         return ""
     if len(t) <= cap:
         return f"<pre>{html.escape(t)}</pre>"
     more = "" if len(t) <= full_cap else f"\n… (+{len(t) - full_cap:,} more ch)"
-    return (f"<pre>{html.escape(t[:cap])}…</pre>"
-            f"<details><summary>show all {len(t):,} ch</summary>"
-            f"<pre>{html.escape(t[:full_cap])}{html.escape(more)}</pre></details>")
+    return (f'<pre class="pv">{html.escape(t[:cap])}</pre>'
+            f'<details class="more"><summary>&hellip; show remaining '
+            f'{len(t) - cap:,} of {len(t):,} ch</summary>'
+            f"<pre>{html.escape(t[cap:full_cap])}{html.escape(more)}</pre></details>")
+
+
+def _tline(cls, label, what, body, cap=2000):
+    """A slim, collapsed one-liner for tool churn (tool_use / tool_result /
+    thinking): the timeline reads as conversation; payloads are a click away."""
+    t = body or ""
+    snip = html.escape(t[:90].replace("\n", " ")) + ("…" if len(t) > 90 else "")
+    if not t:
+        return (f'<div class="tline {cls}"><span class="sz">0 ch</span>'
+                f'{label} {what}</div>')
+    return (f'<div class="tline {cls}"><details><summary>'
+            f'<span class="sz">{len(t):,} ch</span>{label} {what} '
+            f'<span class="dim">{snip}</span></summary>'
+            f'{_prevu(t, cap=cap)}</details></div>')
+
+
+def _cc_ttl(cc):
+    return (cc.get("ttl") or "5m") if isinstance(cc, dict) else "5m"
+
+
+def _cmark(n, cc, cum_ch):
+    """The cache-boundary divider: everything ABOVE this line is one cached
+    prefix unit (breakpoints cache cumulatively in canonical order
+    tools -> system -> messages). cum_ch = canonical-order chars so far."""
+    return (f'<div class="cmark">&#9986; cache breakpoint {n} · '
+            f'ttl {html.escape(_cc_ttl(cc))} · prefix above '
+            f'&approx;{html.escape(_fmt_tok(cum_ch // 4))} tok</div>')
 
 
 def _render_session_openai_body(entry, resp=None):
@@ -315,28 +357,21 @@ def _render_session_openai_body(entry, resp=None):
                             f'<span class="role">#{i} {e(role)}</span>'
                             f'{machine}{_prevu(txt)}</div>')
         elif t == "function_call":
-            args = it.get("arguments") or ""
-            rows.append(f'<div class="blk tooluse">'
-                        f'<span class="sz">{len(args):,} ch</span>'
-                        f'<span class="role">#{i} assistant</span> '
-                        f'function_call <b>{e(it.get("name") or "?")}</b>'
-                        f'{_prevu(args, cap=200)}</div>')
+            rows.append(_tline("tooluse", f'<span class="role">#{i} assistant</span>',
+                               f'function_call <b>{e(it.get("name") or "?")}</b>',
+                               it.get("arguments") or ""))
         elif t == "function_call_output":
             out = it.get("output")
             txt = out if isinstance(out, str) else json.dumps(out or "")
-            rows.append(f'<div class="blk toolres">'
-                        f'<span class="sz">{len(txt):,} ch</span>'
-                        f'<span class="role">#{i} tool</span> '
-                        f'function_call_output{_prevu(txt, cap=200)}</div>')
+            rows.append(_tline("toolres", f'<span class="role">#{i} tool</span>',
+                               "function_call_output", txt))
         elif t == "reasoning":
             enc = it.get("encrypted_content") or ""
             summ = "\n".join(s.get("text") or "" for s in (it.get("summary") or [])
                              if isinstance(s, dict))
-            rows.append(f'<div class="blk assistant">'
-                        f'<span class="sz">{len(enc):,} ch</span>'
-                        f'<span class="role">#{i} assistant</span> reasoning '
-                        f'<span class="dim">(encrypted)</span>'
-                        f'{_prevu(summ, cap=120)}</div>')
+            rows.append(_tline("assistant", f'<span class="role">#{i} assistant</span>',
+                               f'reasoning <span class="dim">(encrypted, '
+                               f'{len(enc):,} ch)</span>', summ))
         else:
             rows.append(f'<div class="blk"><span class="role">#{i}</span> '
                         f'<span class="dim">{e(str(t))}</span></div>')
@@ -356,7 +391,7 @@ def _render_session_openai_body(entry, resp=None):
     return bar + tools_html + sb + "".join(rows)
 
 
-def _render_session_html(sid, entry, snap, resp=None):
+def _render_session_html(sid, entry, snap, resp=None, usage=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
     w = s.get("warmth") or {}
@@ -370,6 +405,23 @@ def _render_session_html(sid, entry, snap, resp=None):
             f'<span>model <b>{e(writer_mod._short_model(s.get("model")))}</b></span>'
             f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
             f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
+    if usage:    # token receipts from the last response (in-memory; see
+                 # meta._LAST_USAGE) — what actually got read vs (re)written
+        rd = usage.get("cache_read_input_tokens") or 0
+        wr = ((usage.get("cache_write_5m_tokens") or 0)
+              + (usage.get("cache_write_1h_tokens") or 0)) \
+            or usage.get("cache_write_flat_tokens") or 0
+        inp = usage.get("input_tokens") or 0
+        out = usage.get("output_tokens") or 0
+        usd = usage.get("est_usd")
+        head += (f'<p class="kv"><span class="dim">last turn '
+                 f'({e(_fmt_ago(usage.get("ts")))}):</span>'
+                 f'<span>cache read <b class="warm">{e(_fmt_tok(rd))}</b></span>'
+                 f'<span>cache written <b class="warn">{e(_fmt_tok(wr))}</b></span>'
+                 f'<span>uncached in <b>{e(_fmt_tok(inp))}</b></span>'
+                 f'<span>out <b>{e(_fmt_tok(out))}</b></span>'
+                 f'<span class="dim">context = {e(_fmt_tok(rd + wr + inp))} tok'
+                 f'{f" · ${usd:.4f}" if usd is not None else ""}</span></p>')
     if entry and codex_mod._is_openai_body(entry.get("obj") or {}):
         body = _render_session_openai_body(entry, resp=resp)
         foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
@@ -405,6 +457,11 @@ def _render_session_html(sid, entry, snap, resp=None):
                f'<span>messages <b>{len(msgs)}</b> &approx;{e(_fmt_tok(m_ch // 4))} tok</span>'
                f'{turns_link}'
                f'<span class="dim">sizes are chars; tok &approx; ch/4</span></p>')
+        # cache breakpoints number through the CANONICAL prefix order
+        # tools -> system -> messages; cum_ch tracks chars in that order so
+        # each divider can price the prefix it closes (tok ≈ ch/4).
+        mark_n = 0
+        cum_ch = t_ch
         if tools:
             trs = "".join(
                 f'<tr><td><b>{e(t.get("name", "?"))}</b></td>'
@@ -414,20 +471,28 @@ def _render_session_html(sid, entry, snap, resp=None):
             tools_html = (f'<details><summary>tools · {len(tools)} · '
                           f'&approx;{e(_fmt_tok(t_ch // 4))} tok</summary>'
                           f'<table>{trs}</table></details>')
+            tcc = next((t.get("cache_control") for t in tools
+                        if isinstance(t, dict) and t.get("cache_control")), None)
+            if tcc:
+                mark_n += 1
+                tools_html += _cmark(mark_n, tcc, cum_ch)
         else:
             tools_html = '<p class="dim">no tools</p>'
         sb = []
         for i, b in enumerate(sysb):
             txt = b.get("text") or ""
+            cum_ch += len(txt)
             cc = b.get("cache_control")
-            badge = (f'<span class="badge on">cache '
-                     f'{e((cc.get("ttl") or "5m") if isinstance(cc, dict) else "5m")}'
-                     f'</span>' if cc else "")
+            badge = (f'<span class="badge on">cache {e(_cc_ttl(cc))}</span>'
+                     if cc else "")
             heads = _MD_HEADING_RE.findall(txt)
             hl = " · ".join(e(h.lstrip("# ")) for h in heads[:12])
             sb.append(f'<div class="blk sysb"><span class="sz">{len(txt):,} ch</span>'
                       f'<span class="role">system[{i}]</span> {badge} '
                       f'<span class="dim">{hl}</span>{_prevu(txt, cap=160)}</div>')
+            if cc:
+                mark_n += 1
+                sb.append(_cmark(mark_n, cc, cum_ch))
         rows = []
         turn = 0
         for i, mm in enumerate(msgs):
@@ -439,14 +504,17 @@ def _render_session_html(sid, entry, snap, resp=None):
                        if turn == n_turns else '')
                 rows.append(f'<div class="turnhdr" id="turn-{turn}">'
                             f'turn {turn}{cur}</div>')
+            cum_ch += len(json.dumps(mm)) if isinstance(mm, dict) else 0
             role = mm.get("role", "?")
             content = mm.get("content")
             blocks = (content if isinstance(content, list)
                       else [{"type": "text", "text": content or ""}])
+            mcc = None
             for b in blocks:
                 if not isinstance(b, dict):
                     continue
                 bt = b.get("type")
+                mcc = b.get("cache_control") or mcc
                 pin = " &#128204;" if b.get("cache_control") else ""
                 lbl = f'<span class="role">#{i} {e(role)}{pin}</span>'
                 if bt == "text":
@@ -458,25 +526,23 @@ def _render_session_html(sid, entry, snap, resp=None):
                                 f'{lbl}{rem}{_prevu(txt)}</div>')
                 elif bt == "tool_use":
                     args = json.dumps(b.get("input") or {}, ensure_ascii=False)
-                    rows.append(f'<div class="blk tooluse">'
-                                f'<span class="sz">{len(args):,} ch</span>'
-                                f'{lbl} tool_use <b>{e(b.get("name") or "?")}</b>'
-                                f'{_prevu(args, cap=200)}</div>')
+                    rows.append(_tline("tooluse", lbl,
+                                       f'tool_use <b>{e(b.get("name") or "?")}</b>',
+                                       args))
                 elif bt == "tool_result":
                     txt = _flat_text(b.get("content"))
                     err = (' <span class="bad">ERROR</span>'
                            if b.get("is_error") else "")
-                    rows.append(f'<div class="blk toolres">'
-                                f'<span class="sz">{len(txt):,} ch</span>'
-                                f'{lbl} tool_result{err}{_prevu(txt, cap=200)}</div>')
+                    rows.append(_tline("toolres", lbl, f"tool_result{err}", txt))
                 elif bt == "thinking":
-                    txt = b.get("thinking") or ""
-                    rows.append(f'<div class="blk assistant">'
-                                f'<span class="sz">{len(txt):,} ch</span>'
-                                f'{lbl} thinking{_prevu(txt, cap=120)}</div>')
+                    rows.append(_tline("assistant", lbl, "thinking",
+                                       b.get("thinking") or ""))
                 else:
                     rows.append(f'<div class="blk">{lbl} '
                                 f'<span class="dim">{e(str(bt))}</span></div>')
+            if mcc:
+                mark_n += 1
+                rows.append(_cmark(mark_n, mcc, cum_ch))
         # The answer to the FINAL user message lives only in the response until
         # the next turn re-ships it as input — a request-only view always
         # lagged one answer. Append it when fresher than the captured request.

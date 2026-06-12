@@ -191,6 +191,10 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                 # tool-loop hops come back text-less (reasoning+calls only).
                 bill = billing_mod._billing_openai(
                     meta.get("resolved_model") or model, u)
+                if session_id:    # /_session header receipts (same as anthropic)
+                    meta_mod._LAST_USAGE[session_id] = {
+                        **(bill.get("tokens") or {}),
+                        "est_usd": bill.get("est_usd"), "ts": time.time()}
                 stop = {"stop_reason": meta.get("status"),
                         "is_turn": (meta.get("status") == "completed"
                                     and bool(meta.get("text")))}
@@ -253,7 +257,8 @@ async def handler(request: Request) -> Response:
             entry = views_mod._load_last_request_row(sess)
         return Response(views_mod._render_session_html(sess, entry,
                                              status_mod._status_snapshot(session=sess),
-                                             resp=meta_mod._LAST_RESPONSE.get(sess)),
+                                             resp=meta_mod._LAST_RESPONSE.get(sess),
+                                             usage=meta_mod._LAST_USAGE.get(sess)),
                         media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
@@ -599,6 +604,13 @@ async def handler(request: Request) -> Response:
                                     model_resolved=meta.get("resolved_model") or model,
                                     usage_final=meta.get("usage_final"),
                                     usage_start=meta.get("usage_start"))
+                    # token receipts for /_session's header (main line only —
+                    # a subagent's usage must not clobber the parent's)
+                    if (session_id and not title_call
+                            and role in ("parent", "unknown")):
+                        meta_mod._LAST_USAGE[session_id] = {
+                            **(bill.get("tokens") or {}),
+                            "est_usd": bill.get("est_usd"), "ts": time.time()}
                     # Refresh the prefix-warmth ledger off-thread (hash the prefix
                     # this response cached + stamp now/ttl). obj is the forwarded
                     # (post-transform) body = exactly what the backend addressed.

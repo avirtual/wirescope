@@ -390,6 +390,7 @@ def _sweep_state(now=None):
         # identity stay — they're durable facts, not runtime state)
         meta_mod._CONTEXT_STATS.pop(sid, None)
         meta_mod._LAST_RESPONSE.pop(sid, None)
+        meta_mod._LAST_USAGE.pop(sid, None)
     purged = heads = 0
     try:
         con = warmth_mod._warmth_db()
