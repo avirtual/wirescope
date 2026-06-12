@@ -315,8 +315,15 @@ def _bump(totals, bill, stop=None):
         totals["turns"] = totals.get("turns", 0) + 1
     if stop and stop.get("stop_reason") == "refusal":
         totals["refusals"] = totals.get("refusals", 0) + 1
+        # keep the FULL stop_details: the category + ToS explanation are the
+        # only non-generic facts (the CLI flattens this to a toast), and the
+        # /_session refusal banner renders them. `at` (epoch) lets the view
+        # tell whether the captured last request IS the blocked context.
         ev = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "at": round(time.time(), 3),
+              "model": bill.get("model"),
               "category": (stop.get("stop_details") or {}).get("category"),
+              "stop_details": stop.get("stop_details"),
               "request_id": stop.get("request_id")}
         totals.setdefault("refusal_events", []).append(ev)
         del totals["refusal_events"][:-20]      # keep the last 20

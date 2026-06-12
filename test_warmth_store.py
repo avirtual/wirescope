@@ -296,6 +296,43 @@ check("refusal bumps the counter once (end_turn doesn't)",
 check("refusal evidence recorded (category + request_id)",
       tot3["refusal_events"][0]["category"] == "reasoning_extraction"
       and tot3["refusal_events"][0]["request_id"] == "req_test123")
+check("full stop_details + model + epoch kept (the wire truth the CLI eats)",
+      tot3["refusal_events"][0]["stop_details"] == {"category": "reasoning_extraction"}
+      and tot3["refusal_events"][0]["model"] == "claude-fable-5"
+      and tot3["refusal_events"][0]["at"] > 0)
+
+# --- refusal surfacing: /_status + /_admin link + /_session banner ------------
+lp._upsert_session_meta("sess-ref-1", cwd="/tmp/ref", model="claude-fable-5")
+lp._bump(lp._SESSION_TOTALS["sess-ref-1"], bill2,
+         stop={"stop_reason": "refusal",
+               "stop_details": {"category": "reasoning_extraction",
+                                "explanation": "ToS: duplicating model outputs"},
+               "request_id": "req_ref456"})
+st_ref = lp._status_snapshot(session="sess-ref-1")["sessions"][0]
+check("status exposes refusal_events per session",
+      st_ref["refusals"] == 1
+      and st_ref["refusal_events"][0]["request_id"] == "req_ref456")
+check("admin ref count links to the session refusal banner",
+      "/_session?session=sess-ref-1#refusals"
+      in lp._render_admin_html(lp._status_snapshot(session="sess-ref-1")))
+_ref_entry = {"obj": compact_obj(sid="sess-ref-1"), "ts": time.time() - 60,
+              "path": "/v1/messages"}
+_rv = lp._render_session_html("sess-ref-1", _ref_entry,
+                              lp._status_snapshot(session="sess-ref-1"))
+check("session page renders the refusal banner (category + explanation)",
+      'id="refusals"' in _rv and "reasoning_extraction" in _rv
+      and "duplicating model outputs" in _rv)
+check("refusal newer than the capture -> flags it as the blocked context",
+      "IS the" in _rv)
+_rv2 = lp._render_session_html(
+    "sess-ref-1", {**_ref_entry, "ts": time.time() + 60},
+    lp._status_snapshot(session="sess-ref-1"))
+check("a fresher capture -> banner says the context post-dates the refusal",
+      "post-dates the refusal" in _rv2 and "IS the" not in _rv2)
+check("no refusals -> no banner",
+      'id="refusals"' not in lp._render_session_html(
+          "sess-meta-none", None, lp._status_snapshot(session="sess-meta-none")))
+del lp._SESSION_TOTALS["sess-ref-1"]   # don't leak into later totals checks
 
 # --- hold-warm: sentinel parse ---------------------------------------------------
 def hold_obj(text):

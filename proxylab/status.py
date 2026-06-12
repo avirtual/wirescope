@@ -122,6 +122,9 @@ def _status_snapshot(session=None, all_sessions=False):
                       "unpriced_requests": tot["unpriced_requests"]}
                      if tot else None),
             "refusals": (tot or {}).get("refusals", 0),
+            # last ≤20 classifier hits, wire-truth detail (full stop_details);
+            # the CLI only ever showed a generic toast
+            "refusal_events": (tot or {}).get("refusal_events") or None,
             # receipt-counted completed turns + the latest request-derived
             # heaviness snapshot (turns_in_context resets at /compact)
             "turns_completed": (tot or {}).get("turns"),

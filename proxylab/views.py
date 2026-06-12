@@ -182,7 +182,11 @@ def _render_admin_html(snap, host=""):
             f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'
             f'<td>{e(_fmt_ago(s.get("last_seen"), now))}</td>'
             f'<td>{hold}</td><td>{ping}</td><td>{cost}</td>'
-            f'<td class="{"bad" if sref else "dim"}">{sref or "—"}</td></tr>')
+            # ref count links to the session page's refusal banner (wire
+            # truth: category + stop_details the CLI never showed)
+            f'<td class="{"bad" if sref else "dim"}">'
+            + (f'<a class="bad" href="/_session?session={e(sid)}#refusals">'
+               f'{sref}</a>' if sref else "—") + '</td></tr>')
     table = ('<table><tr><th>warmth</th><th>session</th><th>last seen</th>'
              '<th>hold</th><th>pingable</th><th>cost</th><th>ref</th></tr>'
              + "".join(rows) + "</table>") if rows else "<p class=dim>no sessions tracked</p>"
@@ -438,6 +442,39 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None):
                  f'<span>out <b>{e(_fmt_tok(out))}</b></span>'
                  f'<span class="dim">context = {e(_fmt_tok(rd + wr + inp))} tok'
                  f'{f" · ${usd:.4f}" if usd is not None else ""}</span></p>')
+    revs = s.get("refusal_events") or []
+    if revs:
+        # server-side classifier hits: the model never ran, the CLI showed a
+        # generic toast — the category + stop_details here are the only truth.
+        # When the LAST refusal post-dates the captured request, the timeline
+        # below is the exact context that got blocked.
+        latest_at = revs[-1].get("at") or 0
+        if latest_at and entry and latest_at >= (entry.get("ts") or 0):
+            note = (' · <span class="warn">the captured request below IS the '
+                    'context the classifier blocked</span>')
+        elif latest_at:
+            note = (' · a turn has succeeded since — the context below '
+                    'post-dates the refusal')
+        else:
+            note = ''
+        items = []
+        for ev in reversed(revs):
+            det = ev.get("stop_details")
+            detv = (f'<details><summary>stop_details</summary>'
+                    f'<pre>{e(json.dumps(det, indent=2, ensure_ascii=False))}'
+                    f'</pre></details>' if det else "")
+            items.append(
+                f'<div class="blk sysb"><span class="sz">{e(str(ev.get("ts") or "?"))}</span>'
+                f'<span class="bad">refusal</span> '
+                f'<b>{e(str(ev.get("category") or "uncategorized"))}</b> '
+                f'<span class="dim">{e(writer_mod._short_model(ev.get("model")))} · '
+                f'reqid {e(str(ev.get("request_id") or "?"))}</span>{detv}</div>')
+        head += (f'<div id="refusals"><p class="kv">'
+                 f'<span class="bad">&#9940; {len(revs)} refusal'
+                 f'{"s" if len(revs) != 1 else ""} this session</span>'
+                 f'<span class="dim">server-side classifier (model never ran; '
+                 f'CLI saw a generic toast){note}</span></p>'
+                 + "".join(items) + "</div>")
     if entry and codex_mod._is_openai_body(entry.get("obj") or {}):
         body = _render_session_openai_body(entry, resp=resp)
         foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
