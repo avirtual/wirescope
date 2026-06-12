@@ -112,7 +112,11 @@ def _status_snapshot(session=None, all_sessions=False):
             "warmth": {"state": ("warm" if wq.get("warm")
                                  else "cold" if wq.get("found") else "absent"),
                        "remaining_s": wq.get("remaining_s"),
-                       "ttl_s": wq.get("ttl_s")},
+                       "ttl_s": wq.get("ttl_s"),
+                       # leading-breakpoint segments (tools / tools+system),
+                       # content-addressed → shared across sessions with
+                       # identical layouts; display-grade only
+                       "segments": warmth_mod.warmth_segments(sid)},
             "hold": hold,
             "cost": ({"est_usd": tot["est_usd"], "requests": tot["requests"],
                       "unpriced_requests": tot["unpriced_requests"]}

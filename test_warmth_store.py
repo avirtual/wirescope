@@ -148,6 +148,88 @@ check("/_end on a session the proxy never saw invents nothing",
 lp._clear_session_ended("sess-test-1")
 check("live turn clears the ended marker", "sess-test-1" not in lp._ENDED)
 
+# --- leading-breakpoint segments (display-grade; 2026-06-12) -------------------
+# marker 1 = tools, marker 2 = tools+system: content-addressed so sessions with
+# byte-identical layouts share rows; a sibling's traffic keeps them warm after
+# this session's own message tail lapses. Eye candy — no gate reads these.
+
+def seg_obj(sid, question, ttl="1h", tool_desc="edit a file",
+            with_billing_block=False):
+    cc = ({"type": "ephemeral", "ttl": "1h"} if ttl == "1h"
+          else {"type": "ephemeral"})
+    sysb = [{"type": "text", "text": "You are Claude Code, a CLI."},
+            {"type": "text", "text": "# Environment\ncwd: /tmp",
+             "cache_control": dict(cc)}]
+    if with_billing_block:
+        sysb.insert(0, {"type": "text",
+                        "text": "x-anthropic-billing-header: cch=42"})
+    return {"model": "claude-fable-5",
+            "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "tools": [{"name": "Read", "description": "read a file",
+                       "input_schema": {"type": "object"}},
+                      {"name": "Edit", "description": tool_desc,
+                       "input_schema": {"type": "object"},
+                       "cache_control": dict(cc)}],
+            "system": sysb,
+            "messages": [msg("user", question),
+                         {"role": "user", "content": [
+                             {"type": "text", "text": "go",
+                              "cache_control": dict(cc)}]}]}
+
+sa, sb = seg_obj("seg-A", "build the thing " * 60), seg_obj("seg-B", "fix the bug " * 60)
+ga, gb = lp._segment_hashes(sa), lp._segment_hashes(sb)
+check("identical layouts -> identical segment hashes (the sharing claim)",
+      ga["tools"]["hash"] == gb["tools"]["hash"]
+      and ga["system"]["hash"] == gb["system"]["hash"])
+check("…while their message-tail prefixes differ",
+      lp._prefix_hash(sa, 2) != lp._prefix_hash(sb, 2))
+check("segment ttl read from its own marker",
+      ga["tools"]["ttl"] == 3600
+      and lp._segment_hashes(seg_obj("x", "q", ttl="5m"))["tools"]["ttl"] == 300)
+check("marker ttl is an attribute, not identity (5m and 1h hash the same)",
+      lp._segment_hashes(seg_obj("x", "q", ttl="5m"))["tools"]["hash"]
+      == ga["tools"]["hash"])
+check("a changed tool description changes BOTH segment hashes (byte-exact)",
+      lp._segment_hashes(seg_obj("x", "q", tool_desc="edit a FILE"))["tools"]["hash"]
+      != ga["tools"]["hash"]
+      and lp._segment_hashes(seg_obj("x", "q", tool_desc="edit a FILE"))["system"]["hash"]
+      != ga["system"]["hash"])
+check("billing-header block excluded from the system segment (out-of-band)",
+      lp._segment_hashes(seg_obj("x", "q", with_billing_block=True))["system"]["hash"]
+      == ga["system"]["hash"])
+check("no markers -> no segments", lp._segment_hashes(compact_obj()) == {})
+
+lp._record_warmth(sa, {"cache_creation_input_tokens": 5000})
+wsa = lp.warmth_segments("seg-A")
+check("a confirmed turn stamps the segment rows warm",
+      wsa is not None and wsa["tools"]["state"] == "warm"
+      and wsa["system"]["state"] == "warm"
+      and wsa["tools"]["hash"] == ga["tools"]["hash"])
+
+# the eye-candy scenario itself: lapse EVERYTHING seg-A stamped, then let the
+# sibling seg-B (same layout, different conversation) take a turn — seg-A's
+# segments must read warm again off the shared rows while its own head is cold
+con = lp.store.db()
+with lp.store.LOCK:
+    con.execute("UPDATE warmth SET expires_at=?", (time.time() - 30,))
+    con.commit()
+lp._record_warmth(sb, {"cache_read_input_tokens": 4000})
+wsa = lp.warmth_segments("seg-A")
+check("sibling traffic re-warms the shared segments…",
+      wsa["tools"]["state"] == "warm" and wsa["system"]["state"] == "warm")
+check("…while seg-A's own message tail stays cold (the display this buys)",
+      lp.warmth_query(session="seg-A")["warm"] is False)
+check("unknown session -> None (no row, no fiction)",
+      lp.warmth_segments("seg-ghost") is None)
+
+# /_status carries the readout
+lp._upsert_session_meta("seg-A", cwd="/tmp/seg", model="claude-fable-5")
+snap_s = [s for s in lp._status_snapshot(session="seg-A")["sessions"]
+          if s["session_id"] == "seg-A"]
+check("status snapshot exposes warmth.segments",
+      snap_s and (snap_s[0]["warmth"]["segments"] or {}).get("tools", {})
+      .get("state") == "warm")
+
 # --- pricing --------------------------------------------------------------
 check("fable-5 priced (2x opus)",
       lp._price_for("claude-fable-5") == {"in": 10.0, "out": 50.0,

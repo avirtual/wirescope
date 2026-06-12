@@ -125,6 +125,22 @@ def _render_admin_html(snap, host=""):
             warmth = '<span class="cold">&#10052;&#65039; cold</span>'
         else:
             warmth = '<span class="absent">&empty;</span>'
+        # leading-breakpoint segments: same short hash on two rows = those
+        # sessions share that cache entry (a sibling's traffic keeps it warm
+        # even when this session's own message tail has lapsed)
+        segbits = []
+        for label, ico in (("tools", "&#9881;"), ("system", "&#128220;")):
+            sg = (w.get("segments") or {}).get(label)
+            if not sg:
+                continue
+            cls = sg["state"] if sg["state"] in ("warm", "cold") else "absent"
+            left = (f' · {_fmt_dur(sg["remaining_s"])} left'
+                    if sg["state"] == "warm" and sg.get("remaining_s") else "")
+            segbits.append(
+                f'<span class="{cls}" title="{label} breakpoint {e(sg["hash"])}'
+                f' · {e(sg["state"])}{e(left)}">{ico}&#8239;{e(sg["hash"][:6])}</span>')
+        if segbits:
+            warmth += '<br>' + " ".join(segbits)
         h = s.get("hold")
         if h:
             hold = (f'until {time.strftime("%H:%M", time.localtime(h["until"]))} '

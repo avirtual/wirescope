@@ -68,7 +68,12 @@ store_mod.register_schema(
     "ttl INTEGER NOT NULL, expires_at REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS session_head ("
     "session_id TEXT PRIMARY KEY, hash TEXT NOT NULL, "
-    "updated_at REAL NOT NULL)")
+    "updated_at REAL NOT NULL)",
+    # segment index (2026-06-12): the session's last-seen leading-breakpoint
+    # hashes (marker 1 = tools, marker 2 = tools+system) — display-grade only,
+    # see _segment_hashes. Additive migration.
+    "ALTER TABLE session_head ADD COLUMN tools_hash TEXT",
+    "ALTER TABLE session_head ADD COLUMN sys_hash TEXT")
 
 
 def _warmth_rows(hashes):
@@ -143,6 +148,58 @@ def _prefix_hash(obj, upto):
         h.update(b"\x1e")
         h.update(_canon_message(m))
     return h.hexdigest()
+
+
+def _last_marker_ttl(blocks):
+    """(index, ttl_seconds) of the LAST cache_control marker in a block list,
+    (None, None) when unmarked — no marker means the backend keeps no entry at
+    that boundary, so there is no segment to track."""
+    idx = ttl = None
+    for i, b in enumerate(blocks):
+        if isinstance(b, dict) and b.get("cache_control"):
+            idx, ttl = i, (3600 if b["cache_control"].get("ttl") == "1h" else 300)
+    return idx, ttl
+
+
+def _segment_hashes(obj):
+    """Hashes for the leading CLI cache breakpoints — marker 1 (tools[]) and
+    marker 2 (tools + system) — keyed like the real cache: canonical
+    post-transform bytes up to the marked block, cache_control stripped, model
+    folded in. Two sessions with byte-identical tool sets + system prompts
+    therefore compute the SAME hashes and share ledger rows, which is the
+    point: /_status can show a session whose message tail lapsed while its
+    tools/system segments stay warm courtesy of a sibling session.
+
+    DISPLAY-GRADE, NOT GATE-GRADE: per-segment confirmation is inferred from
+    the turn's aggregate usage receipt (the backend never says WHICH breakpoint
+    it read vs wrote, and a sub-min-cacheable segment may be declined while a
+    longer one caches). No gate may read these rows — eye candy only."""
+    tools = obj.get("tools") if isinstance(obj.get("tools"), list) else []
+    sys_ = obj.get("system") if isinstance(obj.get("system"), list) else []
+    out = {}
+    ti, tttl = _last_marker_ttl(tools)
+    si, sttl = _last_marker_ttl(sys_)
+    model = (obj.get("model") or "").encode("utf-8", "replace")
+    if ti is not None:
+        h = hashlib.blake2b(digest_size=20)
+        h.update(model)
+        h.update(b"\x1e")
+        h.update(_canon_message(tools[:ti + 1]))
+        out["tools"] = {"hash": h.hexdigest(), "ttl": tttl}
+    if si is not None:
+        # marker 2's prefix spans ALL tools (marked or not) + system up to its
+        # marker, minus the out-of-band billing-header block (never cached)
+        stable = [b for b in sys_[:si + 1]
+                  if not (isinstance(b, dict) and
+                          b.get("text", "").startswith("x-anthropic-billing-header"))]
+        h = hashlib.blake2b(digest_size=20)
+        h.update(model)
+        h.update(b"\x1e")
+        h.update(_canon_message(tools))
+        h.update(b"\x1e")
+        h.update(_canon_message(stable))
+        out["system"] = {"hash": h.hexdigest(), "ttl": sttl}
+    return out
 
 
 def _marker_ttl(obj):
@@ -226,6 +283,38 @@ def warmth_query(hash_hex=None, session=None):
             "remaining_s": round(max(0.0, exp - now), 1)}
 
 
+def warmth_segments(session):
+    """Per-segment readout for /_status: the session's last-seen tools /
+    tools+system breakpoint hashes + their live warmth. Because the rows are
+    content-addressed (see _segment_hashes), sessions with identical tool sets
+    and system prompts resolve to the SAME rows — so these can read warm off a
+    sibling session's traffic while this session's own message tail is cold.
+    Display-grade only; no gate reads this."""
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            r = con.execute("SELECT tools_hash, sys_hash FROM session_head "
+                            "WHERE session_id=?", (session,)).fetchone()
+        if not r or not (r[0] or r[1]):
+            return None
+        rows = _warmth_rows([r[0], r[1]])
+    except Exception:
+        return None
+    now = time.time()
+    out = {}
+    for label, h in (("tools", r[0]), ("system", r[1])):
+        if not h:
+            continue
+        row = rows.get(h)        # (stamped_at, ttl, expires_at) | None
+        out[label] = {
+            "hash": h,
+            "state": ("warm" if row and row[2] > now
+                      else "cold" if row else "absent"),
+            "remaining_s": round(max(0.0, row[2] - now), 1) if row else None,
+            "ttl_s": row[1] if row else None}
+    return out or None
+
+
 def _cold_ping_decision(obj):
     """If this request is a keep-warm ping whose target prefix is NOT warm, return
     a decline record (caller short-circuits, never forwards). A ping only ever pays
@@ -278,6 +367,9 @@ def _record_warmth(obj, usage):
         return None
     h = _prefix_hash(obj, upto)
     ttl = _marker_ttl(obj)
+    # leading-breakpoint segment rows ride the same stamp: every breakpoint in
+    # a cache-confirmed request was read or re-written, so their TTLs slid too
+    segs = _segment_hashes(obj)
     now = time.time()
     try:
         sid = (writer_mod._session_ids(obj) or (None,))[0]
@@ -285,18 +377,24 @@ def _record_warmth(obj, usage):
         sid = None
     try:
         con = store_mod.db()
+        rows = [(h, now, ttl, now + ttl)] + [
+            (s["hash"], now, s["ttl"], now + s["ttl"]) for s in segs.values()]
         with store_mod.LOCK:
-            con.execute("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
-                        "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
-                        "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "
-                        "expires_at=excluded.expires_at", (h, now, ttl, now + ttl))
+            con.executemany("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
+                            "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
+                            "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "
+                            "expires_at=excluded.expires_at", rows)
             # a real turn advances this session's head; a fork's ping only
-            # refreshes the shared hash above (its fork-id head is irrelevant).
+            # refreshes the shared hashes above (its fork-id head is irrelevant).
             if sid and not ping:
-                con.execute("INSERT INTO session_head(session_id, hash, updated_at) "
-                            "VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
-                            "hash=excluded.hash, updated_at=excluded.updated_at",
-                            (sid, h, now))
+                con.execute("INSERT INTO session_head(session_id, hash, updated_at, "
+                            "tools_hash, sys_hash) VALUES(?,?,?,?,?) "
+                            "ON CONFLICT(session_id) DO UPDATE SET "
+                            "hash=excluded.hash, updated_at=excluded.updated_at, "
+                            "tools_hash=excluded.tools_hash, sys_hash=excluded.sys_hash",
+                            (sid, h, now,
+                             (segs.get("tools") or {}).get("hash"),
+                             (segs.get("system") or {}).get("hash")))
             con.commit()
             size = con.execute("SELECT COUNT(*) FROM warmth").fetchone()[0]
     except Exception as e:
@@ -307,4 +405,5 @@ def _record_warmth(obj, usage):
     return {"hash": h, "ttl": ttl, "ts": round(now, 3), "ping": ping,
             "n_messages_hashed": upto, "cache_read_input_tokens": read,
             "cache_creation_input_tokens": created,
-            "warm_on_arrival": read > 0, "ledger_size": size}
+            "warm_on_arrival": read > 0, "ledger_size": size,
+            "segments": segs or None}

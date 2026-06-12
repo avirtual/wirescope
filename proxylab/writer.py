@@ -65,10 +65,13 @@ def _writer_loop():
                 obj, usage = data
                 rec = proxylab.warmth._record_warmth(obj, usage)
                 if rec is not None:
+                    segs = rec.get("segments") or {}
+                    seg_s = ("".join(f" {k}={v['hash'][:6]}"
+                                     for k, v in segs.items())) if segs else ""
                     print(f"[warmth] {rec['hash'][:12]} ttl={rec['ttl']}s "
                           f"{'PING' if rec['ping'] else 'turn'} "
                           f"warm_on_arrival={rec['warm_on_arrival']} "
-                          f"(ledger={rec['ledger_size']})", flush=True)
+                          f"(ledger={rec['ledger_size']}){seg_s}", flush=True)
                     if path is not None:
                         path.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
             else:  # "json" — serialize off the event loop, in this thread
