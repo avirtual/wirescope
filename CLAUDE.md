@@ -118,26 +118,35 @@ bandwidth + context window. A "2+2" turn loaded 31 tools (~23k tok), used 0.
 
 ## Module map (proxylab/ package)
 
-Split 2026-06-11 (AST-driven, verbatim slices; def-parity 140/140 vs the
-monolith). `proxylab/__init__.py` imports submodules in the monolith's
-top-to-bottom order — import-time side effects (env parsing → writer thread →
-sweeper → server's `_restore_state()`) depend on it. The shim resolves any
-name lazily (PEP 562), so rebindable globals read live; to FLIP a flag from
-outside, assign on the owning module (`lp.warmth.WARMTH_LEDGER = …`), not on
-the shim. Modules (size · job):
-core 3k (constants/routes/httpx client) · codex 9k (openai provider + zstd
-capture) · transforms 51k (inject/SC/relocate/
-strip/sort/compact-strip + gates) · canary 8k (drift detector) · writer 6k
-(disk-writer thread, _classify_role, NO_SESSION) · warmth 20k (SQLite ledger,
-prefix hashing, _record_warmth) · subs 21k (subscriber push feed: /_subscribe
-registry + SSE text tee + turn receipts; contract in SUBSCRIBERS.md) · meta 8k
-(session metadata, turn stats,
-_ENDED/_CONTEXT_STATS/_LAST_RESPONSE) · pinger 21k (last-request cache,
-_ACCOUNT_AUTH, /_ping replay, session teardown + sweeper) · hold 21k
-(/warm-cache driver, echo transform, auth bootstrap) · billing 14k (SSE usage
-parse, PRICES, totals) · restore 8k (restart-amnesia) · status 7k (/_status
-snapshot) · views 25k (/_admin + /_session HTML) · server 38k (handlers +
-Starlette app).
+Split 2026-06-11; made library-grade 2026-06-12. **The package `__init__` is
+LAZY** (`from proxylab import billing` boots only billing+core+writer — no
+sweeper/restore/app, so other projects can lift parts); the **full ordered
+lab boot is the `logproxy.py` shim** (uvicorn entry + tests; eager, monolith
+order). The shim resolves any name lazily (PEP 562), so rebindable globals
+read live; to FLIP a flag from outside, assign on the owning module
+(`lp.warmth.WARMTH_LEDGER = …`), not on the shim. **Growth rules (enforce in
+review):** core+store import nothing from the package; a module creates ONLY
+ITS OWN tables (store's schema registry) and mutates only its own globals;
+server/receipts may know everyone, nobody but the shim knows server. Modules
+(size · job):
+core 5k (identity/constants/routes/httpx client) · store 4k (**shared SQLite:
+connection + LOCK + OWNER + schema registry; each module registers its own
+DDL**) · codex 9k (openai provider + zstd capture) · transforms 51k
+(inject/SC/relocate/strip/sort/compact-strip + gates) · canary 8k (drift
+detector) · writer 6k (disk-writer thread, _classify_role, NO_SESSION) ·
+warmth 14k (prefix hashing + ledger semantics; store plumbing moved out) ·
+subs 21k (subscriber push feed; contract in SUBSCRIBERS.md; owns
+`subscribers`) · meta 9k (session identity + turn stats, _ENDED/
+_CONTEXT_STATS/_LAST_RESPONSE/_LAST_USAGE; owns `session_meta`) · pinger 22k
+(last-request cache, _ACCOUNT_AUTH, /_ping replay, teardown + sweeper; owns
+`last_request`) · hold 22k (/warm-cache driver, echo transform, auth
+bootstrap; owns `hold_state`) · billing 17k (usage parse, PRICES/
+PRICES_OPENAI, totals) · **receipts 11k (the ONE turn-finalize convergence
+both wires call: bill → view state → ledger stamp → capture → subscriber
+receipt → console; new "a turn happened" consumers go HERE, never into
+server's closures)** · restore 8k (restart-amnesia) · status 7k (/_status
+snapshot) · views 28k (/_admin + /_session HTML) · server 31k (routing +
+transform chain + streaming; the app).
 
 ## Feature map (flags; mechanics detail in archive-2026-06-11)
 
