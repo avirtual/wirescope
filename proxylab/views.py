@@ -495,13 +495,14 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
         inp = usage.get("input_tokens") or 0
         out = usage.get("output_tokens") or 0
         usd = usage.get("est_usd")
+        ctx_tok = meta_mod._input_token_total(usage)   # == /_status context.input_tokens
         head += (f'<p class="kv"><span class="dim">last turn '
                  f'({e(_fmt_ago(usage.get("ts")))}):</span>'
                  f'<span>cache read <b class="warm">{e(_fmt_tok(rd))}</b></span>'
                  f'<span>cache written <b class="warn">{e(_fmt_tok(wr))}</b></span>'
                  f'<span>uncached in <b>{e(_fmt_tok(inp))}</b></span>'
                  f'<span>out <b>{e(_fmt_tok(out))}</b></span>'
-                 f'<span class="dim">context = {e(_fmt_tok(rd + wr + inp))} tok'
+                 f'<span class="dim">context = {e(_fmt_tok(ctx_tok))} tok'
                  f'{f" · ${usd:.4f}" if usd is not None else ""}</span></p>')
     revs = s.get("refusal_events") or []
     if revs:

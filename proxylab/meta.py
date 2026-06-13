@@ -104,6 +104,37 @@ _LAST_RESPONSE = {}
 _LAST_USAGE = {}
 
 
+def _input_token_total(usage):
+    """The session's current CONTEXT SIZE in input-side tokens, from the last
+    turn's billing receipt: cache_read + cache_write(5m+1h, or flat) + uncached
+    input — i.e. everything that was shipped TO the model that turn. ONE
+    definition so /_session's header and /_status's `context.input_tokens`
+    can never disagree. None when there's no usage yet."""
+    if not usage:
+        return None
+    rd = usage.get("cache_read_input_tokens") or 0
+    wr = ((usage.get("cache_write_5m_tokens") or 0)
+          + (usage.get("cache_write_1h_tokens") or 0)) \
+        or usage.get("cache_write_flat_tokens") or 0
+    inp = usage.get("input_tokens") or 0
+    return rd + wr + inp
+
+
+def _context_stats(session_id):
+    """The /_status `context` object: the request-derived heaviness snapshot
+    (turns/messages/max_tool_result) PLUS `input_tokens` — the wire-measured
+    context size from the last turn's receipt (matches the /_session header).
+    None only if neither source has fired yet."""
+    base = _CONTEXT_STATS.get(session_id)
+    tot = _input_token_total(_LAST_USAGE.get(session_id))
+    if base is None and tot is None:
+        return None
+    out = dict(base) if base else {}
+    if tot is not None:
+        out["input_tokens"] = tot
+    return out
+
+
 def _is_prompt_msg(m):
     """The shared 'a turn starts here' predicate: a user message carrying real
     prompt text (tool_result-only continuations, <command-*> expansions and

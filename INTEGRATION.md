@@ -56,7 +56,7 @@ Plain traffic with no `/agent/` prefix is observed but **never** pushed to subsc
 | Mode | Endpoint | Method | Cost | What you get |
 |---|---|---|---|---|
 | **Discover** | `/_identity` | GET | free | Is this our proxy + live capabilities (Step 1). |
-| **Pull** | `/_status[?session=<id>][&all=1]` | GET | free | Durable JSON: sessions, titles/agent, model, cwd, per-session + global cost, turn counts, context size, warmth, hold, refusal events. **Survives proxy restarts** — this is your source of truth for reconciliation. |
+| **Pull** | `/_status[?session=<id>][&all=1]` | GET | free | Durable JSON: sessions, titles/agent, model, cwd, per-session + global cost, turn counts, context size (`context.input_tokens` = the wire-measured input-side token count of the last turn — cache_read + cache_write + uncached input, the same figure `/_session` shows; plus `turns_in_context` / `n_messages`), warmth, hold, refusal events. **Survives proxy restarts** — this is your source of truth for reconciliation. |
 | **Pull (human)** | `/_admin` | GET | free | HTML render of `/_status` (dark, auto-refresh). For eyeballs, not parsing. |
 | **Pull (human)** | `/_session?session=<id>` | GET | free | HTML view of the session's captured context + last receipts + cache breakpoints. For eyeballs. |
 | **Pull** | `/_warm?session=<id>` *(or `?h=<prefix-hash>`)* | GET | free | Just the warmth verdict for one session: `warm`/`found`, `remaining_s`, `ttl_s`. |

@@ -619,6 +619,40 @@ check("missing-role subagent page renders gracefully (no crash, shows note)",
       "&#8627; <b>verification</b>" in empty_sub
       and "no replayable request" in empty_sub.lower())
 
+# --- context.input_tokens: wire-measured context size on /_status ----------------
+# The number /_session renders as "context = X tok" (cache_read + cache_write +
+# uncached input of the last turn) must also be in the polled /_status context.
+check("_input_token_total sums read + write(5m+1h) + input",
+      lp._input_token_total({"cache_read_input_tokens": 150000,
+                             "cache_write_5m_tokens": 8000,
+                             "cache_write_1h_tokens": 2000,
+                             "input_tokens": 1800}) == 161800)
+check("_input_token_total uses flat write when 5m/1h absent",
+      lp._input_token_total({"cache_read_input_tokens": 100,
+                             "cache_write_flat_tokens": 50,
+                             "input_tokens": 10}) == 160)
+check("_input_token_total is None with no usage", lp._input_token_total(None) is None)
+ctxsid = "c0ffee00-0000-0000-0000-000000000000"
+lp._capture_session_meta(ctxsid,
+                         {"system": [{"type": "text", "text": "You are Claude Code"}],
+                          "messages": [{"role": "user", "content": "go"}]},
+                         "claude-opus-4-8", role="parent")
+lp._WRITE_Q.join()
+lp._CONTEXT_STATS[ctxsid] = {"turns_in_context": 30, "n_messages": 238,
+                            "max_tool_result_chars": 7123, "ts": 1.0}
+lp._LAST_USAGE[ctxsid] = {"cache_read_input_tokens": 150000, "cache_write_5m_tokens": 8000,
+                         "cache_write_1h_tokens": 2000, "input_tokens": 1800, "ts": 2.0}
+ctx = lp._status_snapshot(session=ctxsid)["sessions"][0]["context"]
+check("/_status context carries input_tokens AND keeps the heaviness fields",
+      ctx["input_tokens"] == 161800 and ctx["turns_in_context"] == 30
+      and ctx["n_messages"] == 238)
+# /_session header and /_status report the SAME number (shared helper)
+spg = lp._render_session_html(ctxsid, {"obj": {"messages": []}, "ts": 2.0},
+                              lp._status_snapshot(session=ctxsid),
+                              usage=lp._LAST_USAGE[ctxsid])
+check("/_session 'context = X tok' matches /_status input_tokens (161.8k)",
+      "context = 161.8k tok" in spg)
+
 # --- session meta: cwd extraction + title-call detection -------------------------
 check("cwd from system text", lp._extract_cwd(
     {"system": [{"type": "text",

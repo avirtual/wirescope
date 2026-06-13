@@ -208,7 +208,7 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
             # receipt-counted completed turns + the latest request-derived
             # heaviness snapshot (turns_in_context resets at /compact)
             "turns_completed": (tot or {}).get("turns"),
-            "context": meta_mod._CONTEXT_STATS.get(sid),
+            "context": meta_mod._context_stats(sid),
             # Task-spawned subagents that share this session_id (each with its
             # own model + request count) — shown under the main agent so the two
             # are obviously distinct and neither overwrites the other.
