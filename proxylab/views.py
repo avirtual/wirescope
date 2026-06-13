@@ -79,7 +79,7 @@ tr:nth-child(even) td{background:#191c21}
 .bad{color:#e06c75}.warn{color:#e5c07b}.dim{color:#69707d}
 .badge{border:1px solid #2a2e36;border-radius:3px;padding:0 .35em;margin-right:.3em}
 .on{color:#7ec699}.off{color:#69707d}
-.subagent{color:#c8a0e0;font-size:12px}
+.subagent{color:#c8a0e0;font-size:12px}.subagent a{color:#c8a0e0;text-decoration:underline}
 code{color:#9aa3b2}
 """
 
@@ -183,7 +183,8 @@ def _render_admin_html(snap, host="", show=60):
         subs = s.get("sub_agents") or []
         mainlbl = ' <span class="badge">main</span>' if subs else ""
         subline = "".join(
-            f'<br><span class="subagent">&#8627; {e(sa["role"])} '
+            f'<br><span class="subagent">&#8627; '
+            f'<a href="/_session?session={e(sid)}&amp;role={e(sa["role"])}">{e(sa["role"])}</a> '
             f'<span class="dim">{e(writer_mod._short_model(sa.get("model")))}'
             f' · {sa.get("requests", 0)} req · {e(_fmt_ago(sa.get("last_seen"), now))}'
             f'</span></span>' for sa in subs)
@@ -455,20 +456,36 @@ def _render_session_openai_body(entry, resp=None):
     return bar + tools_html + sb + "".join(rows)
 
 
-def _render_session_html(sid, entry, snap, resp=None, usage=None):
+def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
-    w = s.get("warmth") or {}
-    warmth = {"warm": (f'<span class="warm">&#128293; '
-                       f'{e(_fmt_dur(w.get("remaining_s")))} left</span>'),
-              "cold": '<span class="cold">&#10052;&#65039; cold</span>'
-              }.get(w.get("state"), '<span class="absent">&empty;</span>')
-    head = (f'<h1>{e(s.get("title") or "(untitled)")} '
-            f'<small>· <code>{e(sid)}</code></small></h1>'
-            f'<p class="kv"><span>{warmth}</span>'
-            f'<span>model <b>{e(writer_mod._short_model(s.get("model")))}</b></span>'
-            f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
-            f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
+    if subrole:
+        # Per-role subagent view: same session_id as the parent, but its own
+        # model/activity. The parent's warmth/cwd belong to the parent line, so
+        # we show the subagent's stats + a link back up instead of the prefix
+        # warmth (a subagent isn't independently pingable).
+        sub = next((sa for sa in (s.get("sub_agents") or [])
+                    if sa.get("role") == subrole), {})
+        ptitle = s.get("title") or "(untitled)"
+        head = (f'<h1>{e(ptitle)} <small>&#8627; <b>{e(subrole)}</b></small> '
+                f'<small>· <code>{e(sid)}</code></small></h1>'
+                f'<p class="kv"><span class="dim">subagent of '
+                f'<a href="/_session?session={e(sid)}">{e(ptitle)}</a></span>'
+                f'<span>model <b>{e(writer_mod._short_model(sub.get("model") or s.get("model")))}</b></span>'
+                f'<span><b>{sub.get("requests", 0)}</b> req</span>'
+                f'<span class="dim">last seen {e(_fmt_ago(sub.get("last_seen")))}</span></p>')
+    else:
+        w = s.get("warmth") or {}
+        warmth = {"warm": (f'<span class="warm">&#128293; '
+                           f'{e(_fmt_dur(w.get("remaining_s")))} left</span>'),
+                  "cold": '<span class="cold">&#10052;&#65039; cold</span>'
+                  }.get(w.get("state"), '<span class="absent">&empty;</span>')
+        head = (f'<h1>{e(s.get("title") or "(untitled)")} '
+                f'<small>· <code>{e(sid)}</code></small></h1>'
+                f'<p class="kv"><span>{warmth}</span>'
+                f'<span>model <b>{e(writer_mod._short_model(s.get("model")))}</b></span>'
+                f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
+                f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
     if usage:    # token receipts from the last response (in-memory; see
                  # meta._LAST_USAGE) — what actually got read vs (re)written
         rd = usage.get("cache_read_input_tokens") or 0

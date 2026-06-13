@@ -584,6 +584,41 @@ page_ag = lp._render_admin_html(lp._status_snapshot(session="sess-agent-1"))
 check("admin renders [agent] as the name AND the learned summary beside it",
       "[executor-1]" in page_ag and "Run the test matrix" in page_ag)
 
+# --- subagent per-role session view ----------------------------------------------
+# Task-spawned subagents share the parent's session_id; /_session?role=<role>
+# renders that role's latest captured turn, and the /_admin ↳ rows link to it.
+psid = "5fb9eba7-1111-2222-3333-444444444444"
+lp._capture_session_meta(psid,
+                         {"system": [{"type": "text", "text": "You are Claude Code"}],
+                          "messages": [{"role": "user", "content": "do it"}]},
+                         "claude-opus-4-8", role="parent")
+sub_obj = {"system": [{"type": "text", "text": "agent for Claude Code"}],
+           "messages": [{"role": "user", "content": "SUBAGENT TASK MARKER"}]}
+lp._capture_session_meta(psid, sub_obj, "claude-haiku-4-5", role="general-purpose")
+lp._WRITE_Q.join()
+check("subagent request is stashed per role; absent role -> None",
+      (lp._subagent_request(psid, "general-purpose") or {}).get("obj") is sub_obj
+      and lp._subagent_request(psid, "verification") is None)
+snap_p = lp._status_snapshot(session=psid)
+check("parent identity survives the subagent turn (model stays parent's opus)",
+      snap_p["sessions"][0]["model"] == "claude-opus-4-8"
+      and any(sa["role"] == "general-purpose"
+              for sa in (snap_p["sessions"][0].get("sub_agents") or [])))
+admin_p = lp._render_admin_html(snap_p, host="t:7800")
+check("admin links the ↳ subagent row to the per-role view",
+      f"/_session?session={psid}&amp;role=general-purpose" in admin_p)
+subpage = lp._render_session_html(psid, lp._subagent_request(psid, "general-purpose"),
+                                  snap_p, subrole="general-purpose")
+check("subagent page shows the role, a back link, and the captured request",
+      "&#8627; <b>general-purpose</b>" in subpage
+      and f'href="/_session?session={psid}"' in subpage
+      and "SUBAGENT TASK MARKER" in subpage and "haiku" in subpage)
+empty_sub = lp._render_session_html(psid, lp._subagent_request(psid, "verification"),
+                                    snap_p, subrole="verification")
+check("missing-role subagent page renders gracefully (no crash, shows note)",
+      "&#8627; <b>verification</b>" in empty_sub
+      and "no replayable request" in empty_sub.lower())
+
 # --- session meta: cwd extraction + title-call detection -------------------------
 check("cwd from system text", lp._extract_cwd(
     {"system": [{"type": "text",

@@ -201,11 +201,18 @@ def _is_title_call(obj):
 # _admin can show the main agent AND every subagent under it WITHOUT either
 # clobbering the other's identity. Display-grade, repopulated by live traffic.
 _SUBAGENTS = {}
+# Latest request body per (session, role), so /_session?session=&role=<role> can
+# render what a subagent was doing — the ↳ rows on /_admin link here. Role-keyed
+# like _SUBAGENTS (so concurrent same-role subs collapse to the latest turn);
+# display-only, never replayed/pinged, in-memory, swept with _SUBAGENTS. Entry
+# shape is the subset of pinger._LAST_REQUEST that _render_session_html reads.
+_SUBAGENT_LAST_REQ = {}
 
 
-def _note_subagent(session_id, role, model, now=None):
+def _note_subagent(session_id, role, model, now=None, obj=None):
     """Record one subagent turn under its parent session (never touches the
-    parent's own identity row). Latest model + a running request count."""
+    parent's own identity row). Latest model + a running request count, and
+    (when obj is given) the latest request body for the per-role session view."""
     if not session_id or not role:
         return
     now = now or time.time()
@@ -218,6 +225,14 @@ def _note_subagent(session_id, role, model, now=None):
         e["model"] = model or e["model"]
         e["requests"] += 1
         e["last_seen"] = now
+    if isinstance(obj, dict):
+        _SUBAGENT_LAST_REQ.setdefault(session_id, {})[role] = {
+            "obj": obj, "ts": now, "needs_auth": False}
+
+
+def _subagent_request(session_id, role):
+    """The latest captured request entry for one subagent role, or None."""
+    return (_SUBAGENT_LAST_REQ.get(session_id) or {}).get(role)
 
 
 def _subagents_snapshot(session_id):
@@ -244,7 +259,7 @@ def _capture_session_meta(session_id, obj, model, agent=None, role=None,
     pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
     if title_call or writer_mod._is_subagent_role(role):
         if writer_mod._is_subagent_role(role):
-            _note_subagent(session_id, role, model)
+            _note_subagent(session_id, role, model, obj=obj)
         # last_seen only (model/cwd left untouched -> COALESCE keeps the parent's)
         writer_mod._enqueue_meta(session_id, agent=agent)
         return

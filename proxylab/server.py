@@ -227,6 +227,16 @@ async def handler(request: Request) -> Response:
         if not sess:
             return Response("missing ?session=", status_code=400,
                             media_type="text/plain")
+        # ?role=<role> -> the per-role subagent view (shares the parent's
+        # session_id; latest captured turn, never the parent's pingable request
+        # nor the parent's response/usage receipts).
+        subrole = request.query_params.get("role")
+        if subrole:
+            return Response(views_mod._render_session_html(
+                                sess, meta_mod._subagent_request(sess, subrole),
+                                status_mod._status_snapshot(session=sess),
+                                subrole=subrole),
+                            media_type="text/html; charset=utf-8")
         with pinger_mod._LAST_REQUEST_LOCK:
             entry = pinger_mod._LAST_REQUEST.get(sess)
         if entry is None:

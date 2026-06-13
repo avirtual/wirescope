@@ -403,6 +403,8 @@ def _sweep_state(now=None):
         meta_mod._CONTEXT_STATS.pop(sid, None)
         meta_mod._LAST_RESPONSE.pop(sid, None)
         meta_mod._LAST_USAGE.pop(sid, None)
+        meta_mod._SUBAGENTS.pop(sid, None)
+        meta_mod._SUBAGENT_LAST_REQ.pop(sid, None)
     purged = heads = 0
     try:
         con = store_mod.db()
