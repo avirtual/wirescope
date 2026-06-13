@@ -568,8 +568,18 @@ lp._WRITE_Q.join()
 check("agent survives later agent-less upserts (COALESCE)",
       lp._status_snapshot(session="sess-agent-1")["sessions"][0]["agent"]
       == "executor-1")
-check("plain (ext) sessions carry agent=None and stay untitled",
+check("plain (ext) sessions carry agent=None (learned title still shows)",
       st_ended["agent"] is None)
+# Un-routed AND no learned title (e.g. a headless run straight at the port):
+# title falls back to ~<session_id first segment> so it stays identifiable.
+lp._capture_session_meta("3f8a1c2d-dead-beef-0000-000000000000",
+                         {"system": [], "messages": []}, "claude-sonnet-4-6")
+lp._WRITE_Q.join()
+st_anon = lp._status_snapshot(
+    session="3f8a1c2d-dead-beef-0000-000000000000")["sessions"][0]
+check("un-routed, title-less session falls back to ~<uuid-prefix>",
+      st_anon["agent"] is None and st_anon["title"] == "~3f8a1c2d"
+      and st_anon["summary"] is None)
 page_ag = lp._render_admin_html(lp._status_snapshot(session="sess-agent-1"))
 check("admin renders [agent] as the name AND the learned summary beside it",
       "[executor-1]" in page_ag and "Run the test matrix" in page_ag)

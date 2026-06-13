@@ -162,7 +162,13 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
         # operator's own label, stabler than a generated summary (and SDK/
         # headless sessions never make the title side-call at all). Bracketed
         # so a label reads as a label. Consumers wanting the raw learned
-        # title have the `summary` field.
+        # title have the `summary` field. Last resort, for an un-routed session
+        # that never made the title side-call either (e.g. a headless run
+        # pointed straight at the port): name it after the session_id's first
+        # segment (~8 hex) so it's still uniquely identifiable rather than
+        # nameless. `~`-marked to read distinctly from a [route] label, and it
+        # ranks BELOW the learned title so a plain interactive CLI keeps its
+        # real title.
         agent_name = r[9] if r else None
         sessions.append({
             "session_id": sid,
@@ -171,7 +177,8 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
             "agent": agent_name,
             "summary": r[1] if r else None,
             "title": (f"[{agent_name}]" if agent_name else None) or
-                     (r[1] if r else None),
+                     (r[1] if r else None) or
+                     (f"~{sid.split('-')[0]}" if sid else None),
             "cwd": r[2] if r else None,
             "model": r[3] if r else None,
             "first_seen": r[4] if r else None,
