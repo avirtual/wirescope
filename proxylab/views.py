@@ -66,7 +66,7 @@ def _fmt_tok(n):
 
 _ADMIN_CSS = """
 body{background:#14161a;color:#cdd3dd;font:13px/1.5 ui-monospace,Menlo,monospace;
-     margin:1.2em;padding:0}
+     margin:1.2em auto;max-width:1600px;padding:0 1.2em}
 a{color:#6ab0de;text-decoration:none} a:hover{text-decoration:underline}
 h1{font-size:16px;color:#e6ebf2} h1 small{color:#69707d;font-weight:normal}
 table{border-collapse:collapse;width:100%;margin:.8em 0}
