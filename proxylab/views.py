@@ -69,9 +69,15 @@ body{background:#14161a;color:#cdd3dd;font:13px/1.5 ui-monospace,Menlo,monospace
      margin:1.2em auto;max-width:1600px;padding:0 1.2em}
 a{color:#6ab0de;text-decoration:none} a:hover{text-decoration:underline}
 h1{font-size:16px;color:#e6ebf2} h1 small{color:#69707d;font-weight:normal}
-table{border-collapse:collapse;width:100%;margin:.8em 0}
+table{border-collapse:collapse;width:auto;margin:.8em 0}
 th{color:#8a93a3;text-align:left;font-weight:normal;border-bottom:1px solid #2a2e36}
 th,td{padding:.32em .6em;vertical-align:top}
+/* warmth: let it claim the width its lines need (state · ttl, then the two
+   segment hashes on their own line, aligned down the column for scanning) */
+td.wcol{white-space:nowrap}
+/* session: bound the low-value title so it can't hog horizontal space — it
+   wraps within this instead of stretching the whole table */
+td.scol{max-width:46ch}
 tr:nth-child(even) td{background:#191c21}
 .kv span{margin-right:1.4em;white-space:nowrap}
 .kv b{color:#e6ebf2;font-weight:600}
@@ -120,7 +126,7 @@ def _render_admin_html(snap, host="", show=60):
         if w["state"] == "warm":
             warmth = (f'<span class="warm">&#128293; '
                       f'{e(_fmt_dur(w["remaining_s"]))} left</span>'
-                      f'<br><span class="dim">ttl {e(_fmt_dur(w["ttl_s"]))}</span>')
+                      f'<span class="dim"> &middot; ttl {e(_fmt_dur(w["ttl_s"]))}</span>')
         elif w["state"] == "cold":
             warmth = '<span class="cold">&#10052;&#65039; cold</span>'
         else:
@@ -195,8 +201,8 @@ def _render_admin_html(snap, host="", show=60):
             f' · {sa.get("requests", 0)} req · {e(_fmt_ago(sa.get("last_seen"), now))}'
             f'</span></span>' for sa in subs)
         return (
-            f'<tr><td>{warmth}</td>'
-            f'<td><b><a href="/_session?session={e(sid)}">'
+            f'<tr><td class="wcol">{warmth}</td>'
+            f'<td class="scol"><b><a href="/_session?session={e(sid)}">'
             f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}{resumeb}<br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span>{mainlbl}<br>'
