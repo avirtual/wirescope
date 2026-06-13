@@ -69,15 +69,23 @@ body{background:#14161a;color:#cdd3dd;font:13px/1.5 ui-monospace,Menlo,monospace
      margin:1.2em auto;max-width:1600px;padding:0 1.2em}
 a{color:#6ab0de;text-decoration:none} a:hover{text-decoration:underline}
 h1{font-size:16px;color:#e6ebf2} h1 small{color:#69707d;font-weight:normal}
-table{border-collapse:collapse;width:auto;margin:.8em 0}
+table{border-collapse:collapse;width:100%;table-layout:fixed;margin:.8em 0}
 th{color:#8a93a3;text-align:left;font-weight:normal;border-bottom:1px solid #2a2e36}
 th,td{padding:.32em .6em;vertical-align:top}
-/* warmth: let it claim the width its lines need (state · ttl, then the two
-   segment hashes on their own line, aligned down the column for scanning) */
-td.wcol{white-space:nowrap}
-/* session: bound the low-value title so it can't hog horizontal space — it
-   wraps within this instead of stretching the whole table */
-td.scol{max-width:46ch}
+/* Deliberate column proportions (sum 100%) via fixed layout — no single column
+   greedily absorbs the slack, so the ratio is whatever we set here. */
+td.scol{overflow-wrap:anywhere}     /* session: wrap long titles/paths in place */
+td.nowrap{white-space:nowrap}       /* the narrow warmth columns don't wrap      */
+th:nth-child(1),td:nth-child(1){width:8%}    /* time left */
+th:nth-child(2),td:nth-child(2){width:6%}    /* ttl       */
+th:nth-child(3),td:nth-child(3){width:7%}    /* tools     */
+th:nth-child(4),td:nth-child(4){width:7%}    /* prompt    */
+th:nth-child(5),td:nth-child(5){width:39%}   /* session   */
+th:nth-child(6),td:nth-child(6){width:7%}    /* last seen */
+th:nth-child(7),td:nth-child(7){width:9%}    /* hold      */
+th:nth-child(8),td:nth-child(8){width:5%}    /* pingable  */
+th:nth-child(9),td:nth-child(9){width:7%}    /* cost      */
+th:nth-child(10),td:nth-child(10){width:5%}  /* ref       */
 tr:nth-child(even) td{background:#191c21}
 .kv span{margin-right:1.4em;white-space:nowrap}
 .kv b{color:#e6ebf2;font-weight:600}
@@ -123,33 +131,35 @@ def _render_admin_html(snap, host="", show=60):
         f'${s0.get("est_usd", 0):.4f}</span></p>')
     def _row(s):
         w = s["warmth"]
+        segs = w.get("segments") or {}
+        # head warmth -> two columns: time-left (how long until cold) and ttl.
         if w["state"] == "warm":
-            warmth = (f'<span class="warm">&#128293; '
-                      f'{e(_fmt_dur(w["remaining_s"]))} left</span>'
-                      f'<span class="dim"> &middot; ttl {e(_fmt_dur(w["ttl_s"]))}</span>')
+            timeleft = (f'<span class="warm">&#128293; '
+                        f'{e(_fmt_dur(w["remaining_s"]))}</span>')
+            ttlc = f'<span class="dim">{e(_fmt_dur(w["ttl_s"]))}</span>'
         elif w["state"] == "cold":
-            warmth = '<span class="cold">&#10052;&#65039; cold</span>'
+            timeleft = '<span class="cold">&#10052;&#65039; cold</span>'
+            ttlc = '<span class="dim">&mdash;</span>'
         else:
-            warmth = '<span class="absent">&empty;</span>'
-        # leading-breakpoint segments (both markers live in system[]): same
-        # short hash on two rows = those sessions share that cache entry (a
-        # sibling's traffic keeps it warm even when this session's own message
-        # tail has lapsed). ⚙ = marker 1 (tools + 'you are Claude' preamble);
-        # 📜 = marker 2 (+ the full system prompt).
-        segbits = []
-        for label, ico, what in (("tools", "&#9881;", "tools + preamble"),
-                                  ("system", "&#128220;", "+ system prompt")):
-            sg = (w.get("segments") or {}).get(label)
+            timeleft = '<span class="absent">&empty;</span>'
+            ttlc = '<span class="dim">&mdash;</span>'
+        # leading-breakpoint segments, each in its OWN column: same short hash on
+        # two rows = those sessions share that cache entry (a sibling's traffic
+        # keeps it warm even when this row's own message tail has lapsed). The
+        # hash is colour-coded by the segment's own warmth, independent of the
+        # head. ⚙ tools = marker 1 (tools + 'you are Claude' preamble); 📜 prompt
+        # = marker 2 (+ the full system prompt).
+        def _segcell(label, ico, what):
+            sg = segs.get(label)
             if not sg:
-                continue
+                return '<span class="dim">&mdash;</span>'
             cls = sg["state"] if sg["state"] in ("warm", "cold") else "absent"
             left = (f' · {_fmt_dur(sg["remaining_s"])} left'
                     if sg["state"] == "warm" and sg.get("remaining_s") else "")
-            segbits.append(
-                f'<span class="{cls}" title="marker {what} · {e(sg["hash"])}'
-                f' · {e(sg["state"])}{e(left)}">{ico}&#8239;{e(sg["hash"][:6])}</span>')
-        if segbits:
-            warmth += '<br>' + " ".join(segbits)
+            return (f'<span class="{cls}" title="marker {what} · {e(sg["hash"])}'
+                    f' · {e(sg["state"])}{e(left)}">{ico}&#8239;{e(sg["hash"][:6])}</span>')
+        toolsc = _segcell("tools", "&#9881;", "tools + preamble")
+        promptc = _segcell("system", "&#128220;", "+ system prompt")
         h = s.get("hold")
         if h:
             hold = (f'until {time.strftime("%H:%M", time.localtime(h["until"]))} '
@@ -201,9 +211,12 @@ def _render_admin_html(snap, host="", show=60):
             f' · {sa.get("requests", 0)} req · {e(_fmt_ago(sa.get("last_seen"), now))}'
             f'</span></span>' for sa in subs)
         return (
-            f'<tr><td class="wcol">{warmth}</td>'
+            f'<tr><td class="nowrap">{timeleft}</td>'
+            f'<td class="nowrap">{ttlc}</td>'
+            f'<td class="nowrap">{toolsc}</td>'
+            f'<td class="nowrap">{promptc}</td>'
             f'<td class="scol"><b><a href="/_session?session={e(sid)}">'
-            f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}{resumeb}<br>'
+            f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}{resumeb} '
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span>{mainlbl}<br>'
             f'<span class="dim">{e(s.get("cwd") or "")}</span>{subline}</td>'
@@ -221,7 +234,8 @@ def _render_admin_html(snap, host="", show=60):
     # TTLs); the cold list is the 24h long tail that pagination caps.
     warm_s = [s for s in snap["sessions"] if s["warmth"]["state"] == "warm"]
     cold_s = [s for s in snap["sessions"] if s["warmth"]["state"] != "warm"]
-    _hdr = ('<tr><th>warmth</th><th>session</th><th>last seen</th>'
+    _hdr = ('<tr><th>time left</th><th>ttl</th><th>tools</th><th>prompt</th>'
+            '<th>session</th><th>last seen</th>'
             '<th>hold</th><th>pingable</th><th>cost</th><th>ref</th></tr>')
 
     def _table(title, items):
