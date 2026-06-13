@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+logs/
+logs_*/
+*.out
+warmth.sqlite*
+_canary/
+HANDOFF.local.md
+*.local.md
+releases/
+release.env
+# internal working docs / lab journals — maintainer context, not published
+CLAUDE.md
+CLAUDE.md.archive-*
+cv-settings-deny.json
