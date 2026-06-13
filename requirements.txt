@@ -1,0 +1,7 @@
+# wirescope runtime dependencies (Python 3.9+).
+# Everything else it uses is in the standard library.
+# Codex/ChatGPT zstd capture uses stdlib `compression.zstd` (Python 3.14+);
+# on older Pythons that capture path degrades gracefully — no extra dep.
+httpx
+starlette
+uvicorn

@@ -36,9 +36,12 @@ In return for routing through it:
 
 ## Quick start
 
-Requires Python 3 with `uvicorn`/`starlette` and `httpx`.
+Needs Python 3.9+. The only third-party deps are `httpx`, `starlette`, and `uvicorn`.
 
 ```bash
+# 0. Install deps (a venv is recommended but not required)
+pip install -r requirements.txt
+
 # 1. Run the proxy (defaults to :7800, captures into ./logs_main)
 ./start_proxy.sh
 #    or directly:  uvicorn logproxy:app --port 7800
