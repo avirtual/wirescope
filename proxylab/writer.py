@@ -160,6 +160,19 @@ def _sys_text(obj):
     return sys or ""
 
 
+# Roles that _classify_role assigns to TASK-spawned subagents. They share the
+# parent's session_id on the wire (one session dir holds parent + every sub), so
+# anything keyed by session_id (the /_status row, the replayable last request,
+# the hold anchor) must NOT be overwritten by a subagent turn — the main agent
+# is the durable, pingable line; subagents are transient. "parent"/"unknown" are
+# the main line. See server.py + meta._capture_session_meta.
+SUBAGENT_ROLES = frozenset({"Plan", "verification", "general-purpose"})
+
+
+def _is_subagent_role(role):
+    return role in SUBAGENT_ROLES
+
+
 def _classify_role(obj):
     """Infer the agent role from the system-prompt signature."""
     s = _sys_text(obj)

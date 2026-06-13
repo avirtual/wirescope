@@ -79,11 +79,12 @@ tr:nth-child(even) td{background:#191c21}
 .bad{color:#e06c75}.warn{color:#e5c07b}.dim{color:#69707d}
 .badge{border:1px solid #2a2e36;border-radius:3px;padding:0 .35em;margin-right:.3em}
 .on{color:#7ec699}.off{color:#69707d}
+.subagent{color:#c8a0e0;font-size:12px}
 code{color:#9aa3b2}
 """
 
 
-def _render_admin_html(snap, host=""):
+def _render_admin_html(snap, host="", show=60):
     e = html.escape
     p = snap["proxy"]
     t = p["totals"]
@@ -114,8 +115,7 @@ def _render_admin_html(snap, host=""):
         f'<span class="{"bad" if ref else "dim"}">refusals <b>{ref}</b></span>'
         f'<span class="dim">since restart: {s0.get("requests", 0):g} req / '
         f'${s0.get("est_usd", 0):.4f}</span></p>')
-    rows = []
-    for s in snap["sessions"]:
+    def _row(s):
         w = s["warmth"]
         if w["state"] == "warm":
             warmth = (f'<span class="warm">&#128293; '
@@ -125,11 +125,14 @@ def _render_admin_html(snap, host=""):
             warmth = '<span class="cold">&#10052;&#65039; cold</span>'
         else:
             warmth = '<span class="absent">&empty;</span>'
-        # leading-breakpoint segments: same short hash on two rows = those
-        # sessions share that cache entry (a sibling's traffic keeps it warm
-        # even when this session's own message tail has lapsed)
+        # leading-breakpoint segments (both markers live in system[]): same
+        # short hash on two rows = those sessions share that cache entry (a
+        # sibling's traffic keeps it warm even when this session's own message
+        # tail has lapsed). ⚙ = marker 1 (tools + 'you are Claude' preamble);
+        # 📜 = marker 2 (+ the full system prompt).
         segbits = []
-        for label, ico in (("tools", "&#9881;"), ("system", "&#128220;")):
+        for label, ico, what in (("tools", "&#9881;", "tools + preamble"),
+                                  ("system", "&#128220;", "+ system prompt")):
             sg = (w.get("segments") or {}).get(label)
             if not sg:
                 continue
@@ -137,7 +140,7 @@ def _render_admin_html(snap, host=""):
             left = (f' · {_fmt_dur(sg["remaining_s"])} left'
                     if sg["state"] == "warm" and sg.get("remaining_s") else "")
             segbits.append(
-                f'<span class="{cls}" title="{label} breakpoint {e(sg["hash"])}'
+                f'<span class="{cls}" title="marker {what} · {e(sg["hash"])}'
                 f' · {e(sg["state"])}{e(left)}">{ico}&#8239;{e(sg["hash"][:6])}</span>')
         if segbits:
             warmth += '<br>' + " ".join(segbits)
@@ -173,13 +176,24 @@ def _render_admin_html(snap, host=""):
         summ = s.get("summary")
         summ = (f' <span class="dim">{e(summ)}</span>'
                 if summ and summ != s.get("title") else "")
-        rows.append(
+        # Task-spawned subagents share this session_id; list them UNDER the main
+        # agent (↳) so it's obvious which line is the parent and which are subs,
+        # each with its own model + request count. The main row's model stays the
+        # parent's (sub turns never overwrite it).
+        subs = s.get("sub_agents") or []
+        mainlbl = ' <span class="badge">main</span>' if subs else ""
+        subline = "".join(
+            f'<br><span class="subagent">&#8627; {e(sa["role"])} '
+            f'<span class="dim">{e(writer_mod._short_model(sa.get("model")))}'
+            f' · {sa.get("requests", 0)} req · {e(_fmt_ago(sa.get("last_seen"), now))}'
+            f'</span></span>' for sa in subs)
+        return (
             f'<tr><td>{warmth}</td>'
             f'<td><b><a href="/_session?session={e(sid)}">'
             f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}<br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
-            f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span><br>'
-            f'<span class="dim">{e(s.get("cwd") or "")}</span></td>'
+            f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span>{mainlbl}<br>'
+            f'<span class="dim">{e(s.get("cwd") or "")}</span>{subline}</td>'
             f'<td>{e(_fmt_ago(s.get("last_seen"), now))}</td>'
             f'<td>{hold}</td><td>{ping}</td><td>{cost}</td>'
             # ref count links to the session page's refusal banner (wire
@@ -187,16 +201,46 @@ def _render_admin_html(snap, host=""):
             f'<td class="{"bad" if sref else "dim"}">'
             + (f'<a class="bad" href="/_session?session={e(sid)}#refusals">'
                f'{sref}</a>' if sref else "—") + '</td></tr>')
-    table = ('<table><tr><th>warmth</th><th>session</th><th>last seen</th>'
-             '<th>hold</th><th>pingable</th><th>cost</th><th>ref</th></tr>'
-             + "".join(rows) + "</table>") if rows else "<p class=dim>no sessions tracked</p>"
+
+    # Split by CACHE STATE, not recency: a warm 1h prefix that was idle 7m still
+    # matters more than a 5m prefix that lapsed 6m ago. Within each, snapshot
+    # order (most-recent-first) holds. Warm sessions are few (bounded by live
+    # TTLs); the cold list is the 24h long tail that pagination caps.
+    warm_s = [s for s in snap["sessions"] if s["warmth"]["state"] == "warm"]
+    cold_s = [s for s in snap["sessions"] if s["warmth"]["state"] != "warm"]
+    _hdr = ('<tr><th>warmth</th><th>session</th><th>last seen</th>'
+            '<th>hold</th><th>pingable</th><th>cost</th><th>ref</th></tr>')
+
+    def _table(title, items):
+        if not items:
+            return f'<h2>{title} <small class="dim">0</small></h2><p class=dim>none</p>'
+        return (f'<h2>{title} <small class="dim">{len(items)}</small></h2>'
+                f'<table>{_hdr}{"".join(_row(s) for s in items)}</table>')
+
+    if not snap["sessions"]:
+        body = "<p class=dim>no sessions tracked</p>"
+    else:
+        body = (_table("&#128293; warm cache", warm_s)
+                + _table("&#10052;&#65039; cold / expired", cold_s))
+
+    # pagination: the snapshot caps how many sessions it enriches (`show`);
+    # ?show=N raises the cap, ?all=1 lifts the 24h window + cap entirely. The
+    # 10s meta-refresh reloads the SAME url, so the chosen page sticks.
+    total = p.get("sessions_total")
+    shown = len(snap["sessions"])
+    more = ""
+    if p.get("sessions_truncated"):
+        more = (f' · <b>{shown}</b> of {total} (last 24h) · '
+                f'<a href="/_admin?show={show + 60}">show 60 more</a> · '
+                f'<a href="/_admin?all=1">show all</a>')
     foot = ('<p class="dim">auto-refresh 10s · <a href="/_admin">last 24h</a> · '
-            '<a href="/_admin?all=1">all</a> · <a href="/_status">raw json</a></p>')
+            '<a href="/_admin?all=1">all</a> · <a href="/_status">raw json</a>'
+            f'{more}</p>')
     return ('<!doctype html><html><head><meta charset="utf-8">'
             '<meta http-equiv="refresh" content="10">'
             f'<title>logproxy · {e(p["log_dir"])}</title>'
             f'<style>{_ADMIN_CSS}</style></head><body>'
-            + head + table + foot + "</body></html>")
+            + head + body + foot + "</body></html>")
 
 
 # --- /_session: simplified view of a session's captured context ----------------

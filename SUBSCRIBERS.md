@@ -1,5 +1,9 @@
 # logproxy subscriber protocol (v1)
 
+> This is the **push-feed deep-dive**. For the whole integration surface (what
+> the proxy offers, what to call, what it costs), start with the front-door
+> contract: [`INTEGRATION.md`](./INTEGRATION.md).
+
 The proxy sits on the wire between agent CLIs and the model backends, so it
 sees things consumers can't get anywhere else, or can only get late:
 
@@ -16,6 +20,44 @@ the agent sessions it owns. The proxy knows nothing about your protocol or
 your schema: if your agents emit `[wb:…]` or `[cli:…]` intents in their text,
 *you* parse them from the text events. One subscriber API, zero app-specific
 code in the proxy.
+
+## Discovery: confirm this is the logproxy (`GET /_identity`)
+
+Anything can sit on `ANTHROPIC_BASE_URL` in front of the model backend. Before
+you register, pull stats, or warm a cache, confirm you're talking to *this*
+proxy and not a generic forwarder:
+
+    GET /_identity        → read-only, unauthenticated, spends nothing
+
+    {
+      "logproxy": true,                 // quick boolean for the lazy check
+      "product": "logproxy",            // the authoritative discriminator
+      "vendor": "proxy-lab",
+      "version": "v0.2.4",              // release tag (or git-describe on a dev tree)
+      "protocols": { "identity": 1, "subscribers": 1 },
+      "capabilities": {                 // LIVE flags — gate features on these
+        "subscribers": true, "warmth": true, "ping": true, "hold": true,
+        "stats": true, "session_view": true, "codex": true
+      },
+      "endpoints": {                    // where each feature lives
+        "identity": "/_identity", "status": "/_status", "subscribe": "/_subscribe",
+        "warm": "/_warm", "ping": "/_ping", "end": "/_end",
+        "admin": "/_admin", "session": "/_session"
+      },
+      "docs": "INTEGRATION.md"          // front-door contract; this file = push deep-dive
+    }
+
+- **Check `product == "logproxy"`** (or the `logproxy: true` shortcut). A
+  different proxy will 404 `/_identity` or return a body without these fields —
+  in either case, don't attempt logproxy-specific integration.
+- The response also carries an `X-Logproxy-Version` header (handy if you only
+  want a HEAD/sniff).
+- `capabilities` are the *running* flags: a subsystem disabled by env reads
+  `false`. Gate conditionally — e.g. only call `/_ping` when `ping` is true.
+- Probe at the proxy ROOT (`http://127.0.0.1:7800/_identity`), same as
+  `/_subscribe` — not under your `/agent/<name>/anthropic` route prefix.
+- Additive-only, like the subscriber envelope: new fields won't bump
+  `protocols.identity`; a breaking change will. Ignore unknown fields.
 
 ## 0. Prerequisite: route your sessions through the proxy with an agent name
 

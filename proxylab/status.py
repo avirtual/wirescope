@@ -31,12 +31,70 @@ from proxylab import subs as subs_mod
 from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 
-def _status_snapshot(session=None, all_sessions=False):
+# Stable product marker. Many proxies can sit on ANTHROPIC_BASE_URL in front of
+# the model backend; a subscriber needs a cheap, unauthenticated way to tell
+# OURS apart from a generic forwarder before it tries to register, pull stats,
+# or warm the cache. /_identity is that handshake: a consumer confirms
+# `product == "logproxy"`, reads `protocols`/`capabilities` to decide what it
+# may use, and `endpoints` for where. Additive-only (mirror SUBSCRIBERS.md's
+# versioning rule): never remove a field, bump `protocols.<name>` on a break.
+PRODUCT = "logproxy"
+IDENTITY_PROTOCOL = 1
+
+
+def _identity():
+    """The 'is this our proxy?' handshake — see PRODUCT above. Read-only,
+    spends nothing; capabilities reflect LIVE flags so a consumer integrates
+    conditionally (e.g. only attempt /_ping when ping is actually enabled)."""
+    return {
+        "logproxy": True,                 # quick boolean for the lazy check
+        "product": PRODUCT,               # the authoritative discriminator
+        "vendor": "proxy-lab",
+        "version": core_mod.VERSION,      # release tag or git-describe (dev tree)
+        "protocols": {
+            # protocol/contract versions a consumer can branch on
+            "identity": IDENTITY_PROTOCOL,
+            "subscribers": 1,             # SUBSCRIBERS.md envelope "v"
+        },
+        # what THIS process can actually do right now (env flags can disable
+        # subsystems) — a subscriber should gate features on these, not assume
+        "capabilities": {
+            "subscribers": subs_mod.SUBSCRIBERS,
+            "warmth": warmth_mod.WARMTH_LEDGER,
+            "ping": pinger_mod.WARMTH_PINGER,
+            "hold": hold_mod.WARMTH_HOLD,
+            "stats": True,                # /_status is always served
+            "session_view": True,         # /_session HTML
+            "codex": True,                # /agent/<name>/openai routing
+        },
+        "endpoints": {
+            "identity": "/_identity",
+            "status": "/_status",
+            "subscribe": "/_subscribe",
+            "warm": "/_warm",
+            "ping": "/_ping",
+            "hold": "/_hold",
+            "end": "/_end",
+            "admin": "/_admin",
+            "session": "/_session",
+        },
+        "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
+    }
+
+
+def _status_snapshot(session=None, all_sessions=False, limit=None):
     """Everything a human (or the statusline) wants to know about the sessions
     this proxy tracks, one read-only JSON. Universe = in-memory pingable
     sessions ∪ armed holds ∪ durable session_meta rows (last 24h unless all=1).
     Identity (title/cwd/model) is SQLite-durable; pingability/hold/cost are
-    in-memory by design (nothing replayable survives a restart anyway)."""
+    in-memory by design (nothing replayable survives a restart anyway).
+
+    `limit` (used by /_admin) caps the most-recently-active N sessions BEFORE
+    the per-session warmth/segment enrichment, so a 24h window with hundreds/
+    thousands of sessions doesn't query + render them all every refresh. Armed
+    holds are never dropped; `session`/`all_sessions` bypass the cap. The cut is
+    by last_seen, and a warm prefix implies recent activity, so warm sessions
+    survive the cap in practice. Reports proxy.sessions_total/truncated."""
     now = time.time()
     with pinger_mod._LAST_REQUEST_LOCK:
         last_real = {sid: (e["ts"], bool(e.get("needs_auth")),
@@ -61,6 +119,20 @@ def _status_snapshot(session=None, all_sessions=False):
     sids = set(meta_rows) | set(last_real) | set(holds)
     if session:
         sids &= {session}
+    sessions_total = len(sids)
+    truncated = False
+    if (limit is not None and not session and not all_sessions
+            and sessions_total > limit):
+        # rank by best-known last activity (meta last_seen ∪ last real turn),
+        # keep the top `limit`, but never drop an armed hold.
+        def _activity(sid):
+            r = meta_rows.get(sid)
+            lr = last_real.get(sid)
+            return max((r[5] if r else 0) or 0, lr[0] if lr else 0)
+        keep = set(holds)
+        ranked = sorted(sids - keep, key=_activity, reverse=True)
+        sids = keep | set(ranked[:max(0, limit - len(keep))])
+        truncated = True
     sessions = []
     for sid in sids:
         r = meta_rows.get(sid)
@@ -129,6 +201,10 @@ def _status_snapshot(session=None, all_sessions=False):
             # heaviness snapshot (turns_in_context resets at /compact)
             "turns_completed": (tot or {}).get("turns"),
             "context": meta_mod._CONTEXT_STATS.get(sid),
+            # Task-spawned subagents that share this session_id (each with its
+            # own model + request count) — shown under the main agent so the two
+            # are obviously distinct and neither overwrites the other.
+            "sub_agents": meta_mod._subagents_snapshot(sid),
         })
     sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
     res = {"proxy": {"version": core_mod.VERSION,
@@ -146,6 +222,9 @@ def _status_snapshot(session=None, all_sessions=False):
                                      "max_pings": hold_mod.WARMTH_HOLD_MAX_PINGS},
                      "tracked_last_requests": len(last_real),
                      "holds_armed": len(holds),
+                     "sessions_total": sessions_total,
+                     "sessions_shown": len(sessions),
+                     "sessions_truncated": truncated,
                      "restored_at_start": dict(restore_mod._RESTORED),
                      "totals": dict(billing_mod._TOTALS),
                      "totals_since_start": billing_mod._since_start()},

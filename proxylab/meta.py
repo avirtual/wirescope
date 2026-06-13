@@ -196,14 +196,58 @@ def _is_title_call(obj):
     return any(t.startswith(_TITLE_SYS_PREFIX) for t in texts)
 
 
-def _capture_session_meta(session_id, obj, model, agent=None):
-    """Per-request meta hook (handler, post-parse): bump last_seen/model every
-    turn; hunt for the cwd only until found (capped attempts — sessions with a
-    custom system prompt may simply not carry an env block). `agent` = the
-    /agent/<name>/ route identity (None for plain traffic)."""
+# In-memory per-session subagent activity (Task-spawned subs share the parent's
+# session_id). Keyed sid -> {role -> {model, requests, last_seen}} so /_status //
+# _admin can show the main agent AND every subagent under it WITHOUT either
+# clobbering the other's identity. Display-grade, repopulated by live traffic.
+_SUBAGENTS = {}
+
+
+def _note_subagent(session_id, role, model, now=None):
+    """Record one subagent turn under its parent session (never touches the
+    parent's own identity row). Latest model + a running request count."""
+    if not session_id or not role:
+        return
+    now = now or time.time()
+    roles = _SUBAGENTS.setdefault(session_id, {})
+    e = roles.get(role)
+    if e is None:
+        roles[role] = {"model": model, "requests": 1, "last_seen": now,
+                       "first_seen": now}
+    else:
+        e["model"] = model or e["model"]
+        e["requests"] += 1
+        e["last_seen"] = now
+
+
+def _subagents_snapshot(session_id):
+    """The session's subagents for /_status, newest-active first; None if none."""
+    roles = _SUBAGENTS.get(session_id)
+    if not roles:
+        return None
+    out = [{"role": r, **v} for r, v in roles.items()]
+    out.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
+    return out
+
+
+def _capture_session_meta(session_id, obj, model, agent=None, role=None,
+                          title_call=False):
+    """Per-request meta hook (handler, post-parse). The MAIN LINE (the parent
+    agent, role parent/unknown, not a title side-call) owns the durable identity
+    row: it bumps last_seen + model and hunts the cwd. A SUBAGENT turn (Plan/
+    general-purpose/verification — same session_id on the wire) or a title
+    side-call must NOT overwrite the parent's model/identity; we only bump
+    last_seen (the session is alive) and, for a real subagent, log its activity
+    so /_status can show it distinctly. `agent` = the /agent/<name>/ route."""
     if not session_id:
         return
     pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
+    if title_call or writer_mod._is_subagent_role(role):
+        if writer_mod._is_subagent_role(role):
+            _note_subagent(session_id, role, model)
+        # last_seen only (model/cwd left untouched -> COALESCE keeps the parent's)
+        writer_mod._enqueue_meta(session_id, agent=agent)
+        return
     cwd = None
     if session_id not in _META_CWD_DONE and _META_CWD_TRIES[session_id] < _META_CWD_MAX_TRIES:
         _META_CWD_TRIES[session_id] += 1

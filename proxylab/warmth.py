@@ -150,46 +150,48 @@ def _prefix_hash(obj, upto):
     return h.hexdigest()
 
 
-def _last_marker_ttl(blocks):
-    """(index, ttl_seconds) of the LAST cache_control marker in a block list,
-    (None, None) when unmarked — no marker means the backend keeps no entry at
-    that boundary, so there is no segment to track."""
-    idx = ttl = None
-    for i, b in enumerate(blocks):
-        if isinstance(b, dict) and b.get("cache_control"):
-            idx, ttl = i, (3600 if b["cache_control"].get("ttl") == "1h" else 300)
-    return idx, ttl
-
-
 def _segment_hashes(obj):
-    """Hashes for the leading CLI cache breakpoints — marker 1 (tools[]) and
-    marker 2 (tools + system) — keyed like the real cache: canonical
-    post-transform bytes up to the marked block, cache_control stripped, model
-    folded in. Two sessions with byte-identical tool sets + system prompts
-    therefore compute the SAME hashes and share ledger rows, which is the
-    point: /_status can show a session whose message tail lapsed while its
-    tools/system segments stay warm courtesy of a sibling session.
+    """Hashes for the two leading CLI cache breakpoints. BOTH live in system[]:
+    the canonical server order is tools -> system -> messages, and on the wire
+    the CLI places no cache_control inside tools[] — it marks the system blocks
+    that sit in front of the conversation (verified across the capture corpus:
+    0 of ~6k real tool-carrying requests carry a tools[]-internal marker). The
+    standard layout is:
 
-    DISPLAY-GRADE, NOT GATE-GRADE: per-segment confirmation is inferred from
-    the turn's aggregate usage receipt (the backend never says WHICH breakpoint
-    it read vs wrote, and a sub-min-cacheable segment may be declined while a
+        system[0]  x-anthropic-billing-header   (out-of-band, never cached)
+        system[1]  "You are Claude Code…"        <- marker 1  (tools + preamble)
+        system[2]  the full system prompt        <- marker 2  (+ system prompt)
+
+    So marker 1 caches `tools + the 'you are Claude' preamble` and marker 2 adds
+    the system prompt. We surface marker 1 as segment "tools" (the smallest
+    shared prefix — tools + preamble) and the LAST marker as segment "system"
+    (tools + preamble + system prompt). A single-marker layout can't separate
+    the two, so it yields only "system".
+
+    Keyed like the real cache: canonical post-transform bytes of the cumulative
+    prefix up to each marked block, cache_control stripped, model folded in, the
+    volatile billing-header block excluded (its per-session `cch` token would
+    otherwise defeat the cross-session sharing this whole feature is for). Two
+    sessions with byte-identical tools+system therefore compute the SAME hashes
+    and share ledger rows — so /_status can show a session whose message tail
+    lapsed while its tools/system segments stay warm via a sibling session.
+
+    DISPLAY-GRADE, NOT GATE-GRADE: per-segment confirmation is inferred from the
+    turn's aggregate usage receipt (the backend never says WHICH breakpoint it
+    read vs wrote, and a sub-min-cacheable segment may be declined while a
     longer one caches). No gate may read these rows — eye candy only."""
     tools = obj.get("tools") if isinstance(obj.get("tools"), list) else []
     sys_ = obj.get("system") if isinstance(obj.get("system"), list) else []
-    out = {}
-    ti, tttl = _last_marker_ttl(tools)
-    si, sttl = _last_marker_ttl(sys_)
+    markers = [i for i, b in enumerate(sys_)
+               if isinstance(b, dict) and b.get("cache_control")]
+    if not markers:
+        return {}
     model = (obj.get("model") or "").encode("utf-8", "replace")
-    if ti is not None:
-        h = hashlib.blake2b(digest_size=20)
-        h.update(model)
-        h.update(b"\x1e")
-        h.update(_canon_message(tools[:ti + 1]))
-        out["tools"] = {"hash": h.hexdigest(), "ttl": tttl}
-    if si is not None:
-        # marker 2's prefix spans ALL tools (marked or not) + system up to its
-        # marker, minus the out-of-band billing-header block (never cached)
-        stable = [b for b in sys_[:si + 1]
+
+    def _hash_upto(idx):
+        # tools (all of them) + system blocks up to & including idx, minus the
+        # out-of-band billing header; the cumulative prefix the server caches.
+        stable = [b for b in sys_[:idx + 1]
                   if not (isinstance(b, dict) and
                           b.get("text", "").startswith("x-anthropic-billing-header"))]
         h = hashlib.blake2b(digest_size=20)
@@ -198,7 +200,17 @@ def _segment_hashes(obj):
         h.update(_canon_message(tools))
         h.update(b"\x1e")
         h.update(_canon_message(stable))
-        out["system"] = {"hash": h.hexdigest(), "ttl": sttl}
+        return h.hexdigest()
+
+    def _ttl(idx):
+        cc = sys_[idx].get("cache_control") or {}
+        return 3600 if cc.get("ttl") == "1h" else 300
+
+    out = {}
+    if len(markers) >= 2:               # marker 1 = tools + preamble
+        out["tools"] = {"hash": _hash_upto(markers[0]), "ttl": _ttl(markers[0])}
+    out["system"] = {"hash": _hash_upto(markers[-1]),   # last = + system prompt
+                     "ttl": _ttl(markers[-1])}
     return out
 
 
@@ -284,10 +296,11 @@ def warmth_query(hash_hex=None, session=None):
 
 
 def warmth_segments(session):
-    """Per-segment readout for /_status: the session's last-seen tools /
-    tools+system breakpoint hashes + their live warmth. Because the rows are
-    content-addressed (see _segment_hashes), sessions with identical tool sets
-    and system prompts resolve to the SAME rows — so these can read warm off a
+    """Per-segment readout for /_status: the session's last-seen leading
+    breakpoint hashes + their live warmth — "tools" = marker 1 (tools +
+    preamble), "system" = marker 2 (+ system prompt); see _segment_hashes.
+    Because the rows are content-addressed, sessions with identical tools and
+    system prompts resolve to the SAME rows — so these can read warm off a
     sibling session's traffic while this session's own message tail is cold.
     Display-grade only; no gate reads this."""
     try:

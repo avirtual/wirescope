@@ -183,6 +183,16 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
 
 
 async def handler(request: Request) -> Response:
+    # ---- identity: "is this our proxy?" handshake for subscribers -------------
+    # GET /_identity — read-only, unauthenticated, spends nothing. Lets a
+    # consumer confirm product == "logproxy" + read capabilities/protocols
+    # before it registers / pulls stats / warms cache (see SUBSCRIBERS.md).
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_identity":
+        res = status_mod._identity()
+        return Response(json.dumps(res, indent=2),
+                        media_type="application/json",
+                        headers={"X-Logproxy-Version": core_mod.VERSION})
+
     # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
     # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
     if request.method == "GET" and request.url.path == "/_status":
@@ -195,9 +205,18 @@ async def handler(request: Request) -> Response:
     # GET /_admin[?session=<id>][&all=1] — read-only HTML view of /_status.
     if request.method == "GET" and request.url.path.rstrip("/") == "/_admin":
         q = request.query_params
-        res = status_mod._status_snapshot(session=q.get("session"),
-                               all_sessions=q.get("all") in ("1", "yes", "true"))
-        return Response(views_mod._render_admin_html(res, host=request.headers.get("host", "")),
+        all_s = q.get("all") in ("1", "yes", "true")
+        sess = q.get("session")
+        try:
+            show = int(q.get("show") or 60)
+        except (TypeError, ValueError):
+            show = 60
+        show = max(10, min(show, 2000))
+        res = status_mod._status_snapshot(
+            session=sess, all_sessions=all_s,
+            limit=(None if (all_s or sess) else show))
+        return Response(views_mod._render_admin_html(
+                            res, host=request.headers.get("host", ""), show=show),
                         media_type="text/html; charset=utf-8")
 
     # ---- session context view: the replayable last request, for humans --------
@@ -224,6 +243,70 @@ async def handler(request: Request) -> Response:
         q = request.query_params
         res = warmth_mod.warmth_query(hash_hex=q.get("h"), session=q.get("session"))
         return Response(json.dumps(res), media_type="application/json")
+
+    # ---- keep-warm HOLD: arm/disarm idle insurance for a session --------------
+    # GET  /_hold?session=<id>                  -> current hold (read-only, free)
+    # POST /_hold?session=<id>&hours=<n>        -> arm n hours of idle insurance
+    # POST /_hold?session=<id>&hours=0  (|&action=off) -> disarm
+    # The programmatic twin of the in-band `/warm-cache` command (which arms by
+    # injecting a <proxy:warm-cache hours=N> sentinel into a forwarded turn).
+    # Unlike that path this does NOT forward a turn, so the pinger can only keep
+    # the cache warm if the session already has a replayable last request + live
+    # auth (see `pingable`/`awaiting_auth` in the reply); otherwise the hold is
+    # recorded and the session's next real turn re-anchors + donates them.
+    if request.url.path.rstrip("/") == "/_hold":
+        q = request.query_params
+        sess = q.get("session")
+        if not sess:
+            return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
+                            status_code=400, media_type="application/json")
+        if request.method == "GET":
+            hold = hold_mod._hold_snapshot().get(sess)
+            return Response(json.dumps({"ok": True, "session": sess, "hold": hold}),
+                            media_type="application/json")
+        raw_h, act = q.get("hours"), q.get("action")
+        if act == "off" or raw_h in ("0", "off"):
+            arm_action, hours = "off", None
+        else:
+            try:
+                hours = float(raw_h)
+            except (TypeError, ValueError):
+                return Response(json.dumps({"ok": False, "reason": "missing/invalid ?hours="}),
+                                status_code=400, media_type="application/json")
+            if hours <= 0:
+                arm_action, hours = "off", None
+            else:
+                # match the in-band path's clamp to the configured ceiling
+                arm_action = "arm"
+                hours = min(hours, hold_mod.WARMTH_HOLD_MAX_HOURS)
+        # Same discipline as /_ping: we never warm a non-warm prefix. Arming
+        # over HTTP does NOT forward a turn, so a hold on a cold/absent prefix
+        # has nothing to keep warm — it would be a no-op until a real turn
+        # re-establishes the cache. Decline it (force=1 to arm anyway, e.g. when
+        # the caller knows a turn is imminent). Disarm is never gated.
+        # Convention (matches /_ping): a deliberate decline is a SUCCESSFUL
+        # request with a structured outcome (200, ok:true, armed:false,
+        # skipped:<state>) — NOT an HTTP error. 4xx is reserved for malformed
+        # requests (missing session / bad hours). Branch on `armed`, not status.
+        if arm_action == "arm" and q.get("force") not in ("1", "yes", "on", "true"):
+            wq = warmth_mod.warmth_query(session=sess)
+            state = ("warm" if wq.get("warm")
+                     else "cold" if wq.get("found") else "absent")
+            if state != "warm":
+                return Response(json.dumps(
+                    {"ok": True, "armed": False, "skipped": state, "session": sess,
+                     "warmth_state": state, "warmth": wq,
+                     "reason": f"prefix is '{state}', not warm; arming over HTTP does "
+                               "not forward a turn, so there is nothing to keep warm — "
+                               "it would be a no-op until a real turn re-establishes "
+                               "the cache. Declined (force=1 to arm anyway, or send a "
+                               "turn through the proxy first)."}),
+                    media_type="application/json")
+        ack, rec = hold_mod._arm_hold(sess, arm_action, hours)
+        print(f"[hold] session={sess[:12]}… HTTP {arm_action} -> "
+              f"armed={rec.get('armed')} reason={rec.get('reason')}", flush=True)
+        return Response(json.dumps({"ok": True, "ack": ack, **rec}),
+                        media_type="application/json")
 
     # ---- keep-warm pinger: replay a session's cached last request -------------
     # POST/GET /_ping?session=<id>[&force=1] — intercepted, never forwarded as a
@@ -406,9 +489,13 @@ async def handler(request: Request) -> Response:
         # until found; flag the title side-call so the response capture can
         # harvest the session title the CLI generates anyway.
         if upstream_path.split("?")[0].endswith("/v1/messages"):
-            meta_mod._capture_session_meta(session_id, obj, model,
-                                           agent=(agent if m else None))
             title_call = meta_mod._is_title_call(obj)
+            # subagents (Task-spawned) share the parent's session_id; pass role
+            # so a sub turn is logged distinctly and never overwrites the parent
+            # agent's identity/model on the /_status row.
+            meta_mod._capture_session_meta(session_id, obj, model,
+                                           agent=(agent if m else None),
+                                           role=role, title_call=title_call)
             # heaviness snapshot from the model-visible history (main line
             # only: a subagent's small history must not clobber the parent's)
             if session_id and not title_call and role in ("parent", "unknown"):
@@ -486,12 +573,18 @@ async def handler(request: Request) -> Response:
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in core_mod._HOP}
     fwd_headers["accept-encoding"] = "identity"  # force uncompressed so we can read the SSE
     # Stash this (post-transform) request so POST /_ping?session= can replay it.
+    # Only the MAIN LINE (parent agent) is the session's durable, pingable
+    # request: a subagent or title side-call shares the session_id but is
+    # transient — it must not replace what /_ping replays nor re-anchor the
+    # keep-warm hold (else we'd keep a finished subagent's context warm instead
+    # of the main agent's).
     if upstream_path.split("?")[0].endswith("/v1/messages"):
-        pinger_mod._cache_last_request(session_id, obj, fwd_headers, upstream_path,
-                            account_uuid)
-        if "hold_echo" not in record:      # the arming turn itself isn't
-            hold_mod._hold_note_real_turn(session_id)   # organic; real turns restart
-                                               # the ping budget + window
+        if not title_call and not writer_mod._is_subagent_role(role):
+            pinger_mod._cache_last_request(session_id, obj, fwd_headers, upstream_path,
+                                account_uuid)
+            if "hold_echo" not in record:      # the arming turn itself isn't
+                hold_mod._hold_note_real_turn(session_id)   # organic; real turns restart
+                                                   # the ping budget + window
     req = core_mod._client.build_request(request.method, core_mod.UPSTREAM + upstream_path,
                                 headers=fwd_headers, content=raw)
     up = await core_mod._client.send(req, stream=True)

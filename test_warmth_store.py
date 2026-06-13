@@ -149,15 +149,19 @@ lp._clear_session_ended("sess-test-1")
 check("live turn clears the ended marker", "sess-test-1" not in lp._ENDED)
 
 # --- leading-breakpoint segments (display-grade; 2026-06-12) -------------------
-# marker 1 = tools, marker 2 = tools+system: content-addressed so sessions with
-# byte-identical layouts share rows; a sibling's traffic keeps them warm after
-# this session's own message tail lapses. Eye candy — no gate reads these.
+# Both markers live in system[] (the wire never marks tools[]): marker 1 caches
+# tools + the "You are Claude" preamble, marker 2 adds the full system prompt.
+# Content-addressed so sessions with byte-identical layouts share rows; a
+# sibling's traffic keeps them warm after this session's own message tail
+# lapses. Eye candy — no gate reads these.
 
 def seg_obj(sid, question, ttl="1h", tool_desc="edit a file",
             with_billing_block=False):
     cc = ({"type": "ephemeral", "ttl": "1h"} if ttl == "1h"
           else {"type": "ephemeral"})
-    sysb = [{"type": "text", "text": "You are Claude Code, a CLI."},
+    # real shape: marker 1 on the preamble block, marker 2 on the system prompt
+    sysb = [{"type": "text", "text": "You are Claude Code, a CLI.",
+             "cache_control": dict(cc)},
             {"type": "text", "text": "# Environment\ncwd: /tmp",
              "cache_control": dict(cc)}]
     if with_billing_block:
@@ -168,8 +172,7 @@ def seg_obj(sid, question, ttl="1h", tool_desc="edit a file",
             "tools": [{"name": "Read", "description": "read a file",
                        "input_schema": {"type": "object"}},
                       {"name": "Edit", "description": tool_desc,
-                       "input_schema": {"type": "object"},
-                       "cache_control": dict(cc)}],
+                       "input_schema": {"type": "object"}}],
             "system": sysb,
             "messages": [msg("user", question),
                          {"role": "user", "content": [
@@ -197,6 +200,13 @@ check("a changed tool description changes BOTH segment hashes (byte-exact)",
 check("billing-header block excluded from the system segment (out-of-band)",
       lp._segment_hashes(seg_obj("x", "q", with_billing_block=True))["system"]["hash"]
       == ga["system"]["hash"])
+check("tools segment (tools+preamble) differs from system segment (+system prompt)",
+      ga["tools"]["hash"] != ga["system"]["hash"])
+check("single system marker -> only the 'system' segment (can't separate the two)",
+      "tools" not in lp._segment_hashes(
+          {"model": "m", "tools": [],
+           "system": [{"type": "text", "text": "all in one",
+                       "cache_control": {"type": "ephemeral"}}]}))
 check("no markers -> no segments", lp._segment_hashes(compact_obj()) == {})
 
 lp._record_warmth(sa, {"cache_creation_input_tokens": 5000})
