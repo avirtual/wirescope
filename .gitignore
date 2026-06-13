@@ -13,3 +13,5 @@ release.env
 CLAUDE.md
 CLAUDE.md.archive-*
 cv-settings-deny.json
+.venv/
+venv/

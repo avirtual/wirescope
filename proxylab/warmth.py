@@ -73,7 +73,12 @@ store_mod.register_schema(
     # hashes (marker 1 = tools, marker 2 = tools+system) — display-grade only,
     # see _segment_hashes. Additive migration.
     "ALTER TABLE session_head ADD COLUMN tools_hash TEXT",
-    "ALTER TABLE session_head ADD COLUMN sys_hash TEXT")
+    "ALTER TABLE session_head ADD COLUMN sys_hash TEXT",
+    # cold-resume counter (2026-06-13): how many real turns landed on a LAPSED
+    # head — i.e. the cache went cold between turns and the backend re-wrote the
+    # whole prefix. A bursty long-lived session pays the write premium once per
+    # resume; this counts that waste. Additive migration; old rows -> 0.
+    "ALTER TABLE session_head ADD COLUMN cold_resumes INTEGER NOT NULL DEFAULT 0")
 
 
 def _warmth_rows(hashes):
@@ -328,6 +333,24 @@ def warmth_segments(session):
     return out or None
 
 
+def cold_resumes(session):
+    """How many real turns this session resumed from a COLD cache — each one a
+    full prefix re-write at the write premium (the waste a long-lived but bursty
+    session pays). 0 = it never went cold between turns (or only paid its initial
+    start). Same cold notion as /_admin's warm/cold split; survives restarts
+    (lives on session_head). Display/analytics-grade — no gate reads it."""
+    if not session:
+        return 0
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            r = con.execute("SELECT cold_resumes FROM session_head "
+                            "WHERE session_id=?", (session,)).fetchone()
+        return int(r[0]) if r and r[0] is not None else 0
+    except Exception:
+        return 0
+
+
 def _cold_ping_decision(obj):
     """If this request is a keep-warm ping whose target prefix is NOT warm, return
     a decline record (caller short-circuits, never forwards). A ping only ever pays
@@ -392,7 +415,27 @@ def _record_warmth(obj, usage):
         con = store_mod.db()
         rows = [(h, now, ttl, now + ttl)] + [
             (s["hash"], now, s["ttl"], now + s["ttl"]) for s in segs.values()]
+        resumed = False
         with store_mod.LOCK:
+            # COLD-RESUME detection (before we restamp). A real turn whose
+            # session we've seen before, arriving while that session's last head
+            # had LAPSED (cold/absent), means the cache went cold between turns
+            # and the backend re-wrote the whole prefix. The first turn of a
+            # session (no prior head row) is an initial cold start, NOT a resume.
+            # We read the prior head's warmth with the SAME head-hash notion that
+            # /_admin's warm/cold split uses, so the counter and the table agree.
+            # (Raw query, not warmth_state/_warmth_rows — those re-acquire LOCK,
+            # which is non-reentrant.)
+            new_resumes = 0
+            if sid and not ping:
+                prev = con.execute(
+                    "SELECT hash, cold_resumes FROM session_head "
+                    "WHERE session_id=?", (sid,)).fetchone()
+                if prev:
+                    pe = con.execute("SELECT expires_at FROM warmth WHERE hash=?",
+                                     (prev[0],)).fetchone()
+                    resumed = (not pe) or (pe[0] <= now)
+                    new_resumes = (prev[1] or 0) + (1 if resumed else 0)
             con.executemany("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
                             "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
                             "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "
@@ -401,13 +444,15 @@ def _record_warmth(obj, usage):
             # refreshes the shared hashes above (its fork-id head is irrelevant).
             if sid and not ping:
                 con.execute("INSERT INTO session_head(session_id, hash, updated_at, "
-                            "tools_hash, sys_hash) VALUES(?,?,?,?,?) "
+                            "tools_hash, sys_hash, cold_resumes) VALUES(?,?,?,?,?,?) "
                             "ON CONFLICT(session_id) DO UPDATE SET "
                             "hash=excluded.hash, updated_at=excluded.updated_at, "
-                            "tools_hash=excluded.tools_hash, sys_hash=excluded.sys_hash",
+                            "tools_hash=excluded.tools_hash, sys_hash=excluded.sys_hash, "
+                            "cold_resumes=excluded.cold_resumes",
                             (sid, h, now,
                              (segs.get("tools") or {}).get("hash"),
-                             (segs.get("system") or {}).get("hash")))
+                             (segs.get("system") or {}).get("hash"),
+                             new_resumes))
             con.commit()
             size = con.execute("SELECT COUNT(*) FROM warmth").fetchone()[0]
     except Exception as e:
@@ -419,4 +464,5 @@ def _record_warmth(obj, usage):
             "n_messages_hashed": upto, "cache_read_input_tokens": read,
             "cache_creation_input_tokens": created,
             "warm_on_arrival": read > 0, "ledger_size": size,
+            "cold_resume": resumed, "cold_resumes": new_resumes,
             "segments": segs or None}

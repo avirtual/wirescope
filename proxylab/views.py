@@ -66,7 +66,7 @@ def _fmt_tok(n):
 
 _ADMIN_CSS = """
 body{background:#14161a;color:#cdd3dd;font:13px/1.5 ui-monospace,Menlo,monospace;
-     margin:1.2em auto;max-width:1180px;padding:0 1em}
+     margin:1.2em;padding:0}
 a{color:#6ab0de;text-decoration:none} a:hover{text-decoration:underline}
 h1{font-size:16px;color:#e6ebf2} h1 small{color:#69707d;font-weight:normal}
 table{border-collapse:collapse;width:100%;margin:.8em 0}
@@ -182,6 +182,12 @@ def _render_admin_html(snap, host="", show=60):
         # parent's (sub turns never overwrite it).
         subs = s.get("sub_agents") or []
         mainlbl = ' <span class="badge">main</span>' if subs else ""
+        # cold-resume count: each is a full prefix re-write at the premium —
+        # a bursty session that keeps lapsing between turns is paying it over.
+        nres = s.get("cold_resumes") or 0
+        resumeb = (f' <span class="badge warn" title="resumed from a cold cache '
+                   f'{nres}× — each a full prefix re-write at the write premium">'
+                   f'&#8635;{nres}</span>' if nres else "")
         subline = "".join(
             f'<br><span class="subagent">&#8627; '
             f'<a href="/_session?session={e(sid)}&amp;role={e(sa["role"])}">{e(sa["role"])}</a> '
@@ -191,7 +197,7 @@ def _render_admin_html(snap, host="", show=60):
         return (
             f'<tr><td>{warmth}</td>'
             f'<td><b><a href="/_session?session={e(sid)}">'
-            f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}<br>'
+            f'{e(s.get("title") or "(untitled)")}</a></b>{summ}{kindb}{resumeb}<br>'
             f'<a href="/_status?session={e(sid)}"><code>{e(sid[:8])}…</code></a> '
             f'<span class="dim">{e(writer_mod._short_model(s.get("model")))}</span>{mainlbl}<br>'
             f'<span class="dim">{e(s.get("cwd") or "")}</span>{subline}</td>'

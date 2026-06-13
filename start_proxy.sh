@@ -25,6 +25,30 @@ PORT="${PORT:-7800}"
 LOG_DIR="${LOG_DIR:-logs_main}"
 OUT="${OUT:-proxy_${PORT}.out}"
 
+# Resolve the Python interpreter: an active venv wins, then a local ./.venv
+# (what setup.sh creates), else system python3. If the chosen interpreter can't
+# import uvicorn, bootstrap a local venv automatically — so a fresh clone needs
+# only `./start_proxy.sh`, no pip dance. (A user who already has the deps on
+# their own interpreter is untouched: the import check passes, nothing is built.)
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+  PY="$VIRTUAL_ENV/bin/python"
+elif [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+else
+  PY="python3"
+fi
+if ! "$PY" -c 'import uvicorn' >/dev/null 2>&1; then
+  if [ -x ./setup.sh ]; then
+    echo "dependencies missing — bootstrapping a local venv via ./setup.sh ..."
+    ./setup.sh
+    PY=".venv/bin/python"
+  else
+    echo "ERROR: uvicorn isn't available to '$PY'. Run ./setup.sh (recommended) or" >&2
+    echo "  pip install -r requirements.txt into your environment." >&2
+    exit 1
+  fi
+fi
+
 # Canonical defaults for flags that are off in code ("-" not ":-" so an
 # explicit empty/0 from the caller is respected):
 export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
@@ -40,7 +64,7 @@ fi
 # Subshell + nohup + disown => detached, reparented to PID 1.
 (
   LOG_DIR="$LOG_DIR" PORT="$PORT" ${INJECT:+INJECT="$INJECT"} \
-    nohup python3 -m uvicorn logproxy:app \
+    nohup "$PY" -m uvicorn logproxy:app \
       --host 127.0.0.1 --port "$PORT" --log-level warning \
       >"$OUT" 2>&1 </dev/null &
   disown

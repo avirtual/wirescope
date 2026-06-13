@@ -132,6 +132,66 @@ con2.close()
 check("warmth survives a restart (fresh connection sees rows)",
       n_rows >= 1 and n_heads == 1)
 
+# --- cold-resume counter -------------------------------------------------------
+# DISTINCT content so this session's content-addressed warmth rows don't collide
+# with any sibling's (the /_end fork-shared check above relies on its row staying
+# warm). Each entry advances this session's head to a distinct prefix.
+cr = {"model": "claude-fable-5",
+      "system": [{"type": "text", "text": "You are Claude Code, a CLI."}],
+      "messages": [msg("user", "cold-resume probe alpha " * 20),
+                   msg("assistant", "cold-resume reply " * 20),
+                   msg("user", "cold-resume probe gamma " * 20)],
+      "metadata": {"user_id": json.dumps({"session_id": "sess-cr-1"})}}
+cr_t1 = {**cr, "messages": cr["messages"][:1]}
+cr_t2 = {**cr, "messages": cr["messages"][:2]}
+cr_t3 = {**cr, "messages": cr["messages"][:3]}
+
+# Turn 1: a session's FIRST turn is an initial cold start, NOT a resume.
+r1 = lp._record_warmth(cr_t1, {"cache_creation_input_tokens": 100})
+check("first turn is not counted as a resume",
+      r1["cold_resume"] is False and r1["cold_resumes"] == 0
+      and lp.cold_resumes("sess-cr-1") == 0)
+
+# Turn 2: prior head still warm (active session) -> no resume.
+r2 = lp._record_warmth(cr_t2, {"cache_read_input_tokens": 100})
+check("a turn on a still-warm prior head is not a resume",
+      r2["cold_resume"] is False and lp.cold_resumes("sess-cr-1") == 0)
+
+# Lapse this session's CURRENT head, then take a turn -> prior head is cold ->
+# resume #1. (Scope the lapse to this head hash so sibling sessions' rows, which
+# later checks rely on, stay warm. Resolve the hash BEFORE taking the lock —
+# _session_head_hash acquires it and store.LOCK is non-reentrant.)
+_cr_head = lp.warmth._session_head_hash("sess-cr-1")
+with lp.store.LOCK:
+    con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
+                (time.time() - 30, _cr_head))
+    con.commit()
+r3 = lp._record_warmth(cr_t3, {"cache_creation_input_tokens": 200})
+check("a turn on a lapsed prior head counts as a cold resume",
+      r3["cold_resume"] is True and r3["cold_resumes"] == 1
+      and lp.cold_resumes("sess-cr-1") == 1)
+
+# Lapse again with a fresh, longer prefix -> resume #2 (counter accumulates).
+cr_t4 = {**cr, "messages": cr["messages"] + [msg("user", "more " * 10)]}
+_cr_head = lp.warmth._session_head_hash("sess-cr-1")
+with lp.store.LOCK:
+    con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
+                (time.time() - 30, _cr_head))
+    con.commit()
+r4 = lp._record_warmth(cr_t4, {"cache_creation_input_tokens": 50})
+check("the cold-resume counter accumulates across lapses",
+      r4["cold_resumes"] == 2 and lp.cold_resumes("sess-cr-1") == 2)
+
+check("cold_resumes() is 0 for an unknown session (no fiction)",
+      lp.cold_resumes("sess-cr-ghost") == 0)
+
+# /_status carries the per-session counter
+lp._upsert_session_meta("sess-cr-1", cwd="/tmp/cr", model="claude-fable-5")
+_cr_snap = [s for s in lp._status_snapshot(session="sess-cr-1")["sessions"]
+            if s["session_id"] == "sess-cr-1"]
+check("status snapshot exposes cold_resumes",
+      len(_cr_snap) == 1 and _cr_snap[0]["cold_resumes"] == 2)
+
 # /_end = a MARKER since 2026-06-11, not a delete: one-shot `claude -p` runs
 # fire SessionEnd the instant their answer lands; the debug state must survive.
 e = lp._end_session("sess-test-1", reason="clear")

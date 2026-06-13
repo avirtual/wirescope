@@ -39,13 +39,13 @@ In return for routing through it:
 Needs Python 3.9+. The only third-party deps are `httpx`, `starlette`, and `uvicorn`.
 
 ```bash
-# 0. Install deps (a venv is recommended but not required)
-pip install -r requirements.txt
-
 # 1. Run the proxy (defaults to :7800, captures into ./logs_main)
 ./start_proxy.sh
-#    or directly:  uvicorn logproxy:app --port 7800
+```
 
+On a fresh clone `start_proxy.sh` notices the deps are missing and **bootstraps a self-contained `./.venv` for you** (via `./setup.sh`) before launching — no manual `pip` step, and nothing touches your system Python (so you never hit the "externally-managed-environment" / PEP 668 wall). If you'd rather set things up first, run `./setup.sh` on its own; if you already have the deps on your own interpreter (or an active venv), it's used as-is and nothing is built.
+
+```bash
 # 2. Point a CLI at it
 ANTHROPIC_BASE_URL=http://localhost:7800 claude
 
@@ -55,6 +55,8 @@ open  http://localhost:7800/_admin         # live HTML dashboard (auto-refresh)
 ```
 
 That's it — your session runs exactly as before, now fully observable.
+
+> Prefer to manage the environment yourself? `pip install -r requirements.txt` (into a venv or with `pipx`/`--user`) and then `uvicorn logproxy:app --port 7800` works too.
 
 ## The biggest practical levers
 

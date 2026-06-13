@@ -197,6 +197,9 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
                        # content-addressed → shared across sessions with
                        # identical layouts; display-grade only
                        "segments": warmth_mod.warmth_segments(sid)},
+            # lifetime count of resumes from a COLD cache (each = a full prefix
+            # re-write at the write premium); 0 = never lapsed between turns
+            "cold_resumes": warmth_mod.cold_resumes(sid),
             "hold": hold,
             "cost": ({"est_usd": tot["est_usd"], "requests": tot["requests"],
                       "unpriced_requests": tot["unpriced_requests"]}
