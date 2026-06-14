@@ -1120,6 +1120,70 @@ lp.transforms.WS_STRIP_TOOLS = True
 lp.transforms._WS_SPAWN_MEMORY.clear()
 lp.transforms.WS_OMIT_DEFAULT = _save_td
 
+# --- subagent attribution: fingerprint guard vs leaked parent turns -------------
+# Wire-confirmed (clodex session 01fc35be, 2026-06-14): a PARENT turn can arrive
+# flagged cc_is_subagent=true carrying a STALE agent-id, but its body-derived
+# cc_version fingerprint still matches the parent. Fail closed: a sub-flagged turn
+# whose fingerprint == the session main line is NOT a genuine subagent, so it can
+# neither clobber a sub bucket nor replay sticky wirescope memory.
+lp.writer._SESSION_MAIN_FP.clear()
+_FPMAIN = "x-anthropic-billing-header: cc_version=2.1.177.79a; cc_entrypoint=cli;"
+_FPLEAK = "x-anthropic-billing-header: cc_version=2.1.177.79a; cc_entrypoint=cli; cc_is_subagent=true;"
+_FPSUB  = "x-anthropic-billing-header: cc_version=2.1.177.2bb; cc_entrypoint=cli; cc_is_subagent=true;"
+def _fp_obj(billing, sid="sess-fpg", prompt="do it"):
+    return {"model": "claude-x", "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "system": [{"type": "text", "text": billing + "\nYou are Claude Code"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": prompt}]}]}
+check("_billing_fingerprint extracts the cc_version content hash",
+      lp.writer._billing_fingerprint(_fp_obj(_FPMAIN)) == "2.1.177.79a")
+check("a main-line turn is never a genuine subagent",
+      lp.writer._genuine_subagent(_fp_obj(_FPMAIN)) is False)
+lp.writer._note_main_fingerprint("sess-fpg", _fp_obj(_FPMAIN))
+check("sub-flagged turn whose fingerprint MATCHES the main line is rejected (leaked)",
+      lp.writer._genuine_subagent(_fp_obj(_FPLEAK)) is False)
+check("sub-flagged turn with its OWN fingerprint is a genuine subagent",
+      lp.writer._genuine_subagent(_fp_obj(_FPSUB)) is True)
+check("classify: a leaked parent turn is 'parent', not 'subagent'",
+      lp.writer._classify_role(_fp_obj(_FPLEAK)) == "parent")
+check("classify: a genuine subagent turn is 'subagent'",
+      lp.writer._classify_role(_fp_obj(_FPSUB)) == "subagent")
+# end to end through meta: a genuine haiku sub establishes the bucket; the leaked
+# sonnet turn (fp==main, stale agent-id aSUB) is reclassified parent and must NOT
+# clobber the haiku sub's model/last-request — the exact wire bug.
+fpsid = "sess-fpg2"; lp.writer._SESSION_MAIN_FP.clear()
+lp._capture_session_meta(fpsid, _fp_obj(_FPMAIN, sid=fpsid), "claude-sonnet-4-6", role="parent")
+_go = _fp_obj(_FPSUB, sid=fpsid)
+lp._capture_session_meta(fpsid, _go, "claude-haiku-4-5",
+                         role=lp.writer._classify_role(_go), agent_id="aSUB")
+_lk2 = _fp_obj(_FPLEAK, sid=fpsid)
+lp._capture_session_meta(fpsid, _lk2, "claude-sonnet-4-6",
+                         role=lp.writer._classify_role(_lk2), agent_id="aSUB")
+lp._WRITE_Q.join()
+_fpsubs = lp._status_snapshot(session=fpsid)["sessions"][0].get("sub_agents") or []
+check("meta: leaked sonnet turn does NOT clobber the haiku sub bucket (model/count)",
+      len(_fpsubs) == 1 and _fpsubs[0]["model"] == "claude-haiku-4-5"
+      and _fpsubs[0]["requests"] == 1)
+# sticky/operator memory never replays onto a leaked parent turn...
+lp.transforms.WS_OMIT = True
+lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": [("omit", "claudemd")]}
+_lk3 = _fp_obj(_FPLEAK, sid=fpsid)
+_lkr = lp.transforms._ws_omit(_lk3, agent_id="aSUB")
+check("sticky: a leaked parent turn does NOT replay the sub's remembered omit",
+      (_lkr is None or _lkr.get("omitted") == [])
+      and "MARKER-CLAUDEMD" in _lk3["messages"][0]["content"][0]["text"])
+# ...but the genuine sub instance still does (control)
+lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": [("omit", "claudemd")]}
+_g2 = _fp_obj(_FPSUB, sid=fpsid)
+_gr = lp.transforms._ws_omit(_g2, agent_id="aSUB")
+check("sticky: a genuine sub instance still replays its remembered omit (control)",
+      _gr and _gr.get("omitted") == ["claudemd"]
+      and "MARKER-CLAUDEMD" not in _g2["messages"][0]["content"][0]["text"])
+lp.transforms.WS_OMIT = False
+lp.transforms._WS_SPAWN_MEMORY.clear()
+lp.writer._SESSION_MAIN_FP.clear()
+
 # --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --
 # The one place wirescope adds proxy-authored visible text: a constant
 # SELF-CONTAINED grammar block (the recipient is in its own cwd and can't open the

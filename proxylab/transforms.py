@@ -690,7 +690,10 @@ def _ws_merged_pairs(obj, agent_id=None):
     a real subagent instance (the main line has no agent_id, so it is never
     sticky; a non-subagent is never touched even if some header leaked through)."""
     pairs = []
-    is_sub = writer_mod._billing_is_subagent(obj)
+    # Fingerprint-backed subagent check (NOT the raw billing flag): a parent turn
+    # that leaked cc_is_subagent=true + a stale agent-id must NOT pick up the
+    # subagent operator-default NOR replay another instance's sticky directives.
+    is_sub = writer_mod._genuine_subagent(obj)
     if WS_OMIT_DEFAULT and is_sub:
         pairs.append(("omit", ",".join(WS_OMIT_DEFAULT)))   # lowest precedence
     pairs += writer_mod._ws_body_pairs(obj)
@@ -947,8 +950,8 @@ def _ws_spawner_hint(obj):
     proxy-authored text in the whole protocol."""
     if not WS_SPAWNER_HINT:
         return None
-    if writer_mod._billing_is_subagent(obj):       # never teach a subagent
-        return None
+    if writer_mod._genuine_subagent(obj):          # never teach a real subagent
+        return None                                # (a leaked parent turn IS a spawner)
     tools = obj.get("tools")
     if not isinstance(tools, list):
         return None

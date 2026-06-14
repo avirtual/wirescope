@@ -315,6 +315,10 @@ def _capture_session_meta(session_id, obj, model, agent=None, role=None,
         # last_seen only (model/cwd left untouched -> COALESCE keeps the parent's)
         writer_mod._enqueue_meta(session_id, agent=agent)
         return
+    # Durable main line: stamp its content fingerprint so _genuine_subagent can
+    # tell a real subagent (own fingerprint) from a parent turn that leaked
+    # cc_is_subagent=true with a stale agent-id (carries THIS fingerprint).
+    writer_mod._note_main_fingerprint(session_id, obj)
     cwd = None
     if session_id not in _META_CWD_DONE and _META_CWD_TRIES[session_id] < _META_CWD_MAX_TRIES:
         _META_CWD_TRIES[session_id] += 1

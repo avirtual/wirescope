@@ -410,6 +410,7 @@ def _sweep_state(now=None):
         meta_mod._SUBAGENTS.pop(sid, None)
         meta_mod._SUBAGENT_LAST_REQ.pop(sid, None)
         _transforms_mod._ws_forget(sid)   # sticky wirescope spawn memory
+        meta_mod.writer_mod._forget_session_fp(sid)   # main-line fingerprint
     purged = heads = 0
     try:
         con = store_mod.db()

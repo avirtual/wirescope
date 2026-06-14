@@ -180,9 +180,68 @@ def _is_subagent_role(role):
 
 def _billing_is_subagent(obj):
     """Ground-truth subagent flag from the x-anthropic-billing-header (block 0 of
-    system[]): `cc_is_subagent=true`. The routed MAIN agent never sets it — only
-    Task-spawned subagents do — so it's a safe discriminator for the main line."""
+    system[]): `cc_is_subagent=true`. The routed MAIN agent USUALLY never sets it
+    — but it CAN leak onto a parent turn alongside a recycled agent-id (the clodex
+    stale-id case, wire-confirmed 2026-06-14), so this flag alone is not trusted to
+    file a subagent bucket; see _genuine_subagent for the fingerprint backstop."""
     return "cc_is_subagent=true" in _sys_text(obj)
+
+
+# CONTENT FINGERPRINT (the cc_version suffix). The CLI recomputes it every request
+# from the ACTUAL body (SHA256 over chars of the first user message + version) and
+# embeds it in the billing header, so it tracks the conversation LINEAGE and can
+# NOT be stale relative to the body (confirmed against claude-code's
+# fingerprint.ts). This is the one main/sub signal that survives the clodex
+# stale-agent-id leak: a parent turn that arrives flagged cc_is_subagent=true with
+# a recycled agent-id STILL carries the parent's fingerprint, because its body is
+# the parent conversation. See _genuine_subagent.
+_BILLING_FP_RE = re.compile(r"cc_version=([0-9a-f.]+)")
+_SESSION_MAIN_FP = {}          # session_id -> the main line's content fingerprint
+
+
+def _billing_fingerprint(obj):
+    """The cc_version content fingerprint from the billing header, or None."""
+    m = _BILLING_FP_RE.search(_sys_text(obj))
+    return m.group(1) if m else None
+
+
+def _note_main_fingerprint(session_id, obj):
+    """Record the session's MAIN-line fingerprint — called ONLY from the durable
+    main-line capture path (never a title side-call or a subagent), so it's the
+    parent's stable first-message fingerprint that _genuine_subagent tests against."""
+    if not session_id:
+        return
+    fp = _billing_fingerprint(obj)
+    if fp:
+        _SESSION_MAIN_FP[session_id] = fp
+
+
+def _forget_session_fp(session_id):
+    """Drop a session's main fingerprint (pinger sweep hook)."""
+    _SESSION_MAIN_FP.pop(session_id, None)
+
+
+def _genuine_subagent(obj):
+    """True only if this turn is a REAL subagent — header-flagged cc_is_subagent
+    AND its content fingerprint diverges from the session's established main line.
+    A parent turn that leaked the subagent flag + a stale agent-id carries the MAIN
+    fingerprint (body-derived, never stale), so it reads NOT-genuine here and is
+    kept off the subagent buckets — fail closed to the main line (reviewer +
+    claude-code's converging call). PURE READ: never mutates _SESSION_MAIN_FP (the
+    main path does, via _note_main_fingerprint), so transform-chain / classifier
+    callers can't corrupt the reference with a title side-call.
+    CAVEAT: fork-path subagents (subagent_type omitted) clone the parent's first
+    message and thus its fingerprint -> read as main here. Safe under-attribution
+    (a fork's turns roll into the parent view, never corrupting a real sub bucket);
+    normal Task subs have their own first message -> own fingerprint."""
+    if not _billing_is_subagent(obj):
+        return False
+    sid = (_session_ids(obj) or [None])[0]
+    main_fp = _SESSION_MAIN_FP.get(sid) if sid else None
+    fp = _billing_fingerprint(obj)
+    if main_fp and fp and fp == main_fp:
+        return False               # leaked parent turn (stale agent-id)
+    return True
 
 
 # --- Wirescope directive protocol (`wirescope:`) — full spec in WIRESCOPE.md --
@@ -337,8 +396,10 @@ def _classify_role(obj):
         return "general-purpose"
     # Any remaining subagent (custom .claude/agents agent, or a builtin whose
     # signature drifted) is flagged on the wire — keep it OFF the durable main
-    # line even though its prose may say "Claude Code".
-    if _billing_is_subagent(obj):
+    # line even though its prose may say "Claude Code". Use the fingerprint-backed
+    # check (not the raw flag) so a leaked parent turn (stale agent-id) is NOT
+    # mistaken for a subagent and is correctly classified parent below.
+    if _genuine_subagent(obj):
         return "subagent"
     if "Claude Code" in s:
         return "parent"
