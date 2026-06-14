@@ -185,30 +185,143 @@ def _billing_is_subagent(obj):
     return "cc_is_subagent=true" in _sys_text(obj)
 
 
-# --- Wirescope directive protocol (`ws:`) — full spec in WIRESCOPE.md --------
+# --- Wirescope directive protocol (`wirescope:`) — full spec in WIRESCOPE.md --
 # Opt-in directives an agent author writes into the agent .md BODY (the only
 # author-controlled text that reaches system[], since the CLI drops frontmatter
-# and never sends an agent name). Form: `[ws:<directive> <value>]`, one per line.
-# Parsed ONLY from the system prompt, NEVER from message content, so nothing a
-# user (or tool result, or quoted transcript) types can forge a directive.
-# Unknown directives are silently ignored -> additive forever.
-_WS_DIRECTIVE_RE = re.compile(r"\[ws:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]",
-                              re.IGNORECASE)
+# and never sends an agent name). Form: `[wirescope:<directive> <value>]`, one
+# per line. The distinctive `wirescope:` prefix (v1; was the shorter `ws:`)
+# makes an incidental collision in curated text vanishingly unlikely — important
+# because the proxy SILENTLY STRIPS its own tags, and a false match would delete
+# real content.
+# Body directives are parsed from the system prompt; spawn directives (below)
+# from the strict head of the spawn-prompt block. Unknown directives are
+# silently ignored -> additive forever.
+_WS_DIRECTIVE_RE = re.compile(
+    r"\[wirescope:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]", re.IGNORECASE)
+# A WHOLE-LINE directive: the entire (stripped) line is exactly one directive.
+# Used for the strict-head spawn-prompt parse, where only a leading run of pure
+# directive lines is honored (so a `[wirescope:...]` buried in prompt prose, a
+# quoted transcript, or pasted data is NOT a directive).
+_WS_LINE_RE = re.compile(
+    r"^\[wirescope:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]$", re.IGNORECASE)
+
+# Spawn-level directives (WIRESCOPE.md v1): read omit/keep/agent-name from the
+# strict head of messages[0]'s spawn-prompt block, so behavior can be a property
+# of the CALL — apply omit/keep to UNEDITABLE built-in subagents (Plan/Explore/
+# general-purpose) by leading the Task prompt with a directive, no def edit /
+# override-trap. messages[0] is frozen at spawn + resent verbatim and later
+# turns append to messages[1..], so this position is NOT injectable by
+# mid-conversation content (tool result, web page, etc.). Residual trust: the
+# spawner must not place untrusted data as the literal leading token. Default ON
+# (directive presence is the opt-in, like WS_OMIT); WS_SPAWN_DIRECTIVES=0 is a
+# deployment kill-switch that disables all message-content directive parsing.
+WS_SPAWN_DIRECTIVES = os.environ.get(
+    "WS_SPAWN_DIRECTIVES", "1") not in ("0", "no", "off", "false")
+
+
+def _ws_directive_pairs(text):
+    """Ordered [(directive(lowercased), value(str, trimmed))] for every
+    `[wirescope:...]` in `text` (duplicates kept, in order) — the form the action
+    resolver needs (one target may carry several verbs across lines)."""
+    return [(m.group(1).lower(), (m.group(2) or "").strip())
+            for m in _WS_DIRECTIVE_RE.finditer(text)]
+
+
+def _ws_body_pairs(obj):
+    """Ordered directives from the request's system body."""
+    return _ws_directive_pairs(_sys_text(obj))
 
 
 def _ws_directives(obj):
-    """All `[ws:<directive> <value>]` directives in the request's system body,
-    as {directive(lowercased): value(str, trimmed)}. Last duplicate wins."""
-    out = {}
-    for m in _WS_DIRECTIVE_RE.finditer(_sys_text(obj)):
-        out[m.group(1).lower()] = (m.group(2) or "").strip()
+    """System-body directives as {directive: value} (last duplicate wins) — the
+    flat view used for single-valued directives like agent-name."""
+    return dict(_ws_body_pairs(obj))
+
+
+def _ws_prompt_block(obj):
+    """messages[0]'s spawn-prompt text block: the first `user` text block that is
+    NOT a <system-reminder> (those are harness-generated — blocks 0/1 in
+    practice; the prompt/Task text is block 2). Returns the mutable block dict or
+    None (no list-content messages[0], or none found)."""
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    m0 = msgs[0]
+    if not isinstance(m0, dict) or m0.get("role") != "user":
+        return None
+    c = m0.get("content")
+    if not isinstance(c, list):
+        return None
+    for b in c:
+        if (isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str)
+                and not b["text"].lstrip().startswith("<system-reminder>")):
+            return b
+    return None
+
+
+def _parse_leading_pairs(text):
+    """Ordered [(directive, value)] at the STRICT HEAD of `text`: leading blank
+    lines are skipped, then a run of consecutive whole-line `[wirescope:...]`
+    directives is consumed; parsing stops at the first non-blank, non-directive
+    line. A directive not at the head is ignored."""
+    out = []
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = _WS_LINE_RE.match(s)
+        if not m:
+            break
+        out.append((m.group(1).lower(), (m.group(2) or "").strip()))
     return out
 
 
+def _ws_strip_leading_directives(text):
+    """Remove the strict-head `[wirescope:...]` directive lines (and any blank
+    lines among/before them) from `text`. Mirrors _parse_leading_directives, so
+    it strips exactly what was consumed. Returns (new_text, n_removed)."""
+    lines = text.splitlines(keepends=True)
+    i = removed = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if not s:
+            i += 1
+            continue
+        if _WS_LINE_RE.match(s):
+            removed += 1
+            i += 1
+            continue
+        break
+    if not removed:
+        return text, 0
+    return "".join(lines[i:]).lstrip("\n"), removed
+
+
+def _ws_spawn_pairs(obj):
+    """Ordered leading `[wirescope:...]` directives from messages[0]'s spawn-prompt
+    block, or [] (flag off / no prompt block / none present). See
+    WS_SPAWN_DIRECTIVES."""
+    if not WS_SPAWN_DIRECTIVES:
+        return []
+    b = _ws_prompt_block(obj)
+    if b is None:
+        return []
+    return _parse_leading_pairs(b["text"])
+
+
+def _ws_spawn_directives(obj):
+    """Spawn-position directives as {directive: value} (last wins) — the flat
+    view for single-valued directives like agent-name."""
+    return dict(_ws_spawn_pairs(obj))
+
+
 def _subagent_marker_name(obj):
-    """The author-declared display label from `[ws:agent-name <label>]`, or None.
-    Display-grade only (no gate reads it); len-capped at 64."""
-    name = _ws_directives(obj).get("agent-name")
+    """The author-declared display label from `[wirescope:agent-name <label>]`,
+    or None. A spawn-position directive overrides a body one (precedence spawn >
+    body). Display-grade only (no gate reads it); len-capped at 64."""
+    name = (_ws_spawn_directives(obj).get("agent-name")
+            or _ws_directives(obj).get("agent-name"))
     return name[:64] if name else None
 
 

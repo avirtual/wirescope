@@ -31,6 +31,7 @@ from proxylab import subs as subs_mod
 from proxylab import store as store_mod
 from proxylab import transforms as transforms_mod
 from proxylab import warmth as warmth_mod
+from proxylab import writer as writer_mod
 
 # Stable product marker. Many proxies can sit on ANTHROPIC_BASE_URL in front of
 # the model backend; a subscriber needs a cheap, unauthenticated way to tell
@@ -57,7 +58,8 @@ def _identity():
             # protocol/contract versions a consumer can branch on
             "identity": IDENTITY_PROTOCOL,
             "subscribers": 1,             # SUBSCRIBERS.md envelope "v"
-            "wirescope": 0,               # WIRESCOPE.md [ws:...] directive spec
+            "wirescope": 1,               # WIRESCOPE.md [wirescope:...] spec (v1:
+            #                               renamed ws:->wirescope:, spawn + keep)
         },
         # what THIS process can actually do right now (env flags can disable
         # subsystems) — a subscriber should gate features on these, not assume
@@ -69,9 +71,12 @@ def _identity():
             "stats": True,                # /_status is always served
             "session_view": True,         # /_session HTML
             "codex": True,                # /agent/<name>/openai routing
-            # wirescope body directives (WIRESCOPE.md): agent-name always honored,
-            # omit gated by WS_OMIT (per-agent directive opt-in on top)
-            "wirescope": {"agent_name": True, "omit": transforms_mod.WS_OMIT},
+            # wirescope directives (WIRESCOPE.md): agent-name always honored,
+            # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
+            # whether spawn-position (messages[0] head) directives are read at all
+            "wirescope": {"agent_name": True, "omit": transforms_mod.WS_OMIT,
+                          "replace": transforms_mod.WS_OMIT, "keep": True,
+                          "spawn": writer_mod.WS_SPAWN_DIRECTIVES},
         },
         "endpoints": {
             "identity": "/_identity",

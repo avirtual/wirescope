@@ -255,7 +255,7 @@ def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None,
         return
     now = now or time.time()
     key = agent_id or role
-    # opt-in label from `[ws:agent-name <name>]`. The server resolves it from the
+    # opt-in label from `[wirescope:agent-name <name>]`. Server resolves it from the
     # pre-strip body and passes it in (the directives are stripped before meta
     # sees obj); fall back to parsing obj directly for callers that don't (tests).
     name = display_name if display_name is not None else (

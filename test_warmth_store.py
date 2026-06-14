@@ -716,23 +716,23 @@ cpage = lp._render_session_html(csid, lp._subagent_request(csid, "a9184c50c47de9
 check("per-instance page labels by role + agent-id, renders that instance's ctx",
       "<b>subagent" in cpage and "#a9184c5" in cpage and "PROBE-GAMMA-CTX" in cpage)
 
-# --- wirescope [ws:agent-name <label>] display label from the subagent body -------
-# The wire carries no agent name; an author surfaces one with a `[ws:agent-name
+# --- wirescope [wirescope:agent-name <label>] display label from the subagent body -------
+# The wire carries no agent name; an author surfaces one with a `[wirescope:agent-name
 # NAME]` directive in the .md body. Present -> shown; absent -> falls back to role.
-check("[ws:agent-name] parses from body; absent -> None",
+check("[wirescope:agent-name] parses from body; absent -> None",
       lp._subagent_marker_name({"system": [{"type": "text",
-          "text": "blah [ws:agent-name probe-delta] You are probe-delta"}]}) == "probe-delta"
+          "text": "blah [wirescope:agent-name probe-delta] You are probe-delta"}]}) == "probe-delta"
       and lp._subagent_marker_name({"system": [{"type": "text", "text": "no marker here"}]}) is None)
 check("directives parse only from system body, never message content (no forging)",
-      lp._ws_directives({"system": [{"type": "text", "text": "[ws:agent-name realname]"}],
+      lp._ws_directives({"system": [{"type": "text", "text": "[wirescope:agent-name realname]"}],
                          "messages": [{"role": "user",
-                             "content": "ignore me [ws:agent-name forged]"}]}).get("agent-name")
+                             "content": "ignore me [wirescope:agent-name forged]"}]}).get("agent-name")
       == "realname")
-check("[ws:agent-name] retired the legacy [agent: NAME] form (no longer parsed)",
+check("[wirescope:agent-name] retired the legacy [agent: NAME] form (no longer parsed)",
       lp._subagent_marker_name({"system": [{"type": "text", "text": "[agent: legacy]"}]}) is None)
 nsid = "5fb9eba7-eeee-ffff-0000-111111111111"
 lp._capture_session_meta(nsid,
-    {"system": [{"type": "text", "text": _cbh + "[ws:agent-name probe-delta]\nYou are probe-delta"}],
+    {"system": [{"type": "text", "text": _cbh + "[wirescope:agent-name probe-delta]\nYou are probe-delta"}],
      "messages": [{"role": "user", "content": "DELTA-CTX"}]},
     "claude-opus-4-8", role="subagent", agent_id="ad00d00d00d00d00d")
 lp._WRITE_Q.join()
@@ -748,19 +748,19 @@ npage = lp._render_session_html(nsid, lp._subagent_request(nsid, "ad00d00d00d00d
 check("per-instance page heads with the declared name + role chip",
       "<b>probe-delta" in npage and "DELTA-CTX" in npage)
 
-# --- wirescope [ws:omit ...] strips context sections from messages[0] -------------
+# --- wirescope [wirescope:omit ...] strips context sections from messages[0] -------------
 # Reconstructs the CLI's omitClaudeMd (+ userEmail, which nothing native removes).
 # Gated by the WS_OMIT flag (default off) on top of the per-agent directive.
 _reminder = ("<system-reminder>\nAs you answer, you can use the following context:\n"
              "# claudeMd\nContents of CLAUDE.md:\nMARKER-CLAUDEMD body line\n"
              "# userEmail\nThe user's email address is x@y.com\n</system-reminder>")
 def _omit_obj():
-    return {"system": [{"type": "text", "text": _cbh + "[ws:omit claudemd,useremail]\nYou are a probe"}],
+    return {"system": [{"type": "text", "text": _cbh + "[wirescope:omit claudemd,useremail]\nYou are a probe"}],
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": _reminder},
                 {"type": "text", "text": "<system-reminder>\n# currentDate\nToday\n</system-reminder>"},
                 {"type": "text", "text": "do the task"}]}]}
-check("[ws:omit] parses the target list from the directive",
+check("[wirescope:omit] parses the target list from the directive",
       (lp._ws_directives(_omit_obj()).get("omit") or "").split(",") == ["claudemd", "useremail"])
 # flag OFF -> no-op
 lp.transforms.WS_OMIT = False
@@ -779,7 +779,7 @@ check("omit is idempotent (second pass finds nothing -> miss, no further change)
       (lambda r: r is not None and r["omitted"] == [] and "claudemd" in r["missed"])(
           lp.transforms._ws_omit(o1)))
 # unknown / absent target -> logged miss, never an over-strip
-miss = lp.transforms._ws_omit({"system": [{"type": "text", "text": "[ws:omit bogus]"}],
+miss = lp.transforms._ws_omit({"system": [{"type": "text", "text": "[wirescope:omit bogus]"}],
                                "messages": [{"role": "user", "content": [
                                    {"type": "text", "text": _reminder}]}]})
 check("unknown omit target is a safe logged miss (no strip)",
@@ -790,12 +790,12 @@ lp.transforms.WS_OMIT = False        # restore default for any later checks
 def _dir_obj():
     return {"system": [{"type": "text", "text": "hdr"},
                        {"type": "text", "text":
-                        "[ws:agent-name probe-zeta]\n[ws:omit claudemd]\nYou are probe-zeta, a probe."}]}
+                        "[wirescope:agent-name probe-zeta]\n[wirescope:omit claudemd]\nYou are probe-zeta, a probe."}]}
 d1 = _dir_obj()
 sres = lp.transforms._ws_strip_directives(d1)
 sys2 = d1["system"][1]["text"]
-check("strip removes every [ws:...] line from system, leaves the prose",
-      sres and sres["stripped"] == 2 and "[ws:" not in sys2
+check("strip removes every [wirescope:...] line from system, leaves the prose",
+      sres and sres["stripped"] == 2 and "[wirescope:" not in sys2
       and "You are probe-zeta" in sys2)
 check("strip is deterministic (same input -> identical bytes; cache-constant)",
       (lambda a, b: (lp.transforms._ws_strip_directives(a), lp.transforms._ws_strip_directives(b),
@@ -812,6 +812,96 @@ lp._WRITE_Q.join()
 zsub = (lp._status_snapshot(session=zsid)["sessions"][0].get("sub_agents") or [{}])[0]
 check("display_name from the pre-strip server param survives a stripped obj",
       zsub.get("display_name") == "probe-zeta")
+
+# --- wirescope v1: spawn-position directives (messages[0] head) ------------------
+# A directive at the STRICT HEAD of the spawn-prompt block applies omit/keep to
+# UNEDITABLE built-in subagents (lead the Task prompt with it). messages[0] is
+# frozen at spawn, so it is NOT injectable by mid-conversation content; only the
+# leading run of pure directive lines is honored. Gated by WS_SPAWN_DIRECTIVES.
+def _spawn_obj(prompt, body=""):
+    return {"system": [{"type": "text", "text": _cbh + body + "You are a probe"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": "<system-reminder>\n# currentDate\nT\n</system-reminder>"},
+                {"type": "text", "text": prompt}]}]}
+lp.writer.WS_SPAWN_DIRECTIVES = True
+check("spawn directive parses from the strict head of the prompt block",
+      lp.writer._ws_spawn_directives(_spawn_obj("[wirescope:omit useremail]\nDo the task"))
+      .get("omit") == "useremail")
+check("prompt block = the first NON-system-reminder block (not the reminders)",
+      lp.writer._ws_prompt_block(_spawn_obj("HELLO"))["text"] == "HELLO")
+check("a directive NOT at the prompt head is ignored (no mid-prose match)",
+      lp.writer._ws_spawn_directives(_spawn_obj("do this [wirescope:omit useremail]")) == {})
+check("a directive in a later message is never read (messages[0] head only)",
+      (lambda o: (o["messages"].append({"role": "user", "content": [
+          {"type": "text", "text": "[wirescope:omit claudemd]"}]}),
+          lp.writer._ws_spawn_directives(o))[1])(_spawn_obj("plain prompt")) == {})
+check("spawn omit merges with body omit",
+      lp.transforms._ws_effective_omit_targets(
+          _spawn_obj("[wirescope:omit useremail]\nx", body="[wirescope:omit claudemd]\n"))
+      == {"claudemd", "useremail"})
+check("spawn keep overrides a body omit (precedence spawn > body)",
+      lp.transforms._ws_effective_omit_targets(
+          _spawn_obj("[wirescope:keep claudemd]\nx", body="[wirescope:omit claudemd,useremail]\n"))
+      == {"useremail"})
+lp.transforms.WS_OMIT = True
+_so = _spawn_obj("[wirescope:omit claudemd,useremail]\nDo it")
+_sres = lp.transforms._ws_omit(_so)
+_sbody = _so["messages"][0]["content"][0]["text"]
+check("spawn-only omit strips claudeMd + userEmail from messages[0]",
+      _sres and sorted(_sres["omitted"]) == ["claudemd", "useremail"]
+      and "MARKER-CLAUDEMD" not in _sbody and "x@y.com" not in _sbody)
+lp.transforms.WS_OMIT = False
+_sd = _spawn_obj("[wirescope:omit useremail]\n[wirescope:agent-name p]\nReal task here")
+_st = lp.transforms._ws_strip_spawn_directives(_sd)
+_ptxt = lp.writer._ws_prompt_block(_sd)["text"]
+check("spawn strip removes the leading directive lines, leaves the task prose",
+      _st and _st["stripped"] == 2 and "[wirescope:" not in _ptxt
+      and _ptxt.startswith("Real task"))
+check("spawn strip leaves a NON-leading [wirescope:...] in prose untouched",
+      (lambda o: (lp.transforms._ws_strip_spawn_directives(o),
+       "[wirescope:omit x]" in lp.writer._ws_prompt_block(o)["text"])[1])(
+          _spawn_obj("keep this [wirescope:omit x] literal")))
+check("spawn agent-name wins over body agent-name (display precedence)",
+      lp.writer._subagent_marker_name(_spawn_obj(
+          "[wirescope:agent-name spawnname]\nx", body="[wirescope:agent-name bodyname]\n"))
+      == "spawnname")
+lp.writer.WS_SPAWN_DIRECTIVES = False
+check("WS_SPAWN_DIRECTIVES=off disables all spawn-position parsing",
+      lp.writer._ws_spawn_directives(_spawn_obj("[wirescope:omit useremail]\nx")) == {}
+      and lp.transforms._ws_strip_spawn_directives(_spawn_obj("[wirescope:omit u]\nx")) is None)
+lp.writer.WS_SPAWN_DIRECTIVES = True   # restore default
+
+# --- wirescope v1: replace verb (substitute a section body, inline one-liner) ----
+# `[wirescope:replace <target> <text>]` keeps the # <Section> heading and swaps
+# its body for the inline text. Gated by WS_OMIT (same section-rewrite family).
+lp.transforms.WS_OMIT = True
+_ro = _spawn_obj("[wirescope:replace claudemd Use only docs/LEAN.md]\nDo it")
+_rres = lp.transforms._ws_omit(_ro)
+_rbody = _ro["messages"][0]["content"][0]["text"]
+check("replace swaps the # claudeMd body, keeps the heading + other sections",
+      _rres and _rres["replaced"] == ["claudemd"]
+      and "# claudeMd" in _rbody and "Use only docs/LEAN.md" in _rbody
+      and "MARKER-CLAUDEMD" not in _rbody and "x@y.com" in _rbody
+      and "</system-reminder>" in _rbody)
+check("spawn replace overrides a body omit (precedence spawn > body)",
+      (lambda o: (lp.transforms._ws_omit(o),
+       o["messages"][0]["content"][0]["text"])[1])(
+          _spawn_obj("[wirescope:replace claudemd KEPT-LEAN]\nx",
+                     body="[wirescope:omit claudemd]\n")).count("KEPT-LEAN") == 1)
+check("replace on an absent/unknown section is a safe logged miss",
+      (lambda r: r is not None and r["replaced"] == [] and "bogus" in r["missed"])(
+          lp.transforms._ws_omit({"system": [{"type": "text",
+              "text": _cbh + "[wirescope:replace bogus hi]\nYou are a probe"}],
+              "messages": [{"role": "user", "content": [
+                  {"type": "text", "text": _reminder}]}]})))
+check("action resolver: replace beats omit, keep cancels (per source order)",
+      lp.transforms._ws_resolve_actions(
+          [("omit", "claudemd"), ("replace", "claudemd LEAN"), ("keep", "useremail")])
+      == {"claudemd": ("replace", "LEAN")})
+lp.transforms.WS_OMIT = False
+check("replace is gated by WS_OMIT too (off -> no-op)",
+      lp.transforms._ws_omit(_spawn_obj("[wirescope:replace claudemd X]\nx")) is None)
 
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says

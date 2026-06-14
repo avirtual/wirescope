@@ -452,21 +452,28 @@ async def handler(request: Request) -> Response:
             if strp:
                 record["system_strip"] = strp
                 changed = True
-            # WIRESCOPE [ws:omit ...]: strip author-opted-out context sections
-            # (# claudeMd / # userEmail) from messages[0]. Per-agent-type opt-in.
+            # WIRESCOPE [wirescope:omit ...]: strip author-opted-out context
+            # sections (# claudeMd / # userEmail) from messages[0]. Effective
+            # targets merge body + spawn directives (per-agent + per-call opt-in).
             wso = transforms_mod._ws_omit(obj)
             if wso:
                 record["ws_omit"] = wso
-                if wso.get("omitted"):
+                if wso.get("omitted") or wso.get("replaced"):
                     changed = True
             # WIRESCOPE: capture the display name BEFORE removing the directives,
-            # then strip every [ws:...] line from system so the model never sees
-            # our control lines (and they cost no prefix tokens). Strip is
+            # then strip every [wirescope:...] line from system so the model never
+            # sees our control lines (and they cost no prefix tokens). Strip is
             # unconditional; the name is forwarded to meta below.
             ws_display_name = writer_mod._subagent_marker_name(obj)
             wstr = transforms_mod._ws_strip_directives(obj)
             if wstr:
                 record["ws_strip"] = wstr
+                changed = True
+            # WIRESCOPE v1 spawn directives: strip the strict-head [wirescope:...]
+            # lines from messages[0]'s prompt block (already read + acted on).
+            wstrs = transforms_mod._ws_strip_spawn_directives(obj)
+            if wstrs:
+                record["ws_strip_spawn"] = wstrs
                 changed = True
             # Tool sort: alphabetize tools[] for a byte-stable first cache segment.
             srt = transforms_mod._sort_tools(obj)

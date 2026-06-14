@@ -485,16 +485,18 @@ def _strip_system_sections(obj):
     return {"removed": removed} if removed else None
 
 
-# ---- WIRESCOPE `[ws:omit ...]` — strip context sections from messages[0] ----
-# Honors the body directive `[ws:omit claudemd,useremail]` (see WIRESCOPE.md):
-# the proxy strips the named `# <Section>` blocks out of the <system-reminder> in
-# the first user message before forwarding — the reconstruction of the CLI's
-# internal omitClaudeMd, generalized (nothing native removes # userEmail). The
-# strip is per-agent-type opt-in (rides system[2], cache-constant), fires every
-# turn deterministically, and is idempotent. messages[0] sits AFTER the
-# system/tools cache breakpoint, so the expensive prefix is untouched.
-# Default ON: the per-agent `[ws:omit ...]` directive IS the opt-in (an author
-# must write it; no directive -> no change), so the directive alone gates the
+# ---- WIRESCOPE `[wirescope:omit ...]` — strip context sections from msgs[0] -
+# Honors `[wirescope:omit claudemd,useremail]` (see WIRESCOPE.md): the proxy
+# strips the named `# <Section>` blocks out of the <system-reminder> in the first
+# user message before forwarding — the reconstruction of the CLI's internal
+# omitClaudeMd, generalized (nothing native removes # userEmail). The directive
+# may come from the agent BODY (per-type) or the SPAWN-prompt head (per-call,
+# v1); a `keep` verb overrides per target (spawn > body). The strip rides
+# system[2]/messages[0] cache-constant, fires every turn deterministically, and
+# is idempotent. messages[0] sits AFTER the system/tools cache breakpoint, so the
+# expensive prefix is untouched.
+# Default ON: the `[wirescope:omit ...]` directive IS the opt-in (an author must
+# write it; no directive -> no change), so the directive alone gates the
 # behavior. WS_OMIT stays only as a deployment kill-switch (WS_OMIT=0 to refuse
 # honoring omit directives entirely).
 WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
@@ -520,23 +522,83 @@ def _ws_strip_reminder_section(text, hdr):
     return new, end - start
 
 
+def _ws_replace_reminder_section(text, hdr, new_body):
+    """Replace the BODY of the `hdr` section (keep the `# <Section>` heading,
+    swap its content) with `new_body`. Same section boundary as the strip helper
+    (next column-0 `# ` header OR the closing </system-reminder>). Returns
+    (new_text, 1) on a hit, (text, 0) on a miss (fail-safe, never invents a
+    section)."""
+    m = re.search(r"(?m)^[ \t]*" + re.escape(hdr) + r"[ \t]*$", text)
+    if not m:
+        return text, 0
+    rest = text[m.end():]
+    bounds = [c.start() for c in (re.search(r"(?m)^# ", rest),
+                                  re.search(r"</system-reminder>", rest)) if c]
+    end = m.end() + min(bounds) if bounds else len(text)
+    body = new_body.strip("\n")
+    new = text[:m.end()] + "\n" + body + "\n" + text[end:]
+    return new, 1
+
+
+def _ws_omit_target_list(value):
+    """Parse a comma-separated `omit`/`keep` value into a lowercased token list."""
+    return [t.strip().lower() for t in (value or "").split(",") if t.strip()]
+
+
+def _ws_resolve_actions(pairs):
+    """Resolve ordered [(directive, value)] into a per-target action map
+    {target: ('omit', None) | ('replace', text)}. `omit` adds each listed target;
+    `replace <target> <text>` sets one target to substitute that text; `keep`
+    cancels a target. Later directives override earlier for the same target, so
+    feeding body pairs THEN spawn pairs makes spawn win (precedence spawn > body),
+    in either direction. The verb vocabulary lives here — new section verbs slot
+    in as one more branch."""
+    actions = {}
+    for name, value in pairs:
+        if name == "omit":
+            for t in _ws_omit_target_list(value):
+                actions[t] = ("omit", None)
+        elif name == "replace":
+            parts = value.split(None, 1)            # "<target> <inline text>"
+            if parts:
+                actions[parts[0].lower()] = (
+                    "replace", parts[1] if len(parts) > 1 else "")
+        elif name == "keep":
+            for t in _ws_omit_target_list(value):
+                actions.pop(t, None)
+    return actions
+
+
+def _ws_effective_actions(obj):
+    """The per-target action map after merging body + spawn directives (spawn
+    overrides body). See _ws_resolve_actions. {} when nothing applies."""
+    pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
+    return _ws_resolve_actions(pairs)
+
+
+def _ws_effective_omit_targets(obj):
+    """Just the targets resolved to a strip (`omit`) — convenience for callers /
+    tests that only care about deletions, not replacements."""
+    return {t for t, (act, _) in _ws_effective_actions(obj).items()
+            if act == "omit"}
+
+
 def _ws_omit(obj):
-    """Apply `[ws:omit <targets>]` from the system body to messages[0]. Returns a
-    log dict {omitted, missed, chars_removed, requested} or None when nothing was
-    requested / the flag is off. A requested target that isn't found (unknown
-    token or format drift) is a logged MISS, never an over-strip (fail-safe)."""
+    """Apply the effective wirescope context-section actions (omit / replace,
+    body + spawn, with the `keep` override) to messages[0]. Returns a log dict
+    {omitted, replaced, missed, chars_removed, requested} or None when nothing
+    was requested / the flag is off. A requested target not found (unknown token
+    or format drift) is a logged MISS, never an over-strip (fail-safe)."""
     if not WS_OMIT:
         return None
-    raw = writer_mod._ws_directives(obj).get("omit")
-    if not raw:
+    actions = _ws_effective_actions(obj)
+    if not actions:
         return None
-    requested = [t.strip().lower() for t in raw.split(",") if t.strip()]
-    if not requested:
-        return None
+    requested = sorted(actions)
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    removed, chars = set(), 0
+    omitted, replaced, chars = set(), set(), 0
     for m in msgs:                       # in practice only messages[0] carries it
         if m.get("role") != "user":
             continue
@@ -547,24 +609,31 @@ def _ws_omit(obj):
             if not (isinstance(b, dict) and b.get("type") == "text"
                     and isinstance(b.get("text"), str)):
                 continue
-            for tgt in requested:
+            for tgt, (act, payload) in actions.items():
                 hdr = _WS_OMIT_TARGETS.get(tgt)
                 if not hdr or hdr not in b["text"]:
                     continue
-                new, n = _ws_strip_reminder_section(b["text"], hdr)
-                if n:
-                    b["text"] = new
-                    removed.add(tgt)
-                    chars += n
-    missed = [t for t in requested if t not in removed]
-    if not removed and not missed:
+                if act == "replace":
+                    new, n = _ws_replace_reminder_section(b["text"], hdr, payload)
+                    if n:
+                        b["text"] = new
+                        replaced.add(tgt)
+                else:                                # "omit"
+                    new, n = _ws_strip_reminder_section(b["text"], hdr)
+                    if n:
+                        b["text"] = new
+                        omitted.add(tgt)
+                        chars += n
+    done = omitted | replaced
+    missed = [t for t in requested if t not in done]
+    if not done and not missed:
         return None
-    return {"omitted": sorted(removed), "missed": missed,
-            "chars_removed": chars, "requested": requested}
+    return {"omitted": sorted(omitted), "replaced": sorted(replaced),
+            "missed": missed, "chars_removed": chars, "requested": requested}
 
 
 def _ws_strip_directives(obj):
-    """Remove every `[ws:...]` directive from the system text blocks before
+    """Remove every `[wirescope:...]` directive from the system text blocks before
     forwarding. The proxy has already READ and ACTED on them (agent-name captured
     for display, omit applied to messages[0]); they are proxy control lines, so
     the MODEL must never see them and they shouldn't cost prefix tokens. Always
@@ -577,19 +646,41 @@ def _ws_strip_directives(obj):
     if isinstance(sys, list):
         for bi, b in enumerate(sys):
             if not (isinstance(b, dict) and isinstance(b.get("text"), str)
-                    and "[ws:" in b["text"]):
+                    and "[wirescope:" in b["text"]):
                 continue
             new, n = writer_mod._WS_DIRECTIVE_RE.subn("", b["text"])
             if n:
                 b["text"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
                 total += n
                 blocks.append(bi)
-    elif isinstance(sys, str) and "[ws:" in sys:
+    elif isinstance(sys, str) and "[wirescope:" in sys:
         new, n = writer_mod._WS_DIRECTIVE_RE.subn("", sys)
         if n:
             obj["system"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
             total, blocks = n, [0]
     return {"stripped": total, "blocks": blocks} if total else None
+
+
+def _ws_strip_spawn_directives(obj):
+    """Strip the strict-head spawn directives from messages[0]'s prompt block
+    before forwarding — the proxy has already READ and ACTED on them (omit/keep
+    merged into the effective target set, agent-name captured for display), so
+    the model must never see our control lines and they cost zero tokens. Gated
+    by WS_SPAWN_DIRECTIVES. Unlike the system strip, this removes ONLY the leading
+    consumed directive lines — never a `[wirescope:...]` that appears later in
+    prompt prose or a quoted transcript (which was never a directive). Returns
+    {stripped} or None. Deterministic per spawn, so messages[0] stays byte-stable
+    across the instance's turns (cache-coherent, no transcript desync)."""
+    if not writer_mod.WS_SPAWN_DIRECTIVES:
+        return None
+    b = writer_mod._ws_prompt_block(obj)
+    if b is None:
+        return None
+    new, n = writer_mod._ws_strip_leading_directives(b["text"])
+    if not n:
+        return None
+    b["text"] = new
+    return {"stripped": n}
 
 
 # ---- TOOL SORT (experimental, off by default) -----------------------------
