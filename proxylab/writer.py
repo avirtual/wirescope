@@ -166,15 +166,28 @@ def _sys_text(obj):
 # the hold anchor) must NOT be overwritten by a subagent turn — the main agent
 # is the durable, pingable line; subagents are transient. "parent"/"unknown" are
 # the main line. See server.py + meta._capture_session_meta.
-SUBAGENT_ROLES = frozenset({"Plan", "verification", "general-purpose"})
+#
+# "subagent" = the GENERIC bucket for a subagent whose system prompt matched no
+# known signature below (a CUSTOM .claude/agents/<name> agent). We learn it from
+# the billing header's ground-truth cc_is_subagent flag, not from prose; the wire
+# carries no custom agent NAME, only the boolean, so all such turns collapse here.
+SUBAGENT_ROLES = frozenset({"Plan", "verification", "general-purpose", "subagent"})
 
 
 def _is_subagent_role(role):
     return role in SUBAGENT_ROLES
 
 
+def _billing_is_subagent(obj):
+    """Ground-truth subagent flag from the x-anthropic-billing-header (block 0 of
+    system[]): `cc_is_subagent=true`. The routed MAIN agent never sets it — only
+    Task-spawned subagents do — so it's a safe discriminator for the main line."""
+    return "cc_is_subagent=true" in _sys_text(obj)
+
+
 def _classify_role(obj):
-    """Infer the agent role from the system-prompt signature."""
+    """Infer the agent role from the system-prompt signature, with the billing
+    header's cc_is_subagent flag as the authoritative subagent backstop."""
     s = _sys_text(obj)
     if "software architect and planning" in s:
         return "Plan"
@@ -182,6 +195,11 @@ def _classify_role(obj):
         return "verification"
     if "agent for Claude Code" in s or "Searching for code" in s:
         return "general-purpose"
+    # Any remaining subagent (custom .claude/agents agent, or a builtin whose
+    # signature drifted) is flagged on the wire — keep it OFF the durable main
+    # line even though its prose may say "Claude Code".
+    if _billing_is_subagent(obj):
+        return "subagent"
     if "Claude Code" in s:
         return "parent"
     return "unknown"

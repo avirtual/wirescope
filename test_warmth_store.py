@@ -679,6 +679,23 @@ check("missing-role subagent page renders gracefully (no crash, shows note)",
       "&#8627; <b>verification</b>" in empty_sub
       and "no replayable request" in empty_sub.lower())
 
+# --- _classify_role: billing-header cc_is_subagent backstop ----------------------
+# A CUSTOM .claude/agents subagent matches no signature and its prose says
+# "Claude Code" — without the header flag it used to be mislabeled "parent" and
+# clobbered the durable main line. The cc_is_subagent=true header is ground truth.
+_bh = "x-anthropic-billing-header: cc_entrypoint=cli; cc_is_subagent=true; "
+custom_sub = {"system": [{"type": "text", "text": _bh + "You are Claude Code, custom probe agent."}]}
+check("custom subagent (header-flagged, no signature) -> 'subagent', not 'parent'",
+      lp._classify_role(custom_sub) == "subagent"
+      and lp._is_subagent_role("subagent"))
+check("named builtin subagent still wins by signature over generic bucket",
+      lp._classify_role({"system": [{"type": "text", "text": _bh + "agent for Claude Code"}]})
+      == "general-purpose")
+check("routed MAIN agent (no header flag) stays 'parent'",
+      lp._classify_role({"system": [{"type": "text",
+          "text": "x-anthropic-billing-header: cc_entrypoint=cli; You are Claude Code"}]})
+      == "parent")
+
 # --- context.input_tokens: wire-measured context size on /_status ----------------
 # The number /_session renders as "context = X tok" (cache_read + cache_write +
 # uncached input of the last turn) must also be in the polled /_status context.
