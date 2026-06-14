@@ -507,6 +507,13 @@ WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
 # action layer (operator < body < spawn), so any `[wirescope:keep <t>]` directive
 # overrides it. Empty/unset = off (no change). Still under the WS_OMIT master
 # gate, and only on subagent turns (the main session is the user's own).
+# UNCONDITIONAL-ONLY RULE (policy can be automated, strategy cannot): a target
+# belongs here ONLY if no subagent would EVER want it kept — i.e. it's policy,
+# not a task-dependent judgment. `useremail` qualifies; `claudemd` does NOT
+# (whether a subagent needs project context is per-task = strategy → leave it to
+# body/spawn directives). Rule of thumb: "if you'd ever want it kept, it doesn't
+# belong in omit_default." (keep-override is the safety valve for rare misses,
+# not a license to put strategic targets in the blanket default.)
 WS_OMIT_DEFAULT = [t.strip().lower()
                    for t in os.environ.get("WS_OMIT_DEFAULT", "").split(",")
                    if t.strip()]
@@ -527,20 +534,29 @@ _WS_SPAWN_TOOLS = {"Agent", "Task"}
 # open the proxy-side WIRESCOPE.md, so the hint carries the usable grammar inline
 # (not a file pointer). Still one constant block -> re-anchors once, then rides
 # the cache. Must start with "[wirescope] " (the idempotency guard keys on it).
+# MIXED REGISTER (the proxy holds no per-task intent, so it must not push a
+# stripping strategy): *recommend* agent-name (needs no task knowledge, no
+# downside), only *surface* omit/keep/replace (strategy — the spawner decides).
 _WS_HINT_TEXT = (
-    "[wirescope] This proxy can trim a spawned subagent's context on the "
-    "wire, saving tokens. To use it, lead the subagent's prompt with "
-    "directive lines (one per line, before the task text); the subagent never "
-    "sees them — the proxy consumes them. Verbs:\n"
-    "  [wirescope:omit claudemd,useremail]  — drop those context sections\n"
-    "  [wirescope:keep claudemd]            — re-include a section another "
-    "layer dropped\n"
-    "  [wirescope:replace claudemd <text>]  — keep the section heading, "
-    "swap its body (single line)\n"
-    "  [wirescope:agent-name <label>]       — give this spawn a display "
-    "label\n"
-    "Only a leading run of directive lines is read; the first normal line ends "
-    "parsing. Targets: claudemd, useremail.")
+    "[wirescope] This agent can spawn subagents through the wirescope proxy, "
+    "which can shape what each subagent inherits on the wire. The choice is "
+    "yours per spawn — wirescope only carries it onto the wire, it doesn't "
+    "decide. Directives go at the head of the spawn's prompt (one per line, "
+    "before the task text) and are stripped before forwarding, so the subagent "
+    "never sees them.\n"
+    "\n"
+    "Recommended for every spawn — name the subagent:\n"
+    "  [wirescope:agent-name <label>]   improves traceability in logs and "
+    "dashboards; costs nothing.\n"
+    "\n"
+    "Optional, apply per your own strategy — shape inherited context:\n"
+    "  [wirescope:omit <targets>]            drop inherited context sections\n"
+    "  [wirescope:keep <targets>]            cancel an omit (e.g. an operator "
+    "default)\n"
+    "  [wirescope:replace <target> <text>]   keep the section, swap in a "
+    "one-line body\n"
+    "Targets: claudemd, useremail. Some may already be stripped by an operator "
+    "default.")
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 

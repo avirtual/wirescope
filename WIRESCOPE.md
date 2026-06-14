@@ -61,6 +61,11 @@ Spawn directives are **capability-gated** (`WS_SPAWN_DIRECTIVES`, default on; `=
 An **operator** can set a deployment-wide default so the universal case needs *zero* agent or spawner knowledge.
 `WS_OMIT_DEFAULT=useremail` (a comma list of omit targets) strips those sections from **every subagent spawn** — no directive required on any agent.
 This is the lowest-precedence layer (see below): any `[wirescope:keep <target>]` in a body or spawn overrides it, and it never touches a main-agent turn (the main session is the user's own; the policy is scoped to subagents via the `cc_is_subagent` billing-header flag).
+
+**Unconditional-only rule — policy can be automated, strategy cannot.**
+A target belongs in `WS_OMIT_DEFAULT` only if **no subagent would ever want it kept** — i.e. it's a blanket *policy*, not a task-dependent judgment.
+`useremail` qualifies (no spawned helper ever needs the account email). `claudemd` does **not** — whether a subagent wants project context depends on its task, which is *strategy* and belongs to a body or spawn directive, not the operator floor.
+Rule of thumb: **"if you'd ever want it kept, it doesn't belong in `omit_default`."** (Keep-override is the safety valve for a rare miss, not a license to put strategic targets in the blanket default.)
 It rides under the `WS_OMIT` master gate. Default empty = off.
 A consumer can read the active list from `capabilities.wirescope.omit_default` on `/_identity` (e.g. a spawner skill can tell the user "your operator already strips `useremail`").
 
@@ -142,6 +147,9 @@ When `WS_SPAWNER_HINT` is enabled, the proxy appends a **single constant block**
 So the hint reaches exactly the agents that can use it, and **never a subagent** (they stay pristine).
 It is **self-contained, not a file pointer** — the spawner that receives it lives in its own cwd and cannot open this proxy-side doc, so the hint carries the usable verbs (`omit`/`keep`/`replace`/`agent-name`) and targets (`claudemd`/`useremail`) inline, enough to use without any fetch.
 It's a **constant string at a stable position** (a trailing system block, after the cache breakpoint), so it re-anchors the prefix once and then rides the cache — it busts nothing before it.
+
+**Mixed register — the proxy holds no per-task intent, so the hint must not push a strategy.**
+It *recommends* `agent-name` (naming needs no task knowledge, has no downside, and is orthogonal to any stripping decision — the proxy can suggest it without presuming intent) but only *surfaces* `omit`/`keep`/`replace` as available capability ("here's how, if your strategy calls for it"). It never says "minimize context" or "strip X" — that would be the proxy presuming a per-task decision that belongs to the spawner. Recommend the no-downside practice; merely inform the judgment calls.
 
 This is the lone place wirescope puts proxy-authored, model-visible text on the wire.
 Note the direction: it's proxy→model *output* (a capability advertisement), not author→proxy *input*, so it doesn't expose any directive — but it does add visible text + a little cost, which is why it's **operator opt-in and default OFF**.
