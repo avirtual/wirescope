@@ -700,10 +700,18 @@ def _ws_merged_pairs(obj, agent_id=None):
     spawn = writer_mod._ws_spawn_pairs(obj)
     if agent_id and is_sub:
         sid = writer_mod._session_ids(obj)[0]
+        fp = writer_mod._billing_fingerprint(obj)      # this turn's lineage hash
+        mem = _WS_SPAWN_MEMORY.setdefault(sid, {})
         if spawn:                                  # turn-1 (or any directive turn)
-            _WS_SPAWN_MEMORY.setdefault(sid, {})[agent_id] = spawn
+            mem[agent_id] = (fp, spawn)            # bind the directives to the lineage
         else:                                      # continuation turn: replay
-            spawn = (_WS_SPAWN_MEMORY.get(sid) or {}).get(agent_id, [])
+            # Defense-in-depth (caching's spec): only replay if the remembered
+            # lineage fingerprint matches THIS turn's. `_genuine_subagent` already
+            # blocks leaked-parent turns; this additionally fails closed on a
+            # genuine in-lineage agent-id REUSE (a different sub recycling the id),
+            # where the fingerprints diverge -> no replay, no cross-instance trim.
+            remembered = mem.get(agent_id)
+            spawn = remembered[1] if (remembered and remembered[0] == fp) else []
     pairs += spawn                                 # highest precedence
     return pairs
 

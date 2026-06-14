@@ -1165,21 +1165,31 @@ _fpsubs = lp._status_snapshot(session=fpsid)["sessions"][0].get("sub_agents") or
 check("meta: leaked sonnet turn does NOT clobber the haiku sub bucket (model/count)",
       len(_fpsubs) == 1 and _fpsubs[0]["model"] == "claude-haiku-4-5"
       and _fpsubs[0]["requests"] == 1)
-# sticky/operator memory never replays onto a leaked parent turn...
+# sticky/operator memory never replays onto a leaked parent turn (the
+# _genuine_subagent gate blocks it even though the stored fingerprint would match)
 lp.transforms.WS_OMIT = True
-lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": [("omit", "claudemd")]}
+lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": ("2.1.177.79a", [("omit", "claudemd")])}
 _lk3 = _fp_obj(_FPLEAK, sid=fpsid)
 _lkr = lp.transforms._ws_omit(_lk3, agent_id="aSUB")
 check("sticky: a leaked parent turn does NOT replay the sub's remembered omit",
       (_lkr is None or _lkr.get("omitted") == [])
       and "MARKER-CLAUDEMD" in _lk3["messages"][0]["content"][0]["text"])
-# ...but the genuine sub instance still does (control)
-lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": [("omit", "claudemd")]}
+# ...but the genuine sub instance (matching stored fingerprint) still does
+lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": ("2.1.177.2bb", [("omit", "claudemd")])}
 _g2 = _fp_obj(_FPSUB, sid=fpsid)
 _gr = lp.transforms._ws_omit(_g2, agent_id="aSUB")
 check("sticky: a genuine sub instance still replays its remembered omit (control)",
       _gr and _gr.get("omitted") == ["claudemd"]
       and "MARKER-CLAUDEMD" not in _g2["messages"][0]["content"][0]["text"])
+# defense-in-depth (caching's spec): a GENUINE sub turn that reuses an agent-id
+# whose remembered lineage fingerprint DIFFERS -> fail closed, no cross-instance
+# replay (the residual case _genuine_subagent alone can't catch).
+lp.transforms._WS_SPAWN_MEMORY[fpsid] = {"aSUB": ("2.1.177.OLD", [("omit", "claudemd")])}
+_g3 = _fp_obj(_FPSUB, sid=fpsid)        # genuine (fp 2bb) but stored lineage = OLD
+_g3r = lp.transforms._ws_omit(_g3, agent_id="aSUB")
+check("sticky: agent-id reuse across lineages fails closed (fingerprint mismatch)",
+      (_g3r is None or _g3r.get("omitted") == [])
+      and "MARKER-CLAUDEMD" in _g3["messages"][0]["content"][0]["text"])
 lp.transforms.WS_OMIT = False
 lp.transforms._WS_SPAWN_MEMORY.clear()
 lp.writer._SESSION_MAIN_FP.clear()
