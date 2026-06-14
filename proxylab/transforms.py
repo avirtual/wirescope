@@ -493,8 +493,11 @@ def _strip_system_sections(obj):
 # strip is per-agent-type opt-in (rides system[2], cache-constant), fires every
 # turn deterministically, and is idempotent. messages[0] sits AFTER the
 # system/tools cache breakpoint, so the expensive prefix is untouched.
-# Default OFF (global kill-switch) on top of the per-agent directive opt-in.
-WS_OMIT = os.environ.get("WS_OMIT") in ("1", "yes", "on", "true")
+# Default ON: the per-agent `[ws:omit ...]` directive IS the opt-in (an author
+# must write it; no directive -> no change), so the directive alone gates the
+# behavior. WS_OMIT stays only as a deployment kill-switch (WS_OMIT=0 to refuse
+# honoring omit directives entirely).
+WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 

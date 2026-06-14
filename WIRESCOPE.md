@@ -86,6 +86,7 @@ In practice that means Task-spawned subagents (the `.claude/agents/*.md` body is
 ## Status
 
 v0 — `agent-name` is live and unconditional (display-grade, no flag).
-`omit` ships behind the `WS_OMIT` flag (default OFF; a global kill-switch on top of the per-agent directive opt-in), so a deployment turns it on to validate on a real stripped subagent on the wire.
-Its safety today is the **fail-safe miss**: a requested section that isn't found (unknown token or `<system-reminder>` format drift) is logged and skipped, never over-stripped.
+`omit` is honored by default: the per-agent `[ws:omit ...]` directive **is** the opt-in (no directive → no change), so the directive alone gates it.
+`WS_OMIT` remains as a deployment kill-switch only — set `WS_OMIT=0` to make a deployment refuse omit directives entirely.
+Its safety is the **fail-safe miss**: a requested section that isn't found (unknown token or `<system-reminder>` format drift) is logged and skipped, never over-stripped.
 A proactive canary fingerprint of the reminder heading structure (alerting on drift even when no `omit` is requested) is a planned follow-up.
