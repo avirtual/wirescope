@@ -490,6 +490,55 @@ def _render_session_openai_body(entry, resp=None):
     return bar + tools_html + sb + "".join(rows)
 
 
+def _session_boundary_note(obj):
+    """If the displayed turn's messages[0] is led by a local-command boundary —
+    a `/clear` or other slash command resets the conversation, so messages[0]
+    becomes the `<local-command-caveat>`/`<command-name>` block rather than a
+    substantive prompt — return a banner saying this view is the CURRENT
+    post-reset request (prior work ran in an earlier context). '' otherwise.
+
+    Why it matters most on the subagent view: subagents share the parent's
+    session_id and keep a STABLE agent-id across a `/clear`, so a reset
+    OVERWRITES the per-instance last-request in place — whereas the main line
+    escapes via session_id rotation (the old work stays under the old id). Without
+    this note a post-`/clear` subagent page reads like "I see instructions, not
+    execution" and looks like a render bug when it's an accurate fresh snapshot."""
+    msgs = obj.get("messages") or []
+    if not msgs:
+        return ""
+    c = msgs[0].get("content")
+    blocks = (c if isinstance(c, list)
+              else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+    is_boundary = False
+    cmd = None
+    for b in blocks:
+        if not (isinstance(b, dict) and b.get("type") == "text"
+                and isinstance(b.get("text"), str)):
+            continue
+        txt = b["text"].lstrip()
+        if txt.startswith("<system-reminder>"):
+            continue
+        # first NON-reminder block decides: a boundary marker => reset turn
+        is_boundary = (txt.startswith("<local-command-caveat>")
+                       or txt.startswith("<command-name>"))
+        break
+    if not is_boundary:
+        return ""
+    # the command name can live in a sibling block; scan messages[0] for it
+    for b in blocks:
+        if isinstance(b, dict) and isinstance(b.get("text"), str):
+            m = re.search(r"<command-name>([^<]+)</command-name>", b["text"])
+            if m:
+                cmd = m.group(1).strip()
+                break
+    label = html.escape(cmd) if cmd else "a local command"
+    return (f'<p class="warn">&#8635; This turn begins with <b>{label}</b> — the '
+            f'conversation was reset, so this is the <b>current</b> post-reset '
+            f'request. Earlier work for this instance ran in a prior context and '
+            f'is not in this snapshot (a subagent keeps its id across a reset, so '
+            f'the new turn overwrites the previous one here).</p>')
+
+
 def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
@@ -613,6 +662,9 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
                f'<span>messages <b>{len(msgs)}</b> &approx;{e(_fmt_tok(m_ch // 4))} tok</span>'
                f'{turns_link}'
                f'<span class="dim">sizes are chars; tok &approx; ch/4</span></p>')
+        # post-reset (`/clear`/slash-command) snapshot note — keeps a fresh
+        # boundary turn from reading as a render bug (esp. on the sub-view).
+        bar += _session_boundary_note(obj)
         # cache breakpoints number through the CANONICAL prefix order
         # tools -> system -> messages; cum_ch tracks chars in that order so
         # each divider can price the prefix it closes (tok ≈ ch/4).

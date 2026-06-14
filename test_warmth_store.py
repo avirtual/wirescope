@@ -1434,6 +1434,23 @@ check("a marked system block draws a cache-boundary divider",
       "cache breakpoint 1 · ttl 1h" in _sv and "prefix above" in _sv)
 check("tool churn renders as slim collapsed lines, not full blocks",
       'class="tline tooluse"' in _sv and 'class="tline toolres"' in _sv)
+# Post-reset (/clear) snapshot banner: a turn whose messages[0] is led by a
+# local-command boundary is the CURRENT post-reset request, not a render bug.
+# Matters on the sub-view (stable agent-id across /clear overwrites in place).
+_clr = {"messages": [{"role": "user", "content": [
+    {"type": "text", "text": "<system-reminder>\n# currentDate\nT\n</system-reminder>"},
+    {"type": "text", "text": "<local-command-caveat>Caveat: ...</local-command-caveat>"},
+    {"type": "text", "text": "<command-name>/clear</command-name>"}]}]}
+check("a /clear-led turn shows the post-reset snapshot banner with the command",
+      (lambda n: 'class="warn"' in n and "/clear" in n and "post-reset" in n)(
+          lp.views._session_boundary_note(_clr)))
+check("a normal execution turn shows NO post-reset banner",
+      lp.views._session_boundary_note(
+          {"messages": [{"role": "user", "content": [
+              {"type": "text", "text": "Work in the directory /tmp. Build a catalog."}]}]}) == "")
+check("an empty / entry-less obj yields no boundary banner (no crash)",
+      lp.views._session_boundary_note({}) == ""
+      and lp.views._session_boundary_note({"messages": []}) == "")
 _pv = lp._prevu("HEAD!" + "y" * 100, cap=5)
 check("preview expansion continues the text instead of duplicating it",
       _pv.count("HEAD!") == 1 and "show remaining 100 of 105 ch" in _pv
