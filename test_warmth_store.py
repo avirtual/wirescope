@@ -1141,8 +1141,12 @@ check("spawner hint is idempotent (second pass no-ops, no duplicate block)",
 check("spawner hint is self-contained grammar (carries usable verbs inline, not just a file pointer)",
       all(tok in _hobj["system"][-1]["text"]
           for tok in ("[wirescope:omit", "[wirescope:keep", "[wirescope:replace",
-                      "[wirescope:agent-name"))
+                      "[wirescope:agent-name", "[wirescope:tools",
+                      "[wirescope:strip-tools", "[wirescope:keep-tools"))
       and "WIRESCOPE.md" not in _hobj["system"][-1]["text"])
+check("hint surfaces tool-trim as capability, never a strategy push (mixed register)",
+      "minimize" not in _hobj["system"][-1]["text"].lower()
+      and "apply per your own strategy" in _hobj["system"][-1]["text"])
 check("spawn tool 'Task' (vanilla Claude Code) also triggers the hint",
       lp.transforms._ws_spawner_hint(_spawner_obj(tools=("Task", "Read"))) is not None)
 check("no hint for a main agent WITHOUT a spawn tool (Agent/Task absent)",

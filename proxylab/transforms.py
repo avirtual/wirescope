@@ -550,14 +550,19 @@ _WS_HINT_TEXT = (
     "dashboards; costs nothing.\n"
     "\n"
     "Optional, apply per your own strategy — shape inherited context "
-    "(targets are comma- or space-separated):\n"
+    "(targets/names are comma- or space-separated):\n"
     "  [wirescope:omit claudemd,useremail]   drop inherited context sections\n"
     "  [wirescope:keep claudemd]             cancel an omit (e.g. an operator "
     "default)\n"
     "  [wirescope:replace claudemd <text>]   keep the section, swap in a "
     "one-line body\n"
-    "Targets: claudemd, useremail. Some may already be stripped by an operator "
-    "default.")
+    "  [wirescope:tools Read,Grep,Glob]      forward only these tools "
+    "(allowlist)\n"
+    "  [wirescope:strip-tools Bash,WebFetch] forward all but these tools "
+    "(denylist)\n"
+    "  [wirescope:keep-tools Bash]           cancel a strip-tools\n"
+    "Context targets: claudemd, useremail (some may already be stripped by an "
+    "operator default). Tool names match the subagent's roster.")
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
