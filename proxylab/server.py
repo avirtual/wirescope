@@ -409,6 +409,10 @@ async def handler(request: Request) -> Response:
                 record["canary"] = cres
         # EXPERIMENTAL piggyback: mutate the outbound payload, forward modified bytes
         ws_display_name = None     # captured pre-strip below; passed to meta
+        # Per-instance key (present iff subagent, stable across that instance's
+        # turns): threads into _ws_omit so a spawn directive remembered on turn 1
+        # re-applies on continuation turns; reused for _capture_session_meta below.
+        agent_id = request.headers.get("x-claude-code-agent-id")
         if obj:
             changed = False
             appended, reason = transforms_mod._decide_injection(obj)
@@ -455,7 +459,7 @@ async def handler(request: Request) -> Response:
             # WIRESCOPE [wirescope:omit ...]: strip author-opted-out context
             # sections (# claudeMd / # userEmail) from messages[0]. Effective
             # targets merge body + spawn directives (per-agent + per-call opt-in).
-            wso = transforms_mod._ws_omit(obj)
+            wso = transforms_mod._ws_omit(obj, agent_id=agent_id)
             if wso:
                 record["ws_omit"] = wso
                 if wso.get("omitted") or wso.get("replaced"):
@@ -535,8 +539,8 @@ async def handler(request: Request) -> Response:
             # subagents (Task-spawned) share the parent's session_id; pass role
             # so a sub turn is logged distinctly and never overwrites the parent
             # agent's identity/model on the /_status row. The agent-id header
-            # (present iff subagent, distinct per spawn) keys concurrent subs apart.
-            agent_id = request.headers.get("x-claude-code-agent-id")
+            # (present iff subagent, distinct per spawn) keys concurrent subs apart;
+            # read once above the transform chain and reused here.
             meta_mod._capture_session_meta(session_id, obj, model,
                                            agent=(agent if m else None),
                                            role=role, title_call=title_call,

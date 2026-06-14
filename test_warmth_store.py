@@ -983,6 +983,67 @@ check("a [wirescope:keep] cancels the operator default (precedence keep > operat
 lp.transforms.WS_OMIT_DEFAULT = _save_omit_default
 lp.transforms.WS_OMIT = False
 
+# --- wirescope: STICKY per-instance spawn directives (turn-1-only -> persists) ---
+# Spawn-position directives sit at the head of messages[0] only on a subagent's
+# FIRST turn; a continuation turn swaps that block for a follow-up, so without
+# memory the omit is LOST and # claudeMd RETURNS (proven on the wire: session
+# 1aa29620 agent-id af7427970be15b5f3, capture 027 omit -> 029 claudemd back).
+# We remember the spawn pairs by the per-instance x-claude-code-agent-id and
+# re-apply them on later turns of the same instance.
+lp.transforms.WS_OMIT = True
+_save_sticky_default = lp.transforms.WS_OMIT_DEFAULT
+lp.transforms.WS_OMIT_DEFAULT = []          # isolate from the operator floor
+lp.transforms._WS_SPAWN_MEMORY.clear()
+def _inst_obj(prompt, sid="sess-sticky"):
+    # a subagent turn (cc_is_subagent via _cbh) with a fresh reminder + the given
+    # first prompt block; metadata supplies the real session_id for the memory key
+    return {"system": [{"type": "text", "text": _cbh + "You are a probe"}],
+            "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": prompt}]}]}
+# turn 1: spawn directive present + agent_id A1 -> strips claudeMd AND remembers
+_t1 = _inst_obj("[wirescope:omit claudemd]\nDo the task")
+_r1 = lp.transforms._ws_omit(_t1, agent_id="A1")
+check("sticky turn1: spawn omit strips claudeMd and is remembered for the instance",
+      _r1 and _r1["omitted"] == ["claudemd"]
+      and "MARKER-CLAUDEMD" not in _t1["messages"][0]["content"][0]["text"]
+      and lp.transforms._WS_SPAWN_MEMORY.get("sess-sticky", {}).get("A1"))
+# turn 2: SAME agent_id, NO directive at head, claudeMd present -> stripped via memory
+_t2 = _inst_obj("just a follow-up question")
+_r2 = lp.transforms._ws_omit(_t2, agent_id="A1")
+check("sticky turn2: same instance with NO directive still strips claudeMd (memory)",
+      _r2 and _r2["omitted"] == ["claudemd"]
+      and "MARKER-CLAUDEMD" not in _t2["messages"][0]["content"][0]["text"])
+# turn 2 for a DIFFERENT (unknown) instance -> no memory -> untouched
+_t2b = _inst_obj("a follow-up from another sub")
+_r2b = lp.transforms._ws_omit(_t2b, agent_id="B2")
+check("sticky: an unknown agent_id has no memory -> claudeMd untouched",
+      _r2b is None and "MARKER-CLAUDEMD" in _t2b["messages"][0]["content"][0]["text"])
+# a later `keep` turn UPDATES the memory and cancels the omit
+_t3 = _inst_obj("[wirescope:keep claudemd]\ncarry on")
+_r3 = lp.transforms._ws_omit(_t3, agent_id="A1")
+check("sticky: a later [wirescope:keep] updates the memory and cancels the omit",
+      (_r3 is None or _r3["omitted"] == [])
+      and "MARKER-CLAUDEMD" in _t3["messages"][0]["content"][0]["text"])
+# and the cancel persists: a subsequent directive-less turn no longer strips
+_t4 = _inst_obj("another follow-up")
+_r4 = lp.transforms._ws_omit(_t4, agent_id="A1")
+check("sticky: the keep persists -> a later bare turn no longer strips",
+      _r4 is None and "MARKER-CLAUDEMD" in _t4["messages"][0]["content"][0]["text"])
+# main line (no agent_id) is never sticky even with memory present for the session
+_t5 = _inst_obj("plain turn")
+_r5 = lp.transforms._ws_omit(_t5, agent_id=None)
+check("sticky: no agent_id (main line) never replays remembered actions",
+      _r5 is None and "MARKER-CLAUDEMD" in _t5["messages"][0]["content"][0]["text"])
+# _ws_forget drops the session memory (the pinger sweep hook)
+lp.transforms._ws_forget("sess-sticky")
+check("_ws_forget clears the session's sticky spawn memory",
+      "sess-sticky" not in lp.transforms._WS_SPAWN_MEMORY)
+lp.transforms._WS_SPAWN_MEMORY.clear()
+lp.transforms.WS_OMIT_DEFAULT = _save_sticky_default
+lp.transforms.WS_OMIT = False
+
 # --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --
 # The one place wirescope adds proxy-authored visible text: a constant
 # SELF-CONTAINED grammar block (the recipient is in its own cwd and can't open the

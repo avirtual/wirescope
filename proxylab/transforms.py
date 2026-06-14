@@ -652,16 +652,52 @@ def _ws_resolve_actions(pairs):
     return actions
 
 
-def _ws_effective_actions(obj):
+# STICKY PER-INSTANCE SPAWN MEMORY: spawn-position directives only sit at the
+# strict HEAD of messages[0] on a subagent's FIRST turn; on any continuation turn
+# that block is a follow-up / <local-command-caveat> / compaction summary, so
+# _ws_spawn_pairs sees nothing and the omitted sections (esp. # claudeMd) RETURN.
+# We remember the resolved spawn pairs by the stable per-instance key
+# (x-claude-code-agent-id, present iff subagent) and RE-APPLY them on later turns
+# of the same instance. A later directive-bearing turn UPDATES the memory (a
+# fresh `keep` can still cancel). Keyed session_id -> {agent_id: pairs} so the
+# pinger sweep drops it with the session's other instance state; transforms OWNS
+# + mutates this (no gate but omit reads it). See _ws_forget.
+_WS_SPAWN_MEMORY = {}
+
+
+def _ws_forget(session_id):
+    """Drop the sticky spawn memory for a session (called by the pinger sweep
+    alongside the other per-session instance state). No-op if absent."""
+    _WS_SPAWN_MEMORY.pop(session_id, None)
+
+
+def _ws_effective_actions(obj, agent_id=None):
     """The per-target action map after merging the operator default policy +
     body + spawn directives. Precedence operator < body < spawn (resolved by
     feeding the layers in that order; a later `keep` cancels an earlier action).
     The operator default applies only to subagent turns (cc_is_subagent on the
-    billing header). See _ws_resolve_actions. {} when nothing applies."""
+    billing header). See _ws_resolve_actions. {} when nothing applies.
+
+    `agent_id` (the x-claude-code-agent-id request header) makes the spawn layer
+    STICKY per instance: on a directive-bearing turn we remember the spawn pairs
+    under that id; on a later directive-less turn of the same instance we re-feed
+    the remembered pairs so the omit/keep/replace persists past turn 1."""
     pairs = []
-    if WS_OMIT_DEFAULT and writer_mod._billing_is_subagent(obj):
+    is_sub = writer_mod._billing_is_subagent(obj)
+    if WS_OMIT_DEFAULT and is_sub:
         pairs.append(("omit", ",".join(WS_OMIT_DEFAULT)))   # lowest precedence
-    pairs += writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
+    pairs += writer_mod._ws_body_pairs(obj)
+    spawn = writer_mod._ws_spawn_pairs(obj)
+    # Sticky layer: only ever remember/replay for a real subagent instance (the
+    # main line has no agent_id, so it is never sticky; a non-subagent is never
+    # touched even if some header leaked through).
+    if agent_id and is_sub:
+        sid = writer_mod._session_ids(obj)[0]
+        if spawn:                                  # turn-1 (or any directive turn)
+            _WS_SPAWN_MEMORY.setdefault(sid, {})[agent_id] = spawn
+        else:                                      # continuation turn: replay
+            spawn = (_WS_SPAWN_MEMORY.get(sid) or {}).get(agent_id, [])
+    pairs += spawn                                 # highest precedence
     return _ws_resolve_actions(pairs)
 
 
@@ -683,17 +719,20 @@ def _ws_reminder_is_empty(text):
             and re.search(r"(?m)^# ", text) is None)
 
 
-def _ws_omit(obj):
+def _ws_omit(obj, agent_id=None):
     """Apply the effective wirescope context-section actions (omit / replace,
     body + spawn, with the `keep` override) to messages[0]. Returns a log dict
     {omitted, replaced, missed, chars_removed, requested, dropped_blocks} or None
     when nothing was requested / the flag is off. A requested target not found
     (unknown token or format drift) is a logged MISS, never an over-strip
     (fail-safe). A reminder block emptied of ALL its sections is dropped whole
-    rather than forwarded as a dangling 'here's the context:' shell."""
+    rather than forwarded as a dangling 'here's the context:' shell.
+
+    `agent_id` threads the per-instance key so a continuation turn re-applies the
+    spawn directive remembered from turn 1 (see _ws_effective_actions)."""
     if not WS_OMIT:
         return None
-    actions = _ws_effective_actions(obj)
+    actions = _ws_effective_actions(obj, agent_id=agent_id)
     if not actions:
         return None
     requested = sorted(actions)

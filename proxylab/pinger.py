@@ -396,6 +396,10 @@ def _sweep_state(now=None):
                  if (lambda a, t: a > t + _LAST_REQUEST_GRACE)(*_prefix_age_ttl(e, now))]
         for sid in stale:
             _LAST_REQUEST.pop(sid, None)
+    # lazy import: transforms is a heavier module, not needed at boot here; the
+    # sweep is a cross-cutting teardown (like the meta_mod pops below) so reaching
+    # into transforms' own sticky store for hygiene is consistent.
+    from proxylab import transforms as _transforms_mod
     for sid in stale:
         # companion debug state rides the same staleness verdict (since the
         # /_end redesign nothing else deletes it; ended markers + session_meta
@@ -405,6 +409,7 @@ def _sweep_state(now=None):
         meta_mod._LAST_USAGE.pop(sid, None)
         meta_mod._SUBAGENTS.pop(sid, None)
         meta_mod._SUBAGENT_LAST_REQ.pop(sid, None)
+        _transforms_mod._ws_forget(sid)   # sticky wirescope spawn memory
     purged = heads = 0
     try:
         con = store_mod.db()

@@ -51,9 +51,12 @@ So lead the prompt with the directive:
 <the actual task text…>
 ```
 
-**Why this is safe.** `messages[0]` is fixed at spawn and resent verbatim every turn; later content (tool results, fetched pages, conversation) only ever appends to `messages[1..]`.
-Nothing downstream can inject into the spawn-prompt head, and a `[wirescope:...]` that appears *later* in the prompt (or anywhere in message content) is **not** a directive and is left untouched.
+**Why this is safe.** The spawn-prompt head is fixed at dispatch; nothing downstream can inject into it, and a `[wirescope:...]` that appears *later* in the prompt (or anywhere in message content) is **not** a directive and is left untouched.
 **Residual trust:** the spawner must not place untrusted data as the literal leading token of the prompt — the same trust already given to a body-directive author, moved to dispatch time.
+
+**Persistence (sticky per instance).** The spawn directive is at the head of `messages[0]` only on the subagent's **first** turn; on a continuation turn `messages[0]` is a follow-up / `<local-command-caveat>` / compaction summary, so the directive is no longer visible there.
+The proxy therefore **remembers** the resolved spawn directives per instance — keyed by the `x-claude-code-agent-id` header (present iff subagent, stable across that instance's turns) — and **re-applies** them on every later turn of the same instance, so an `omit`/`replace`/`keep` declared at spawn holds for the life of the subagent (not just turn 1).
+A later turn that carries a fresh directive at the head **updates** the memory (a new `[wirescope:keep …]` cancels an earlier `omit`). The memory is in-memory, session-scoped, and swept with the session's other per-instance state. The main line carries no `agent-id`, so it is never made sticky.
 
 Spawn directives are **capability-gated** (`WS_SPAWN_DIRECTIVES`, default on; `=0` disables all message-content directive parsing). Body directives don't read message content and are unaffected.
 
@@ -160,7 +163,7 @@ A consumer sees whether it's on via `capabilities.wirescope.spawner_hint`.
 - **System prefix untouched (net).** The only system-body change is the *removal* of body directive lines; deterministic per type, so spawns of one agent still share a system prefix. `messages[0]` (where `omit` and the spawn strip act) sits *after* the system/tools cache breakpoints, so a change there never busts the expensive prefix.
 - **Within-instance message cache stays coherent.** All strips are deterministic, so an instance's `messages[0]` is byte-stable across its turns.
 - **No transcript desync.** It's request-side and idempotent: the CLI rebuilds context locally each turn; the proxy re-applies the same strip in-flight, leaving the client's transcript untouched.
-- **The one invariant:** the strip must fire on every forwarded turn — guaranteed, because both the body directive (`system[]`) and the spawn prompt (`messages[0]`) ride every turn.
+- **The one invariant:** the strip must fire on every forwarded turn. A **body** directive rides `system[]` every turn, so it's automatic. A **spawn** directive is only at the `messages[0]` head on turn 1, so the proxy makes it sticky — it remembers the resolved spawn directives per `x-claude-code-agent-id` and re-applies them on every later turn of that instance (see *Persistence* above). Deterministic re-application keeps `messages[0]` byte-stable across the instance's turns.
 - **Behavior-affecting, by design.** Omitting `claudeMd`/`userEmail` removes real context the agent would otherwise see. That's the author's/spawner's opt-in call. (Side note: it also tends to *reduce* fable refusal-classifier hits, since claudeMd content is a common trigger.)
 
 ## Placement & precedence summary
