@@ -33,7 +33,9 @@ Before you integrate, probe the proxy ROOT and check the product marker:
                         "codex": true,
                         "wirescope": { "agent_name": true, "omit": true,
                                        "replace": true, "keep": true,
-                                       "spawn": true } },
+                                       "spawn": true,
+                                       "omit_default": ["useremail"],
+                                       "spawner_hint": true } },
       "endpoints": { ... }, "docs": "INTEGRATION.md" }
 
 - **Branch on `product == "wirescope"`.** A different proxy 404s `/_identity` or returns a body without these fields — don't attempt wirescope-specific calls.
@@ -89,7 +91,7 @@ This is how you trim or rewrite the context the CLI auto-injects (project `CLAUD
 There are two placements, and **an integrating app cares most about the second**:
 
 - **Body directives** — written into an agent's `.claude/agents/*.md` body. A property of the agent *type*; the agent's author opts in.
-- **Spawn directives** — written at the **strict head of the prompt you hand a spawn**. A property of the *call*: your app can shape any spawn's context **without editing the agent**, including uneditable built-ins (Plan / Explore / general-purpose). Just lead the spawned prompt with the directive(s).
+- **Spawn directives** — written at the **strict head of the prompt you hand a spawn**. A property of the *call*: your app can shape any spawn's context **without editing the agent**, including uneditable built-ins (Plan / Explore / general-purpose). Just lead the spawned prompt with the directive(s). They **persist for the whole life of that subagent instance** — the proxy remembers them per instance (keyed by the `x-claude-code-agent-id` it sees on the wire) and re-applies them on every later turn, even after the spawn prompt scrolls out of `messages[0]` (a follow-up, a `/clear`, or a compaction summary). You set it once at spawn; you do not re-send it each turn.
 
 The verbs:
 
@@ -105,7 +107,12 @@ Example — spawn a stock `general-purpose` subagent but strip the project CLAUD
     [wirescope:omit claudemd,useremail]
     Search the repo for all callers of foo() and summarize.
 
-**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`), plus `omit_default` — the **operator-configured list already stripped from every subagent spawn** (so for that universal case you need no directive at all; check it before adding your own). `protocols.wirescope` is the grammar version. `omit`/`replace`/`keep` only *do* something where the directive is present — no directive, no change.
+**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`). It also carries two operator-configured fields:
+
+- `omit_default` — the list **already stripped from every subagent spawn** with no directive at all (e.g. `["useremail"]`). Check it before adding your own `omit`; the universal case may already be handled.
+- `spawner_hint` (bool) — when on, the proxy appends one self-contained line to spawn-capable **main** agents pointing them at this directive grammar. It's a discovery aid the *agent* sees, not something you call; if your app already teaches its agents the grammar you can ignore it.
+
+`protocols.wirescope` is the grammar version. `omit`/`replace`/`keep` only *do* something where the directive is present — no directive, no change.
 
 **Full grammar, safety model, and the omit-target registry: [`WIRESCOPE.md`](./WIRESCOPE.md).**
 
