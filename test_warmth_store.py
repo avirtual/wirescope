@@ -762,6 +762,28 @@ def _omit_obj():
                 {"type": "text", "text": "do the task"}]}]}
 check("[wirescope:omit] parses the target list from the directive",
       (lp._ws_directives(_omit_obj()).get("omit") or "").split(",") == ["claudemd", "useremail"])
+# REGRESSION (2026-06-14 wire leak): a claudeMd body that LEADS with markdown
+# headings must be stripped IN FULL up to the NEXT reminder section. The old
+# `^# ` boundary stopped at the first content heading (`# Spatiul lui Adam`),
+# cutting only the preamble and leaving the whole project doc on the wire.
+_rem_md = ("<system-reminder>\nAs you answer:\n"
+           "# claudeMd\nContents of CLAUDE.md:\n\n# Project Title\nbody A\n"
+           "## Subsection\nMARKER-DEEP body\n# Another H1\nmore\n"
+           "# userEmail\nThe user's email is x@y.com\n</system-reminder>")
+_stripped, _n = lp.transforms._ws_strip_reminder_section(_rem_md, "# claudeMd")
+check("omit strips the WHOLE claudeMd section past internal markdown headings",
+      "# claudeMd" not in _stripped and "Project Title" not in _stripped
+      and "MARKER-DEEP" not in _stripped and "Another H1" not in _stripped)
+check("omit claudeMd PRESERVES the sibling userEmail section in the same block",
+      "# userEmail" in _stripped and "x@y.com" in _stripped)
+check("strip of the LAST section (userEmail) stops at the closing tag, keeps claudeMd",
+      (lambda s, _n: "</system-reminder>" in s and "x@y.com" not in s
+       and "# claudeMd" in s)(
+          *lp.transforms._ws_strip_reminder_section(_rem_md, "# userEmail")))
+check("replace swaps the claudeMd body across internal headings, keeps userEmail",
+      (lambda s, n: n == 1 and "# claudeMd" in s and "Project Title" not in s
+       and "MARKER-DEEP" not in s and "LEAN-X" in s and "# userEmail" in s)(
+          *lp.transforms._ws_replace_reminder_section(_rem_md, "# claudeMd", "LEAN-X")))
 # flag OFF -> no-op
 lp.transforms.WS_OMIT = False
 check("omit is a no-op while the WS_OMIT flag is off", lp.transforms._ws_omit(_omit_obj()) is None)

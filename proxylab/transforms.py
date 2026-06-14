@@ -562,19 +562,42 @@ _WS_HINT_TEXT = (
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
 
+# A reminder SECTION header is `# ` + a lowercase camelCase key (claudeMd,
+# userEmail, currentDate, … — the CLI generates them from internal camelCase
+# keys) on its own line. NOT an arbitrary markdown heading: CLAUDE.md CONTENT
+# routinely leads with `# Title` / `## Sub` headings, and a naive `^# ` boundary
+# stopped at the FIRST of those, leaving the whole doc un-stripped (the
+# 2026-06-14 leak: a `# claudeMd` body began `# Spatiul lui Adam`, so omit cut
+# only the ~280-char preamble and the project doc survived on the wire).
+# Calibrated against 400 real captures: every CLI reminder header is lowercase
+# camelCase (claudeMd/userEmail/currentDate); content headings are Title-Case or
+# multi-word and never match — so a section ends only at the NEXT such header or
+# the closing tag. (An unknown future section is still camelCase → respected, no
+# over-strip; the rare lowercase-single-word CONTENT heading would under-strip,
+# same fail-safe class as before, never a leak of MORE than asked.)
+_WS_SECTION_HDR_RE = r"(?m)^# [a-z][A-Za-z0-9]*[ \t]*$"
+
+
+def _ws_section_end(rest):
+    """Offset into `rest` where the current reminder section ends: the next
+    reminder-section header or </system-reminder>, whichever is first; len(rest)
+    if neither (defensive — strips to end)."""
+    bounds = [c.start() for c in (re.search(_WS_SECTION_HDR_RE, rest),
+                                  re.search(r"</system-reminder>", rest)) if c]
+    return min(bounds) if bounds else len(rest)
+
+
 def _ws_strip_reminder_section(text, hdr):
-    """Strip the `hdr` section from a <system-reminder> text. Like
-    _strip_section_from_text but the section boundary is the next column-0 `# `
-    header OR the closing </system-reminder> — so removing the LAST section never
-    eats the closing tag. Returns (new_text, chars_removed)."""
+    """Strip the `hdr` section from a <system-reminder> text — the heading and its
+    whole body up to the next reminder-section header (see _WS_SECTION_HDR_RE) or
+    the closing </system-reminder>, so internal markdown headings inside the body
+    don't truncate it and a sibling section (e.g. userEmail) after it is kept.
+    Returns (new_text, chars_removed)."""
     m = re.search(r"(?m)^[ \t]*" + re.escape(hdr) + r"[ \t]*$", text)
     if not m:
         return text, 0
     start = m.start()
-    rest = text[m.end():]
-    bounds = [c.start() for c in (re.search(r"(?m)^# ", rest),
-                                  re.search(r"</system-reminder>", rest)) if c]
-    end = m.end() + min(bounds) if bounds else len(text)
+    end = m.end() + _ws_section_end(text[m.end():])
     new = text[:start] + text[end:]
     new = re.sub(r"\n{3,}", "\n\n", new)
     return new, end - start
@@ -583,16 +606,13 @@ def _ws_strip_reminder_section(text, hdr):
 def _ws_replace_reminder_section(text, hdr, new_body):
     """Replace the BODY of the `hdr` section (keep the `# <Section>` heading,
     swap its content) with `new_body`. Same section boundary as the strip helper
-    (next column-0 `# ` header OR the closing </system-reminder>). Returns
+    (next reminder-section header or the closing </system-reminder>). Returns
     (new_text, 1) on a hit, (text, 0) on a miss (fail-safe, never invents a
     section)."""
     m = re.search(r"(?m)^[ \t]*" + re.escape(hdr) + r"[ \t]*$", text)
     if not m:
         return text, 0
-    rest = text[m.end():]
-    bounds = [c.start() for c in (re.search(r"(?m)^# ", rest),
-                                  re.search(r"</system-reminder>", rest)) if c]
-    end = m.end() + min(bounds) if bounds else len(text)
+    end = m.end() + _ws_section_end(text[m.end():])
     body = new_body.strip("\n")
     new = text[:m.end()] + "\n" + body + "\n" + text[end:]
     return new, 1
