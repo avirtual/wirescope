@@ -27,10 +27,13 @@ Before you integrate, probe the proxy ROOT and check the product marker:
     GET http://127.0.0.1:7800/_identity        # read-only, unauthenticated, free
 
     { "product": "wirescope", "version": "...",
-      "protocols": { "identity": 2, "subscribers": 1 },
+      "protocols": { "identity": 2, "subscribers": 1, "wirescope": 1 },
       "capabilities": { "subscribers": true, "warmth": true, "ping": true,
                         "hold": true, "stats": true, "session_view": true,
-                        "codex": true },
+                        "codex": true,
+                        "wirescope": { "agent_name": true, "omit": true,
+                                       "replace": true, "keep": true,
+                                       "spawn": true } },
       "endpoints": { ... }, "docs": "INTEGRATION.md" }
 
 - **Branch on `product == "wirescope"`.** A different proxy 404s `/_identity` or returns a body without these fields — don't attempt wirescope-specific calls.
@@ -78,6 +81,34 @@ Rules of thumb:
   `GET/POST /_ping` — one-shot TTL slide if you'd rather own the cadence and cost yourself.
   `/warm-cache <hours>` — the bundled client's slash command; same hold as `/_hold`, but armed in-band by injecting a `<proxy:warm-cache hours=N>` sentinel into a forwarded turn (so it also donates auth + rewrites the cache). Use this when a human/agent is at the CLI; use `/_hold` from code.
 
+## Shape the context on the wire — directives (`wirescope:`)
+
+Beyond the HTTP endpoints, wirescope honors an in-band control channel: **`[wirescope:...]` directives** the proxy reads off a request, acts on, then **strips before forwarding** — so the model never sees them and they cost zero prefix tokens.
+This is how you trim or rewrite the context the CLI auto-injects (project `CLAUDE.md`, the user's email) — things the wire otherwise gives no knob for.
+
+There are two placements, and **an integrating app cares most about the second**:
+
+- **Body directives** — written into an agent's `.claude/agents/*.md` body. A property of the agent *type*; the agent's author opts in.
+- **Spawn directives** — written at the **strict head of the prompt you hand a spawn**. A property of the *call*: your app can shape any spawn's context **without editing the agent**, including uneditable built-ins (Plan / Explore / general-purpose). Just lead the spawned prompt with the directive(s).
+
+The verbs:
+
+| Directive | Effect |
+|---|---|
+| `[wirescope:agent-name <label>]` | Give the (otherwise nameless) subagent a display label in `/_status` + `/_admin`. |
+| `[wirescope:omit claudemd,useremail]` | Drop the `# claudeMd` / `# userEmail` sections from the first user message — reclaims tokens (claudeMd is usually the bulk) and reduces fable refusal-classifier hits. |
+| `[wirescope:replace claudemd <inline text>]` | Keep the section heading but swap its body for a one-line substitute (e.g. point the agent at a leaner doc). Single-line; for more, `omit` and write your own. |
+| `[wirescope:keep <targets>]` | Override verb — cancel an `omit`/`replace` a body default would apply (precedence: spawn > body). |
+
+Example — spawn a stock `general-purpose` subagent but strip the project CLAUDE.md and email from *this* call:
+
+    [wirescope:omit claudemd,useremail]
+    Search the repo for all callers of foo() and summarize.
+
+**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`), and `protocols.wirescope` is the grammar version. `omit`/`replace`/`keep` only *do* something where the directive is present — no directive, no change.
+
+**Full grammar, safety model, and the omit-target registry: [`WIRESCOPE.md`](./WIRESCOPE.md).**
+
 ## Caveats (read before you ship)
 
 - **Localhost, unauthenticated, lab-grade.**
@@ -96,6 +127,6 @@ Rules of thumb:
 ## Where to look next
 
 - **Push events, field by field:** [`SUBSCRIBERS.md`](./SUBSCRIBERS.md).
-- **Wirescope directives (`[wirescope:agent-name]`, `[wirescope:omit]`, `[wirescope:keep]`):** [`WIRESCOPE.md`](./WIRESCOPE.md) — the directive grammar an agent author embeds in a `.claude/agents/*.md` body, or a spawner leads a prompt with, for the proxy to honor (v1: renamed from `ws:`, adds per-call spawn directives + `keep`).
+- **Wirescope directives (`agent-name` / `omit` / `replace` / `keep`):** [`WIRESCOPE.md`](./WIRESCOPE.md) — the full grammar + safety model behind the "Shape the context on the wire" section above (v1: renamed from `ws:`, adds per-call spawn directives, `keep`, and `replace`).
 - **Live capabilities & version of a specific deployment:** `GET /_identity`.
 - **Reconcile / source of truth:** `GET /_status?session=<id>`.
