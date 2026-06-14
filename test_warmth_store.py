@@ -787,16 +787,32 @@ check("replace swaps the claudeMd body across internal headings, keeps userEmail
 # flag OFF -> no-op
 lp.transforms.WS_OMIT = False
 check("omit is a no-op while the WS_OMIT flag is off", lp.transforms._ws_omit(_omit_obj()) is None)
-# flag ON -> strips both, preserves the closing tag + the separate currentDate block
+# flag ON -> strips both; block[0] held ONLY claudeMd+userEmail, so it's emptied
+# of all sections and DROPPED WHOLE (no dangling 'here's the context:' shell).
+# currentDate (was content[1]) shifts up to content[0], the prompt to content[1].
 lp.transforms.WS_OMIT = True
 o1 = _omit_obj()
 res = lp.transforms._ws_omit(o1)
-body0 = o1["messages"][0]["content"][0]["text"]
-check("omit strips # claudeMd and # userEmail, keeps </system-reminder> + currentDate",
+_content = o1["messages"][0]["content"]
+_alltext = " ".join(b.get("text", "") for b in _content if isinstance(b, dict))
+check("omit strips # claudeMd + # userEmail and DROPS the now-empty reminder block",
       res and sorted(res["omitted"]) == ["claudemd", "useremail"]
-      and "MARKER-CLAUDEMD" not in body0 and "x@y.com" not in body0
-      and "</system-reminder>" in body0
-      and "# currentDate" in o1["messages"][0]["content"][1]["text"])
+      and res.get("dropped_blocks") == 1 and len(_content) == 2
+      and "MARKER-CLAUDEMD" not in _alltext and "x@y.com" not in _alltext)
+check("after the drop, the separate currentDate block + prompt remain (shifted up)",
+      "# currentDate" in _content[0]["text"] and "do the task" in _content[1]["text"])
+# a reminder that KEEPS a section (currentDate via keep) is NOT dropped; and the
+# message-level cache breakpoint is re-anchored onto the new first block.
+_ccobj = {"system": [{"type": "text", "text": _cbh + "[wirescope:omit claudemd,useremail]\nx"}],
+          "messages": [{"role": "user", "content": [
+              {"type": "text", "cache_control": {"type": "ephemeral"},
+               "text": _reminder},
+              {"type": "text", "text": "task"}]}]}
+lp.transforms._ws_omit(_ccobj)
+_cc = _ccobj["messages"][0]["content"]
+check("emptied reminder dropped → its cache_control re-anchors on the new first block",
+      len(_cc) == 1 and _cc[0]["text"] == "task"
+      and _cc[0].get("cache_control") == {"type": "ephemeral"})
 check("omit is idempotent (second pass finds nothing -> miss, no further change)",
       (lambda r: r is not None and r["omitted"] == [] and "claudemd" in r["missed"])(
           lp.transforms._ws_omit(o1)))

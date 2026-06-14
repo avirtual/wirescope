@@ -672,12 +672,25 @@ def _ws_effective_omit_targets(obj):
             if act == "omit"}
 
 
+def _ws_reminder_is_empty(text):
+    """True if `text` is a <system-reminder> whose every `# Section` was stripped,
+    leaving only the wrapper + the "you can use the following context:" intro with
+    NOTHING after it. Detected as: a system-reminder with no remaining column-0
+    `# ` heading of any kind (a kept section — currentDate, Environment, … — keeps
+    a heading, so this is conservative: never drops a block that still has real
+    content)."""
+    return ("<system-reminder>" in text
+            and re.search(r"(?m)^# ", text) is None)
+
+
 def _ws_omit(obj):
     """Apply the effective wirescope context-section actions (omit / replace,
     body + spawn, with the `keep` override) to messages[0]. Returns a log dict
-    {omitted, replaced, missed, chars_removed, requested} or None when nothing
-    was requested / the flag is off. A requested target not found (unknown token
-    or format drift) is a logged MISS, never an over-strip (fail-safe)."""
+    {omitted, replaced, missed, chars_removed, requested, dropped_blocks} or None
+    when nothing was requested / the flag is off. A requested target not found
+    (unknown token or format drift) is a logged MISS, never an over-strip
+    (fail-safe). A reminder block emptied of ALL its sections is dropped whole
+    rather than forwarded as a dangling 'here's the context:' shell."""
     if not WS_OMIT:
         return None
     actions = _ws_effective_actions(obj)
@@ -687,17 +700,19 @@ def _ws_omit(obj):
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    omitted, replaced, chars = set(), set(), 0
+    omitted, replaced, chars, dropped = set(), set(), 0, 0
     for m in msgs:                       # in practice only messages[0] carries it
         if m.get("role") != "user":
             continue
         c = m.get("content")
         if not isinstance(c, list):
             continue
-        for b in c:
+        drop_idx = []
+        for bi, b in enumerate(c):
             if not (isinstance(b, dict) and b.get("type") == "text"
                     and isinstance(b.get("text"), str)):
                 continue
+            touched = False
             for tgt, (act, payload) in actions.items():
                 hdr = _WS_OMIT_TARGETS.get(tgt)
                 if not hdr or hdr not in b["text"]:
@@ -707,18 +722,39 @@ def _ws_omit(obj):
                     if n:
                         b["text"] = new
                         replaced.add(tgt)
+                        touched = True
                 else:                                # "omit"
                     new, n = _ws_strip_reminder_section(b["text"], hdr)
                     if n:
                         b["text"] = new
                         omitted.add(tgt)
                         chars += n
+                        touched = True
+            if touched and _ws_reminder_is_empty(b["text"]):
+                drop_idx.append(bi)
+        if drop_idx:
+            drop = set(drop_idx)
+            kept = [b for i, b in enumerate(c) if i not in drop]
+            if not kept:
+                continue                     # never nuke a message's whole content
+            # If a dropped block carried the message-level cache breakpoint,
+            # re-anchor it on the new first block so we don't lose the breakpoint.
+            lost_cc = next((c[i]["cache_control"] for i in drop
+                            if isinstance(c[i], dict) and c[i].get("cache_control")),
+                           None)
+            if (lost_cc and isinstance(kept[0], dict)
+                    and not any(isinstance(b, dict) and b.get("cache_control")
+                                for b in kept)):
+                kept[0]["cache_control"] = lost_cc
+            m["content"] = kept
+            dropped += len(drop)
     done = omitted | replaced
     missed = [t for t in requested if t not in done]
     if not done and not missed:
         return None
     return {"omitted": sorted(omitted), "replaced": sorted(replaced),
-            "missed": missed, "chars_removed": chars, "requested": requested}
+            "missed": missed, "chars_removed": chars, "requested": requested,
+            "dropped_blocks": dropped}
 
 
 def _ws_strip_directives(obj):
