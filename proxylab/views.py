@@ -204,10 +204,15 @@ def _render_admin_html(snap, host="", show=60):
         resumeb = (f' <span class="badge warn" title="resumed from a cold cache '
                    f'{nres}× — each a full prefix re-write at the write premium">'
                    f'&#8635;{nres}</span>' if nres else "")
+        # Link per-instance (sub=<agent-id|role>); a short agent-id chip
+        # disambiguates concurrent same-role subagents at a glance.
         subline = "".join(
             f'<br><span class="subagent">&#8627; '
-            f'<a href="/_session?session={e(sid)}&amp;role={e(sa["role"])}">{e(sa["role"])}</a> '
-            f'<span class="dim">{e(writer_mod._short_model(sa.get("model")))}'
+            f'<a href="/_session?session={e(sid)}&amp;sub={e(sa.get("key") or sa.get("role"))}">'
+            f'{e(sa.get("role"))}</a>'
+            + (f' <span class="dim">#{e((sa.get("agent_id") or "")[:8])}</span>'
+               if sa.get("agent_id") else "")
+            + f' <span class="dim">{e(writer_mod._short_model(sa.get("model")))}'
             f' · {sa.get("requests", 0)} req · {e(_fmt_ago(sa.get("last_seen"), now))}'
             f'</span></span>' for sa in subs)
         return (
@@ -490,10 +495,15 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
         # model/activity. The parent's warmth/cwd belong to the parent line, so
         # we show the subagent's stats + a link back up instead of the prefix
         # warmth (a subagent isn't independently pingable).
+        # subrole is the instance key (agent-id or role); match on key, but
+        # label by the human role (the raw key may be an opaque agent-id hex).
         sub = next((sa for sa in (s.get("sub_agents") or [])
-                    if sa.get("role") == subrole), {})
+                    if sa.get("key") == subrole or sa.get("role") == subrole), {})
+        lbl = sub.get("role") or subrole
+        aid = sub.get("agent_id")
+        lbl_html = e(lbl) + (f' <small class="dim">#{e(aid[:8])}</small>' if aid else "")
         ptitle = s.get("title") or "(untitled)"
-        head = (f'<h1>{e(ptitle)} <small>&#8627; <b>{e(subrole)}</b></small> '
+        head = (f'<h1>{e(ptitle)} <small>&#8627; <b>{lbl_html}</b></small> '
                 f'<small>· <code>{e(sid)}</code></small></h1>'
                 f'<p class="kv"><span class="dim">subagent of '
                 f'<a href="/_session?session={e(sid)}">{e(ptitle)}</a></span>'

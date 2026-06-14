@@ -665,8 +665,8 @@ check("parent identity survives the subagent turn (model stays parent's opus)",
       and any(sa["role"] == "general-purpose"
               for sa in (snap_p["sessions"][0].get("sub_agents") or [])))
 admin_p = lp._render_admin_html(snap_p, host="t:7800")
-check("admin links the ↳ subagent row to the per-role view",
-      f"/_session?session={psid}&amp;role=general-purpose" in admin_p)
+check("admin links the ↳ subagent row to the per-instance view (no agent-id -> key=role)",
+      f"/_session?session={psid}&amp;sub=general-purpose" in admin_p)
 subpage = lp._render_session_html(psid, lp._subagent_request(psid, "general-purpose"),
                                   snap_p, subrole="general-purpose")
 check("subagent page shows the role, a back link, and the captured request",
@@ -679,17 +679,54 @@ check("missing-role subagent page renders gracefully (no crash, shows note)",
       "&#8627; <b>verification</b>" in empty_sub
       and "no replayable request" in empty_sub.lower())
 
+# --- concurrent custom subagents keyed by x-claude-code-agent-id instance ---------
+# Three customs spawned at once all classify as role "subagent"; the agent-id
+# header keeps them three distinct rows/pages, and repeated turns of one instance
+# merge (count bumps, not a new row).
+_cbh = "x-anthropic-billing-header: cc_entrypoint=cli; cc_is_subagent=true; "
+csid = "5fb9eba7-aaaa-bbbb-cccc-dddddddddddd"
+for aid, marker in [("a6285af7ebb94c299", "PROBE-ALPHA-CTX"),
+                    ("abeb7108bd7b6623a", "PROBE-BETA-CTX"),
+                    ("a9184c50c47de95bf", "PROBE-GAMMA-CTX")]:
+    lp._capture_session_meta(csid,
+        {"system": [{"type": "text", "text": _cbh + "You are a probe"}],
+         "messages": [{"role": "user", "content": marker}]},
+        "claude-opus-4-8", role="subagent", agent_id=aid)
+# alpha takes a second turn -> same instance, no new row
+lp._capture_session_meta(csid,
+    {"system": [{"type": "text", "text": _cbh + "You are a probe"}],
+     "messages": [{"role": "user", "content": "PROBE-ALPHA-CTX-2"}]},
+    "claude-opus-4-8", role="subagent", agent_id="a6285af7ebb94c299")
+lp._WRITE_Q.join()
+snap_c = lp._status_snapshot(session=csid)
+csubs = snap_c["sessions"][0].get("sub_agents") or []
+check("three concurrent customs stay three distinct instances (keyed by agent-id)",
+      len(csubs) == 3 and {s["key"] for s in csubs} ==
+      {"a6285af7ebb94c299", "abeb7108bd7b6623a", "a9184c50c47de95bf"})
+check("a repeated turn of one instance bumps its count, not a new row",
+      next(s["requests"] for s in csubs if s["key"] == "a6285af7ebb94c299") == 2)
+check("each instance stashes its OWN latest request (no cross-collapse)",
+      "PROBE-BETA-CTX" in json.dumps(lp._subagent_request(csid, "abeb7108bd7b6623a")["obj"])
+      and "PROBE-ALPHA-CTX-2" in json.dumps(lp._subagent_request(csid, "a6285af7ebb94c299")["obj"]))
+admin_c = lp._render_admin_html(snap_c, host="t:7800")
+check("admin links each instance by agent-id + shows a short id chip",
+      f"sub=abeb7108bd7b6623a" in admin_c and "#abeb7108" in admin_c)
+cpage = lp._render_session_html(csid, lp._subagent_request(csid, "a9184c50c47de95bf"),
+                                snap_c, subrole="a9184c50c47de95bf")
+check("per-instance page labels by role + agent-id, renders that instance's ctx",
+      "<b>subagent" in cpage and "#a9184c5" in cpage and "PROBE-GAMMA-CTX" in cpage)
+
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
 # "Claude Code" — without the header flag it used to be mislabeled "parent" and
 # clobbered the durable main line. The cc_is_subagent=true header is ground truth.
 _bh = "x-anthropic-billing-header: cc_entrypoint=cli; cc_is_subagent=true; "
-custom_sub = {"system": [{"type": "text", "text": _bh + "You are Claude Code, custom probe agent."}]}
+custom_sub = {"system": [{"type": "text", "text": _cbh + "You are Claude Code, custom probe agent."}]}
 check("custom subagent (header-flagged, no signature) -> 'subagent', not 'parent'",
       lp._classify_role(custom_sub) == "subagent"
       and lp._is_subagent_role("subagent"))
 check("named builtin subagent still wins by signature over generic bucket",
-      lp._classify_role({"system": [{"type": "text", "text": _bh + "agent for Claude Code"}]})
+      lp._classify_role({"system": [{"type": "text", "text": _cbh + "agent for Claude Code"}]})
       == "general-purpose")
 check("routed MAIN agent (no header flag) stays 'parent'",
       lp._classify_role({"system": [{"type": "text",

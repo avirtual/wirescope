@@ -227,15 +227,17 @@ async def handler(request: Request) -> Response:
         if not sess:
             return Response("missing ?session=", status_code=400,
                             media_type="text/plain")
-        # ?role=<role> -> the per-role subagent view (shares the parent's
-        # session_id; latest captured turn, never the parent's pingable request
-        # nor the parent's response/usage receipts).
-        subrole = request.query_params.get("role")
-        if subrole:
+        # ?sub=<instance-key> (or legacy ?role=<role>) -> the per-subagent view
+        # (shares the parent's session_id; latest captured turn, never the
+        # parent's pingable request nor the parent's response/usage receipts).
+        # The key is the x-claude-code-agent-id when the spawn had one, else the
+        # role — so concurrent same-role subagents each get their own page.
+        subkey = request.query_params.get("sub") or request.query_params.get("role")
+        if subkey:
             return Response(views_mod._render_session_html(
-                                sess, meta_mod._subagent_request(sess, subrole),
+                                sess, meta_mod._subagent_request(sess, subkey),
                                 status_mod._status_snapshot(session=sess),
-                                subrole=subrole),
+                                subrole=subkey),
                             media_type="text/html; charset=utf-8")
         with pinger_mod._LAST_REQUEST_LOCK:
             entry = pinger_mod._LAST_REQUEST.get(sess)
@@ -502,10 +504,13 @@ async def handler(request: Request) -> Response:
             title_call = meta_mod._is_title_call(obj)
             # subagents (Task-spawned) share the parent's session_id; pass role
             # so a sub turn is logged distinctly and never overwrites the parent
-            # agent's identity/model on the /_status row.
+            # agent's identity/model on the /_status row. The agent-id header
+            # (present iff subagent, distinct per spawn) keys concurrent subs apart.
+            agent_id = request.headers.get("x-claude-code-agent-id")
             meta_mod._capture_session_meta(session_id, obj, model,
                                            agent=(agent if m else None),
-                                           role=role, title_call=title_call)
+                                           role=role, title_call=title_call,
+                                           agent_id=agent_id)
             # heaviness snapshot from the model-visible history (main line
             # only: a subagent's small history must not clobber the parent's)
             if session_id and not title_call and role in ("parent", "unknown"):

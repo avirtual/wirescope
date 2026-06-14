@@ -232,65 +232,78 @@ def _is_title_call(obj):
 # _admin can show the main agent AND every subagent under it WITHOUT either
 # clobbering the other's identity. Display-grade, repopulated by live traffic.
 _SUBAGENTS = {}
-# Latest request body per (session, role), so /_session?session=&role=<role> can
-# render what a subagent was doing — the ↳ rows on /_admin link here. Role-keyed
-# like _SUBAGENTS (so concurrent same-role subs collapse to the latest turn);
+# Latest request body per (session, subagent-instance), so /_session can render
+# what a subagent was doing — the ↳ rows on /_admin link here. Keyed by the same
+# INSTANCE KEY as _SUBAGENTS (the x-claude-code-agent-id header when present, so
+# concurrent subagents — even same-role ones — stay distinct; role otherwise);
 # display-only, never replayed/pinged, in-memory, swept with _SUBAGENTS. Entry
 # shape is the subset of pinger._LAST_REQUEST that _render_session_html reads.
 _SUBAGENT_LAST_REQ = {}
 
 
-def _note_subagent(session_id, role, model, now=None, obj=None):
+def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None):
     """Record one subagent turn under its parent session (never touches the
-    parent's own identity row). Latest model + a running request count, and
-    (when obj is given) the latest request body for the per-role session view."""
+    parent's own identity row). Keyed by INSTANCE — the x-claude-code-agent-id
+    header when the wire carries one (present iff subagent, distinct per spawn,
+    stable across that instance's turns), so three subagents spawned at once stay
+    three separate rows/pages even when they share a role; falls back to the role
+    name when no agent-id is present. Tracks latest model + a running request
+    count, and (when obj is given) the latest request body for the per-instance
+    session view. `role` is kept as the human label; `agent_id` for display."""
     if not session_id or not role:
         return
     now = now or time.time()
+    key = agent_id or role
     roles = _SUBAGENTS.setdefault(session_id, {})
-    e = roles.get(role)
+    e = roles.get(key)
     if e is None:
-        roles[role] = {"model": model, "requests": 1, "last_seen": now,
-                       "first_seen": now}
+        roles[key] = {"key": key, "role": role, "agent_id": agent_id,
+                      "model": model, "requests": 1, "last_seen": now,
+                      "first_seen": now}
     else:
         e["model"] = model or e["model"]
+        e["role"] = role or e.get("role")
         e["requests"] += 1
         e["last_seen"] = now
     if isinstance(obj, dict):
-        _SUBAGENT_LAST_REQ.setdefault(session_id, {})[role] = {
+        _SUBAGENT_LAST_REQ.setdefault(session_id, {})[key] = {
             "obj": obj, "ts": now, "needs_auth": False}
 
 
-def _subagent_request(session_id, role):
-    """The latest captured request entry for one subagent role, or None."""
-    return (_SUBAGENT_LAST_REQ.get(session_id) or {}).get(role)
+def _subagent_request(session_id, key):
+    """The latest captured request entry for one subagent instance, or None.
+    `key` is the instance key (agent-id or role) used by /_session."""
+    return (_SUBAGENT_LAST_REQ.get(session_id) or {}).get(key)
 
 
 def _subagents_snapshot(session_id):
-    """The session's subagents for /_status, newest-active first; None if none."""
+    """The session's subagents for /_status, newest-active first; None if none.
+    Each entry carries key/role/agent_id so views can link per-instance yet
+    label by role."""
     roles = _SUBAGENTS.get(session_id)
     if not roles:
         return None
-    out = [{"role": r, **v} for r, v in roles.items()]
+    out = [dict(v) for v in roles.values()]
     out.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
     return out
 
 
 def _capture_session_meta(session_id, obj, model, agent=None, role=None,
-                          title_call=False):
+                          title_call=False, agent_id=None):
     """Per-request meta hook (handler, post-parse). The MAIN LINE (the parent
     agent, role parent/unknown, not a title side-call) owns the durable identity
     row: it bumps last_seen + model and hunts the cwd. A SUBAGENT turn (Plan/
-    general-purpose/verification — same session_id on the wire) or a title
+    general-purpose/verification/custom — same session_id on the wire) or a title
     side-call must NOT overwrite the parent's model/identity; we only bump
     last_seen (the session is alive) and, for a real subagent, log its activity
-    so /_status can show it distinctly. `agent` = the /agent/<name>/ route."""
+    so /_status can show it distinctly. `agent` = the /agent/<name>/ route;
+    `agent_id` = the x-claude-code-agent-id header (per-instance subagent key)."""
     if not session_id:
         return
     pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
     if title_call or writer_mod._is_subagent_role(role):
         if writer_mod._is_subagent_role(role):
-            _note_subagent(session_id, role, model, obj=obj)
+            _note_subagent(session_id, role, model, obj=obj, agent_id=agent_id)
         # last_seen only (model/cwd left untouched -> COALESCE keeps the parent's)
         writer_mod._enqueue_meta(session_id, agent=agent)
         return
