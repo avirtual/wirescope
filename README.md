@@ -1,8 +1,8 @@
 # wirescope
 
-**A transparent, analytical forward-proxy for the Claude Code and Codex CLIs.**
-It sits on the wire between your agent CLI and the model backend, forwards every byte verbatim, and observes what only the wire can see — the real per-turn bill, prompt-cache warmth, refusals, and the assistant's text as it streams.
-Point a CLI at it with one environment variable and nothing about your session changes, except that now you can *see* it.
+**A transparent, analytical forward-proxy for the Claude Code and Codex CLIs — that can also reshape the wire.**
+It sits between your agent CLI and the model backend, observing what only the wire can see (the real per-turn bill, prompt-cache warmth, refusals, the assistant's text as it streams) and, when you ask it to, **trimming the context the CLI sends** — stripping `CLAUDE.md` from a subagent, cutting a bloated tool roster, keeping a session's cache warm.
+Point a CLI at it with one environment variable. Observation is automatic and invisible; the payload-shaping is opt-in and deterministic.
 
 ```
    claude / codex CLI  ──►  wirescope (localhost)  ──►  api.anthropic.com
@@ -10,29 +10,53 @@ Point a CLI at it with one environment variable and nothing about your session c
                               ├─ prices every turn (the real bill)
                               ├─ tracks prompt-cache warmth + keeps it warm
                               ├─ surfaces refusals the CLI hides
-                              └─ streams text + receipts to subscribers
+                              ├─ streams text + receipts to subscribers
+                              └─ reshapes the request on opt-in directives
 ```
 
-## The thesis
+## Why it exists — the thesis
 
 **Cost is context carriage, not "the model thinking."**
+In one measured 18-turn trivial session, context *carriage* cost \$2.72 while the generated output cost \$0.07 — a **38×** ratio. A single "2+2" turn shipped 31 tools (~23k tokens) and used none of them.
+"It's cached, so it's cheap" is backwards: the right baseline for junk context is **zero**, and caching still bills ~10% of it every turn while it occupies bandwidth and the context window.
 
-In one measured 18-turn trivial session, context *carriage* cost \$2.72 while the actual generated output cost \$0.07 — a **38×** ratio.
-A single "2+2" turn shipped 31 tools (~23k tokens) and used zero of them.
+wirescope was built first to **find and price that waste** — and then to **act on it on the wire**, in the one place a CLI's own knobs can't reach: a *subagent's* context. Native `--tools` and `omitClaudeMd` only touch the main agent; a spawned subagent's roster and `CLAUDE.md` are frozen in its definition. wirescope reconstructs those missing knobs as opt-in directives (see below).
 
-"It's cached, so it's cheap" is backwards: the right baseline for junk context is **zero**.
-Caching bills ~10% of something that should not be there at all — every turn — and cached content still occupies bandwidth and the context window.
-wirescope exists to **find and price that waste**, and to stay completely non-intrusive while doing it (disk I/O runs on a background thread; a dead observer never blocks or fails your stream).
+## What you get (observation — automatic)
 
-## What you get
-
-In return for routing through it:
+Routing through it, with no directives and no config:
 
 - **The real per-turn bill** — priced from the response receipts. The CLI's own `total_cost_usd` under-reports (it misprices 1h-cache sessions); the proxy reconciles to the cent.
-- **Prompt-cache warmth** — read/write split, whether the session prefix is warm, and for how long. Plus the ability to **keep a session's cache warm** between turns.
+- **Prompt-cache warmth** — read/write split, whether the session prefix is warm and for how long, plus the ability to **keep a session's cache warm** between turns.
 - **Refusals** — `stop_reason:"refusal"` is wire-only. The CLI shows a generic toast and the transcript shows nothing; the proxy captures the category and the context that triggered it.
 - **Streaming assistant text** — normalized across both wire dialects, before the CLI renders it.
 - **A capture of everything** — every request/response, for offline analysis (`analyze_tools.py` prices tool-set deadweight).
+
+This side is non-intrusive by construction: capture I/O runs on a background thread, and a dead observer never blocks or fails your stream.
+
+## What you can do — the wirescope directives (opt-in)
+
+This is the namesake feature. You annotate **an agent's `.md` body** (a property of the agent *type*) or **the head of a spawn's prompt** (a property of the *call*) with `[wirescope:…]` directives; the proxy reads them, reshapes the request on the wire, and **strips the directive lines before forwarding** so the model never sees them and they cost zero prefix tokens.
+
+| Directive | What it does |
+|---|---|
+| `[wirescope:omit claudemd,useremail]` | Strip those context sections from the wire — the generalized `omitClaudeMd`, including `userEmail`, which nothing native can remove. |
+| `[wirescope:replace claudemd <text>]` | Keep the section heading, swap its body for your lean inline text. |
+| `[wirescope:keep claudemd]` | Override verb — cancel a lower-layer omit/replace for one target. |
+| `[wirescope:tools Read,Edit,Grep]` | Allowlist a subagent's tool roster (the ~33-tool / ~24k-token-per-turn lever native `--tools` can't reach for a subagent). |
+| `[wirescope:strip-tools Bash]` | Denylist — remove named tools, keep the rest. |
+| `[wirescope:agent-name <label>]` | A human display label for the subagent in `/_admin` / `/_session`. |
+
+```
+# lead a spawn's prompt with directives to customize an unmodified built-in agent:
+[wirescope:omit claudemd,useremail]
+[wirescope:tools Read,Edit,Grep]
+<the actual task text…>
+```
+
+Directives are read **only** from the system body or the strict head of a spawn's prompt — never from arbitrary message content, so they can't be forged downstream — and are **sticky per subagent instance** (they persist past turn 1). An operator can set a deployment-wide floor (`WS_OMIT_DEFAULT=useremail`), and a default-off **spawner hint** (`WS_SPAWNER_HINT`) can teach the syntax to spawn-capable agents on the wire. The full grammar, precedence, and cache semantics are in **[`WIRESCOPE.md`](./WIRESCOPE.md)**.
+
+> **It's deterministic, not verbatim.** Even with no directives, wirescope applies a few cache-coherent default transforms (alphabetize `tools[]`, relocate the volatile `# Environment` block to the tail, strip the `# Session-specific guidance` system section) — each deterministic so spawns of one agent still share a cached prefix. All of it is behind flags; set the kill-switches (`WS_OMIT=0`, `WS_STRIP_TOOLS=0`, `SORT_TOOLS=0`, `RELOCATE_ENV_TO_TAIL=0`, `STRIP_SYSTEM_SECTIONS=''`) for a byte-faithful forward.
 
 ## Quick start
 
@@ -54,28 +78,29 @@ curl -s localhost:7800/_status | jq .      # JSON: per-session cost / warmth / c
 open  http://localhost:7800/_admin         # live HTML dashboard (auto-refresh)
 ```
 
-That's it — your session runs exactly as before, now fully observable.
+Your session runs as before, now fully observable — and ready to shape with directives when you want to.
 
 > Prefer to manage the environment yourself? `pip install -r requirements.txt` (into a venv or with `pipx`/`--user`) and then `uvicorn logproxy:app --port 7800` works too.
 
 ## The biggest practical levers
 
-The proxy proves where the waste is; most of the fix is native CLI flags you can adopt today:
+The proxy proves where the waste is; some of the fix is native CLI flags, and some is wirescope reaching where they can't:
 
-- **Trim the tool set.** The CLI ships ~33 tools (~24k tokens *every turn*); a typical session uses ~4.
-  `claude --tools "Read Edit Write Bash Glob Grep"` trims `tools[]` on the wire. Measured: **−72.7% tokens, −50% USD, same work**.
+- **Trim the tool set.** The CLI ships ~33 tools (~24k tokens *every turn*); a typical session uses ~4. For the **main** agent, `claude --tools "Read Edit Write Bash Glob Grep"` trims `tools[]` natively — measured **−72.7% tokens, −50% USD, same work**. For a **subagent** (which native flags can't reach), `[wirescope:tools …]` does the same on the wire.
+- **Drop dead context from subagents.** `[wirescope:omit claudemd,useremail]` strips the project `CLAUDE.md` and account email a spawned helper usually doesn't need — including `userEmail`, which nothing native removes.
 - **Inline files with `@file`.** `@path` inlines the file *and* primes the read-state, so the model edits directly instead of spending a Read turn. Measured A/B: **−47.6% tokens, −16% USD, half the latency**.
 - **Replace the system prompt** with `--system-prompt-file` when you drive headless.
-- Reserve the **proxy** for what needs the wire: turn-collapse, durable response mutation, cache-warmth management, and capture/analytics.
+- **Keep the cache warm** across idle gaps with `/_hold` / `/warm-cache` instead of paying a cold prefix write on the next turn.
 
 ## Integrating a tool with the proxy
 
-If you're building a tool that wants the proxy's data (cost, warmth, refusals, a live feed), start here:
+If you're building a tool that wants the proxy's data (cost, warmth, refusals, a live feed) or wants to shape the wire, start here:
 
 - **[`INTEGRATION.md`](./INTEGRATION.md)** — the front-door contract. What the proxy offers, what to call, and what each call costs. Discovery via `GET /_identity`, session routing, and the full endpoint surface.
+- **[`WIRESCOPE.md`](./WIRESCOPE.md)** — the directive grammar: omit / replace / keep / tools / agent-name, placement, precedence, and cache semantics.
 - **[`SUBSCRIBERS.md`](./SUBSCRIBERS.md)** — the push-feed deep-dive: register an endpoint and receive `text.delta` / `turn.completed` / `session.ended` events.
 
-Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`) with `GET /_identity` → `{ "product": "wirescope", ... }`.
+Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`) with `GET /_identity` → `{ "product": "wirescope", ... }`. Capabilities (including the live `wirescope` directive set) are advertised there for feature-detection.
 
 ### Endpoint surface (all localhost, read-only unless noted)
 
@@ -105,7 +130,7 @@ See [`client/README.md`](./client/README.md).
 - **server** — routing, the transform chain, and streaming.
 - **billing / receipts** — usage parsing, pricing (Anthropic + OpenAI), and the single turn-finalize convergence point.
 - **warmth / pinger / hold** — prompt-cache warmth ledger, TTL-slide replay, and idle keep-warm holds.
-- **transforms** — request/response mutations (tool-sort, env relocation, cache-marker strips), all behind flags.
+- **transforms** — request/response mutations (wirescope directives, tool-sort, env relocation, cache-marker strips), all behind flags.
 - **subs / canary / writer** — the subscriber push feed, a structural drift detector, and the background disk-writer thread.
 
 The package `__init__` is lazy, so parts (e.g. just billing) can be imported standalone; the full lab boot is the `logproxy.py` entrypoint.
