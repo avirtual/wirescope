@@ -73,10 +73,13 @@ def _identity():
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
-            # whether spawn-position (messages[0] head) directives are read at all
+            # whether spawn-position (messages[0] head) directives are read at
+            # all; `omit_default` = operator policy already stripped from every
+            # subagent spawn (so a spawner needs no knowledge for that case)
             "wirescope": {"agent_name": True, "omit": transforms_mod.WS_OMIT,
                           "replace": transforms_mod.WS_OMIT, "keep": True,
-                          "spawn": writer_mod.WS_SPAWN_DIRECTIVES},
+                          "spawn": writer_mod.WS_SPAWN_DIRECTIVES,
+                          "omit_default": transforms_mod.WS_OMIT_DEFAULT},
         },
         "endpoints": {
             "identity": "/_identity",

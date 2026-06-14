@@ -105,7 +105,7 @@ Example — spawn a stock `general-purpose` subagent but strip the project CLAUD
     [wirescope:omit claudemd,useremail]
     Search the repo for all callers of foo() and summarize.
 
-**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`), and `protocols.wirescope` is the grammar version. `omit`/`replace`/`keep` only *do* something where the directive is present — no directive, no change.
+**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`), plus `omit_default` — the **operator-configured list already stripped from every subagent spawn** (so for that universal case you need no directive at all; check it before adding your own). `protocols.wirescope` is the grammar version. `omit`/`replace`/`keep` only *do* something where the directive is present — no directive, no change.
 
 **Full grammar, safety model, and the omit-target registry: [`WIRESCOPE.md`](./WIRESCOPE.md).**
 

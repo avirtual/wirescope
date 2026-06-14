@@ -500,6 +500,16 @@ def _strip_system_sections(obj):
 # behavior. WS_OMIT stays only as a deployment kill-switch (WS_OMIT=0 to refuse
 # honoring omit directives entirely).
 WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
+# Operator-level default OMIT policy (WIRESCOPE.md): a comma list of targets the
+# operator wants stripped from EVERY subagent spawn with zero agent/spawner
+# knowledge — the universal case (e.g. `WS_OMIT_DEFAULT=useremail` to keep the
+# user's email out of every spawned helper). Applied as the LOWEST-precedence
+# action layer (operator < body < spawn), so any `[wirescope:keep <t>]` directive
+# overrides it. Empty/unset = off (no change). Still under the WS_OMIT master
+# gate, and only on subagent turns (the main session is the user's own).
+WS_OMIT_DEFAULT = [t.strip().lower()
+                   for t in os.environ.get("WS_OMIT_DEFAULT", "").split(",")
+                   if t.strip()]
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
@@ -570,9 +580,15 @@ def _ws_resolve_actions(pairs):
 
 
 def _ws_effective_actions(obj):
-    """The per-target action map after merging body + spawn directives (spawn
-    overrides body). See _ws_resolve_actions. {} when nothing applies."""
-    pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
+    """The per-target action map after merging the operator default policy +
+    body + spawn directives. Precedence operator < body < spawn (resolved by
+    feeding the layers in that order; a later `keep` cancels an earlier action).
+    The operator default applies only to subagent turns (cc_is_subagent on the
+    billing header). See _ws_resolve_actions. {} when nothing applies."""
+    pairs = []
+    if WS_OMIT_DEFAULT and writer_mod._billing_is_subagent(obj):
+        pairs.append(("omit", ",".join(WS_OMIT_DEFAULT)))   # lowest precedence
+    pairs += writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
     return _ws_resolve_actions(pairs)
 
 

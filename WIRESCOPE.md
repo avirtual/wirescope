@@ -57,10 +57,18 @@ Nothing downstream can inject into the spawn-prompt head, and a `[wirescope:...]
 
 Spawn directives are **capability-gated** (`WS_SPAWN_DIRECTIVES`, default on; `=0` disables all message-content directive parsing). Body directives don't read message content and are unaffected.
 
+### Operator default policy (`WS_OMIT_DEFAULT`)
+An **operator** can set a deployment-wide default so the universal case needs *zero* agent or spawner knowledge.
+`WS_OMIT_DEFAULT=useremail` (a comma list of omit targets) strips those sections from **every subagent spawn** — no directive required on any agent.
+This is the lowest-precedence layer (see below): any `[wirescope:keep <target>]` in a body or spawn overrides it, and it never touches a main-agent turn (the main session is the user's own; the policy is scoped to subagents via the `cc_is_subagent` billing-header flag).
+It rides under the `WS_OMIT` master gate. Default empty = off.
+A consumer can read the active list from `capabilities.wirescope.omit_default` on `/_identity` (e.g. a spawner skill can tell the user "your operator already strips `useremail`").
+
 ### Precedence
-A spawn directive **overrides** the body for the same target (spawn > body), in either direction:
-the effective `omit` set is *body omit − body keep + spawn omit − spawn keep*, applied in that order, so a spawn's `omit`/`keep` always wins per target.
-Body directives become an optional "baked-in lean default"; spawn directives are the universal override.
+Three layers, lowest to highest: **operator default `WS_OMIT_DEFAULT` < body directive < spawn directive.**
+They're resolved in that order (a later layer's `omit`/`replace`/`keep` wins per target, and a `keep` cancels a lower layer's action), so:
+a spawn overrides the body, the body overrides the operator default, and a `keep` anywhere can cancel a lower layer.
+Body directives are an optional "baked-in lean default" per agent type; spawn directives are the universal per-call override; the operator policy is the zero-knowledge floor.
 
 ## v1 directives
 
@@ -132,9 +140,9 @@ Both are deterministic, so the forwarded prefix stays cache-constant.
 
 ## Placement & precedence summary
 
-- **Where:** the agent `.md` **body** (type-wide), or the **strict head of a spawn's prompt** (per-call). Never frontmatter — it's dropped.
+- **Where:** the agent `.md` **body** (type-wide), or the **strict head of a spawn's prompt** (per-call). Never frontmatter — it's dropped. Plus the operator's `WS_OMIT_DEFAULT` floor (subagent spawns).
 - **Read from:** the request's `system[]` (body) and the head of `messages[0]`'s spawn-prompt block (spawn) only — never elsewhere in message content.
-- **Precedence:** spawn > body, per target.
+- **Precedence:** spawn > body > operator default, per target (`keep` cancels a lower layer).
 - **Versioning:** additive. Unknown directives/targets are safe no-ops; this doc's version bumps only on a breaking change. (v0's `ws:` prefix was removed in v1.)
 
 ## Status
@@ -145,8 +153,9 @@ v1.
 - `replace` — live; substitutes a section body inline. Same `WS_OMIT` gate (the section-rewrite family).
 - `keep` — live, the per-target override verb.
 - **spawn-position directives** — capability-gated by `WS_SPAWN_DIRECTIVES` (default on; `=0` disables message-content parsing entirely).
+- **operator default policy** — `WS_OMIT_DEFAULT` (comma list; default empty/off); strips those targets from every subagent spawn, keep-overridable.
 
 Safety is the **fail-safe miss**: a requested section that isn't found (unknown token or `<system-reminder>` format drift) is logged and skipped, never over-stripped.
 A proactive canary fingerprint of the reminder heading structure (alerting on drift even when no `omit` is requested) is a planned follow-up.
 
-`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn}` so a consumer can feature-detect before relying on any of it.
+`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn, omit_default}` so a consumer can feature-detect before relying on any of it (`omit_default` is the operator's active list — what's already stripped for you).

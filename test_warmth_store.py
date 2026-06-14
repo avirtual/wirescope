@@ -903,6 +903,32 @@ lp.transforms.WS_OMIT = False
 check("replace is gated by WS_OMIT too (off -> no-op)",
       lp.transforms._ws_omit(_spawn_obj("[wirescope:replace claudemd X]\nx")) is None)
 
+# --- wirescope: operator default omit policy (WS_OMIT_DEFAULT) -------------------
+# An operator can strip targets from EVERY subagent spawn with zero agent/spawner
+# knowledge (lowest-precedence layer, subagent-only, keep-overridable).
+lp.transforms.WS_OMIT = True
+_save_omit_default = lp.transforms.WS_OMIT_DEFAULT
+lp.transforms.WS_OMIT_DEFAULT = ["useremail"]
+def _sub_obj(prompt="do it", sysflag="cc_is_subagent=true"):
+    return {"system": [{"type": "text", "text": sysflag + "\nYou are a probe"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": prompt}]}]}
+_od = _sub_obj()
+_odres = lp.transforms._ws_omit(_od)
+check("WS_OMIT_DEFAULT strips useremail from a subagent spawn with no directive",
+      _odres and _odres["omitted"] == ["useremail"]
+      and "x@y.com" not in _od["messages"][0]["content"][0]["text"]
+      and "MARKER-CLAUDEMD" in _od["messages"][0]["content"][0]["text"])
+check("operator default does NOT touch a main-agent turn (no cc_is_subagent)",
+      lp.transforms._ws_omit(_sub_obj(sysflag="You are Claude Code")) is None)
+_ko = _sub_obj(prompt="[wirescope:keep useremail]\ndo it")
+check("a [wirescope:keep] cancels the operator default (precedence keep > operator)",
+      lp.transforms._ws_omit(_ko) is None
+      and "x@y.com" in _ko["messages"][0]["content"][0]["text"])
+lp.transforms.WS_OMIT_DEFAULT = _save_omit_default
+lp.transforms.WS_OMIT = False
+
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
 # "Claude Code" — without the header flag it used to be mislabeled "parent" and
