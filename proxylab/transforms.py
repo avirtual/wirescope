@@ -512,7 +512,9 @@ WS_OMIT_DEFAULT = [t.strip().lower()
                    if t.strip()]
 # Spawner discovery hint (WIRESCOPE.md): the ONE place wirescope puts
 # proxy-authored MODEL-VISIBLE text on the wire (everywhere else it strips its
-# own directives). A tiny constant one-line pointer to the grammar, injected
+# own directives). A small constant SELF-CONTAINED grammar block (the recipient
+# lives in its own cwd and can't open the proxy-side WIRESCOPE.md, so the hint
+# carries the usable syntax inline, not a file pointer), injected
 # ONLY into a spawner's request — a main/parent line (not cc_is_subagent) that
 # actually carries a subagent-spawn tool (Agent/Task) — so an agent that can't
 # spawn never sees it and subagents stay pristine. Operator opt-in, default OFF.
@@ -521,10 +523,24 @@ WS_SPAWNER_HINT = os.environ.get("WS_SPAWNER_HINT", "") in (
 # tools[] names that mean "this agent can spawn subagents" (clodex: Agent;
 # vanilla Claude Code: Task) — the hint is pointless without one of these.
 _WS_SPAWN_TOOLS = {"Agent", "Task"}
-_WS_HINT_TEXT = ("[wirescope] Spawn directives like "
-                 "`[wirescope:omit claudemd,useremail]` at the head of a "
-                 "subagent's prompt trim its context; full grammar in "
-                 "WIRESCOPE.md.")
+# Self-contained: the agent that receives this lives in its OWN cwd and cannot
+# open the proxy-side WIRESCOPE.md, so the hint carries the usable grammar inline
+# (not a file pointer). Still one constant block -> re-anchors once, then rides
+# the cache. Must start with "[wirescope] " (the idempotency guard keys on it).
+_WS_HINT_TEXT = (
+    "[wirescope] This proxy can trim a spawned subagent's context on the "
+    "wire, saving tokens. To use it, lead the subagent's prompt with "
+    "directive lines (one per line, before the task text); the subagent never "
+    "sees them — the proxy consumes them. Verbs:\n"
+    "  [wirescope:omit claudemd,useremail]  — drop those context sections\n"
+    "  [wirescope:keep claudemd]            — re-include a section another "
+    "layer dropped\n"
+    "  [wirescope:replace claudemd <text>]  — keep the section heading, "
+    "swap its body (single line)\n"
+    "  [wirescope:agent-name <label>]       — give this spawn a display "
+    "label\n"
+    "Only a leading run of directive lines is read; the first normal line ends "
+    "parsing. Targets: claudemd, useremail.")
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
@@ -715,7 +731,7 @@ def _ws_strip_spawn_directives(obj):
 
 
 def _ws_spawner_hint(obj):
-    """Inject the constant one-line spawner discovery hint (WS_SPAWNER_HINT, see
+    """Inject the constant spawner discovery hint (WS_SPAWNER_HINT, see
     above) as a TRAILING system block — appended after the last system block, so
     it lands past the system cache breakpoint: stable position, busts nothing
     before it, ~tiny uncached tail. Gated to spawner requests only (not a

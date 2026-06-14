@@ -930,9 +930,10 @@ lp.transforms.WS_OMIT_DEFAULT = _save_omit_default
 lp.transforms.WS_OMIT = False
 
 # --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --
-# The one place wirescope adds proxy-authored visible text: a constant one-line
-# pointer, only for a main agent that can actually spawn (Agent/Task tool), never
-# a subagent, default off.
+# The one place wirescope adds proxy-authored visible text: a constant
+# SELF-CONTAINED grammar block (the recipient is in its own cwd and can't open the
+# proxy-side WIRESCOPE.md, so the syntax is inline, not a file pointer), only for a
+# main agent that can actually spawn (Agent/Task tool), never a subagent, off by default.
 _save_hint = lp.transforms.WS_SPAWNER_HINT
 lp.transforms.WS_SPAWNER_HINT = True
 def _spawner_obj(tools=("Agent", "Read"), sysflag="You are Claude Code"):
@@ -946,6 +947,11 @@ check("spawner hint appends a trailing system block for a main agent with a spaw
       and len(_hobj["system"]) == 2)
 check("spawner hint is idempotent (second pass no-ops, no duplicate block)",
       lp.transforms._ws_spawner_hint(_hobj) is None and len(_hobj["system"]) == 2)
+check("spawner hint is self-contained grammar (carries usable verbs inline, not just a file pointer)",
+      all(tok in _hobj["system"][-1]["text"]
+          for tok in ("[wirescope:omit", "[wirescope:keep", "[wirescope:replace",
+                      "[wirescope:agent-name"))
+      and "WIRESCOPE.md" not in _hobj["system"][-1]["text"])
 check("spawn tool 'Task' (vanilla Claude Code) also triggers the hint",
       lp.transforms._ws_spawner_hint(_spawner_obj(tools=("Task", "Read"))) is not None)
 check("no hint for a main agent WITHOUT a spawn tool (Agent/Task absent)",
