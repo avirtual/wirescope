@@ -80,7 +80,11 @@ def _identity():
                           "replace": transforms_mod.WS_OMIT, "keep": True,
                           "spawn": writer_mod.WS_SPAWN_DIRECTIVES,
                           "omit_default": transforms_mod.WS_OMIT_DEFAULT,
-                          "spawner_hint": transforms_mod.WS_SPAWNER_HINT},
+                          "spawner_hint": transforms_mod.WS_SPAWNER_HINT,
+                          # tool-roster trim: `tools` (allowlist), `strip-tools`
+                          # (denylist), `keep-tools` (override); gated by
+                          # WS_STRIP_TOOLS, same spawn/body/sticky plumbing.
+                          "strip_tools": transforms_mod.WS_STRIP_TOOLS},
         },
         "endpoints": {
             "identity": "/_identity",

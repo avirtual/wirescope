@@ -1044,6 +1044,82 @@ lp.transforms._WS_SPAWN_MEMORY.clear()
 lp.transforms.WS_OMIT_DEFAULT = _save_sticky_default
 lp.transforms.WS_OMIT = False
 
+# --- wirescope: TOOL-ROSTER trim (tools / strip-tools / keep-tools) -------------
+# Let a spawner trim a subagent's tool roster on the wire (the biggest token
+# lever) to customize a predefined agent without editing its file. `tools` =
+# allowlist (keep only), `strip-tools` = denylist, `keep-tools` = override.
+# Same spawn/body/sticky plumbing as omit; tools[] mutation is request-side only.
+lp.transforms.WS_STRIP_TOOLS = True
+lp.transforms._WS_SPAWN_MEMORY.clear()
+_save_td = lp.transforms.WS_OMIT_DEFAULT
+lp.transforms.WS_OMIT_DEFAULT = []          # isolate from the operator floor
+def _tools_obj(prompt, names=("Read", "Edit", "Bash", "Grep", "WebFetch"),
+               sid="sess-tools"):
+    return {"system": [{"type": "text", "text": _cbh + "You are a probe"}],
+            "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "tools": [{"name": n} for n in names],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": prompt}]}]}
+# resolver: allowlist last-wins, denylist accumulates, keep-tools cancels
+check("tool resolver: `tools` SETS the allowlist (last directive wins)",
+      lp.transforms._ws_resolve_tools([("tools", "Read,Edit"), ("tools", "Read Grep")])
+      == {"allow": {"read", "grep"}, "drop": set()})
+check("tool resolver: strip-tools accumulates the denylist, keep-tools cancels",
+      lp.transforms._ws_resolve_tools(
+          [("strip-tools", "Bash WebFetch"), ("keep-tools", "bash")])
+      == {"allow": None, "drop": {"webfetch"}})
+check("tool resolver: keep-tools re-admits a name to an active allowlist",
+      lp.transforms._ws_resolve_tools(
+          [("tools", "Read"), ("keep-tools", "Edit")])["allow"] == {"read", "edit"})
+# allowlist apply (case-insensitive match against the canonical-case roster)
+_ta = _tools_obj("[wirescope:tools read,edit]\nDo it", sid="sess-ta")
+_tar = lp.transforms._ws_strip_tools(_ta, agent_id="T1")
+check("allowlist keeps ONLY the named tools (case-insensitive), drops the rest",
+      _tar and sorted(_tar["kept"]) == ["Edit", "Read"]
+      and {t["name"] for t in _ta["tools"]} == {"Read", "Edit"}
+      and set(_tar["removed"]) == {"Bash", "Grep", "WebFetch"})
+# denylist apply
+_td = _tools_obj("[wirescope:strip-tools Bash,WebFetch]\nDo it", sid="sess-td")
+_tdr = lp.transforms._ws_strip_tools(_td, agent_id="T2")
+check("denylist removes only the named tools, keeps the rest",
+      _tdr and set(_tdr["removed"]) == {"Bash", "WebFetch"}
+      and {t["name"] for t in _td["tools"]} == {"Read", "Edit", "Grep"})
+# precedence: a spawn keep-tools overrides a body strip-tools
+_tp = {"system": [{"type": "text",
+                   "text": _cbh + "[wirescope:strip-tools Bash]\nYou are a probe"}],
+       "metadata": {"user_id": json.dumps({"session_id": "sess-tp"})},
+       "tools": [{"name": n} for n in ("Read", "Bash", "Edit")],
+       "messages": [{"role": "user", "content": [
+           {"type": "text", "text": _reminder},
+           {"type": "text", "text": "[wirescope:keep-tools Bash]\nDo it"}]}]}
+_tpr = lp.transforms._ws_strip_tools(_tp, agent_id="TP")
+check("spawn keep-tools overrides a body strip-tools (precedence spawn > body)",
+      _tpr is None and "Bash" in {t["name"] for t in _tp["tools"]})
+# STICKY: a tool trim persists to a directive-less continuation turn of the instance
+_ts1 = _tools_obj("[wirescope:strip-tools Bash]\nDo it", sid="sess-tsticky")
+lp.transforms._ws_strip_tools(_ts1, agent_id="TS")
+_ts2 = _tools_obj("a follow-up question", sid="sess-tsticky")
+_ts2r = lp.transforms._ws_strip_tools(_ts2, agent_id="TS")
+check("sticky: tool trim persists to a directive-less continuation turn",
+      _ts2r and _ts2r["removed"] == ["Bash"]
+      and "Bash" not in {t["name"] for t in _ts2["tools"]})
+# fail-safe: a directive that matches no tool over-strips nothing (logged miss)
+_tm = _tools_obj("[wirescope:strip-tools Nonesuch]\nx", sid="sess-tm")
+_tmr = lp.transforms._ws_strip_tools(_tm, agent_id="TM")
+check("a tool directive matching nothing is a fail-safe miss (no over-strip)",
+      _tmr and _tmr.get("miss") and _tmr["removed"] == [] and len(_tm["tools"]) == 5)
+check("no tool directive -> no-op (None)",
+      lp.transforms._ws_strip_tools(
+          _tools_obj("plain prompt", sid="sess-tn"), agent_id="TN") is None)
+lp.transforms.WS_STRIP_TOOLS = False
+check("WS_STRIP_TOOLS=off is the deployment kill-switch (no trim)",
+      lp.transforms._ws_strip_tools(
+          _tools_obj("[wirescope:tools Read]\nx", sid="sess-toff"), agent_id="TO") is None)
+lp.transforms.WS_STRIP_TOOLS = True
+lp.transforms._WS_SPAWN_MEMORY.clear()
+lp.transforms.WS_OMIT_DEFAULT = _save_td
+
 # --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --
 # The one place wirescope adds proxy-authored visible text: a constant
 # SELF-CONTAINED grammar block (the recipient is in its own cwd and can't open the

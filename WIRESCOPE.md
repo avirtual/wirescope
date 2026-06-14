@@ -131,6 +131,33 @@ Use it on a **spawn** to keep a section a body default would have omitted/replac
 
 New targets are added here; an unknown target is ignored (logged), not an error.
 
+### `[wirescope:tools <names>]` / `[wirescope:strip-tools <names>]` / `[wirescope:keep-tools <names>]`
+
+Trim the subagent's **tool roster** on the wire, so a spawner can customize a predefined agent — whose toolset is otherwise frozen in its `.claude/agents/<name>.md` frontmatter — **without editing its file**.
+This is the largest token lever wirescope offers: the default roster is ~33 tools (≈24k tokens *every turn*) while a typical task uses ~4. Native `--tools` trims only the *main* agent; there is no per-spawn override for a subagent, which is the gap these verbs fill.
+
+| verb | semantics |
+|---|---|
+| `tools <names>` | **Allowlist** — keep ONLY the named tools, drop the rest (mirrors native `--tools`). Last `tools` directive wins, so a spawn allowlist overrides a body one. |
+| `strip-tools <names>` | **Denylist** — remove the named tools, keep everything else. Safe surgical removal: no need to know the agent's full roster. |
+| `keep-tools <names>` | **Override** — cancel a lower layer's `strip-tools` and re-admit a name to an active allowlist (e.g. a spawn `keep-tools` over a body `strip-tools`). |
+
+```
+# a research subagent's body: never let it touch the shell
+[wirescope:strip-tools Bash]
+
+# a spawn that wants a minimal editing agent:
+[wirescope:tools Read,Edit,Grep]
+<task…>
+```
+
+Names are matched **case-insensitively** with the same liberal separator as `omit` (comma and/or whitespace), so `strip-tools bash webfetch` parses.
+Like `omit`, the directive is read only from the system **body** or the **spawn-prompt head** (never message content → unforgeable), and is **sticky** per instance (persists past turn 1, see *Persistence*).
+Gated by `WS_STRIP_TOOLS` (default on; `=0` is the deployment kill-switch).
+Fail-safe: a name that matches no tool in the roster is a logged **miss**, never an over-strip.
+
+> **Sharp edge (the spawner's call, same as `--tools`):** if the agent's prompt expects a tool you removed and the model emits a call for it, the upstream API rejects the turn. Trim to a set the agent's task actually needs.
+
 ## Directives are consumed, not forwarded
 
 The proxy reads and acts on directives, then **strips them before forwarding upstream** — body directives from the system prompt (every `[wirescope:...]` line), and spawn directives from the prompt head (only the consumed leading lines).
@@ -165,6 +192,7 @@ A consumer sees whether it's on via `capabilities.wirescope.spawner_hint`.
 - **No transcript desync.** It's request-side and idempotent: the CLI rebuilds context locally each turn; the proxy re-applies the same strip in-flight, leaving the client's transcript untouched.
 - **The one invariant:** the strip must fire on every forwarded turn. A **body** directive rides `system[]` every turn, so it's automatic. A **spawn** directive is only at the `messages[0]` head on turn 1, so the proxy makes it sticky — it remembers the resolved spawn directives per `x-claude-code-agent-id` and re-applies them on every later turn of that instance (see *Persistence* above). Deterministic re-application keeps `messages[0]` byte-stable across the instance's turns.
 - **Behavior-affecting, by design.** Omitting `claudeMd`/`userEmail` removes real context the agent would otherwise see. That's the author's/spawner's opt-in call. (Side note: it also tends to *reduce* fable refusal-classifier hits, since claudeMd content is a common trigger.)
+- **Tool-trim reshapes the prefix — but to a net win.** Unlike the section verbs, `tools[]` sits *in front of* the first cache breakpoint, so trimming it changes the cached prefix. Because the trim is deterministic and sticky (the same roster every turn of the instance), the *smaller* set just becomes the stable cached prefix: turn 1 writes a shorter prefix, every later turn reads it. The win is the recurring per-turn carriage of the dropped tools, not a one-off. (Inconsistent trimming would bust the cache each turn — which is exactly why stickiness is load-bearing here.)
 
 ## Placement & precedence summary
 
@@ -180,6 +208,7 @@ v1.
 - `omit` — honored by default; the directive **is** the opt-in. `WS_OMIT=0` is a deployment kill-switch only.
 - `replace` — live; substitutes a section body inline. Same `WS_OMIT` gate (the section-rewrite family).
 - `keep` — live, the per-target override verb.
+- `tools` / `strip-tools` / `keep-tools` — live; trim the tool roster (allowlist / denylist / override). Gated by `WS_STRIP_TOOLS` (default on; `=0` kill-switch). Sticky per instance like the section verbs.
 - **spawn-position directives** — capability-gated by `WS_SPAWN_DIRECTIVES` (default on; `=0` disables message-content parsing entirely).
 - **operator default policy** — `WS_OMIT_DEFAULT` (comma list; default empty/off); strips those targets from every subagent spawn, keep-overridable.
 - **spawner discovery hint** — `WS_SPAWNER_HINT` (default off); the one model-visible block, self-contained inline grammar, injected only into spawn-capable main agents, never subagents.
@@ -187,4 +216,4 @@ v1.
 Safety is the **fail-safe miss**: a requested section that isn't found (unknown token or `<system-reminder>` format drift) is logged and skipped, never over-stripped.
 A proactive canary fingerprint of the reminder heading structure (alerting on drift even when no `omit` is requested) is a planned follow-up.
 
-`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn, omit_default, spawner_hint}` so a consumer can feature-detect before relying on any of it (`omit_default` is the operator's active list — what's already stripped for you; `spawner_hint` is whether the discovery line is on).
+`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn, omit_default, spawner_hint, strip_tools}` so a consumer can feature-detect before relying on any of it (`omit_default` is the operator's active list — what's already stripped for you; `spawner_hint` is whether the discovery line is on; `strip_tools` is whether the tool-roster verbs are enabled).

@@ -671,26 +671,25 @@ def _ws_forget(session_id):
     _WS_SPAWN_MEMORY.pop(session_id, None)
 
 
-def _ws_effective_actions(obj, agent_id=None):
-    """The per-target action map after merging the operator default policy +
-    body + spawn directives. Precedence operator < body < spawn (resolved by
-    feeding the layers in that order; a later `keep` cancels an earlier action).
-    The operator default applies only to subagent turns (cc_is_subagent on the
-    billing header). See _ws_resolve_actions. {} when nothing applies.
+def _ws_merged_pairs(obj, agent_id=None):
+    """Ordered (directive, value) pairs after merging the operator default policy
+    + body + spawn layers (precedence operator < body < spawn, by feed order),
+    with the spawn layer made STICKY per instance. BOTH verb families consume this
+    one stream — section verbs via _ws_resolve_actions, tool verbs via
+    _ws_resolve_tools — so precedence + stickiness live in exactly one place.
 
     `agent_id` (the x-claude-code-agent-id request header) makes the spawn layer
-    STICKY per instance: on a directive-bearing turn we remember the spawn pairs
-    under that id; on a later directive-less turn of the same instance we re-feed
-    the remembered pairs so the omit/keep/replace persists past turn 1."""
+    sticky: on a directive-bearing turn we remember the spawn pairs under that id;
+    on a later directive-less turn of the same instance we re-feed the remembered
+    pairs so the directives persist past turn 1. Only ever remembered/replayed for
+    a real subagent instance (the main line has no agent_id, so it is never
+    sticky; a non-subagent is never touched even if some header leaked through)."""
     pairs = []
     is_sub = writer_mod._billing_is_subagent(obj)
     if WS_OMIT_DEFAULT and is_sub:
         pairs.append(("omit", ",".join(WS_OMIT_DEFAULT)))   # lowest precedence
     pairs += writer_mod._ws_body_pairs(obj)
     spawn = writer_mod._ws_spawn_pairs(obj)
-    # Sticky layer: only ever remember/replay for a real subagent instance (the
-    # main line has no agent_id, so it is never sticky; a non-subagent is never
-    # touched even if some header leaked through).
     if agent_id and is_sub:
         sid = writer_mod._session_ids(obj)[0]
         if spawn:                                  # turn-1 (or any directive turn)
@@ -698,7 +697,14 @@ def _ws_effective_actions(obj, agent_id=None):
         else:                                      # continuation turn: replay
             spawn = (_WS_SPAWN_MEMORY.get(sid) or {}).get(agent_id, [])
     pairs += spawn                                 # highest precedence
-    return _ws_resolve_actions(pairs)
+    return pairs
+
+
+def _ws_effective_actions(obj, agent_id=None):
+    """The per-target SECTION action map (omit/keep/replace) after merging the
+    operator default + body + spawn directives (see _ws_merged_pairs for the
+    precedence + stickiness). See _ws_resolve_actions. {} when nothing applies."""
+    return _ws_resolve_actions(_ws_merged_pairs(obj, agent_id))
 
 
 def _ws_effective_omit_targets(obj):
@@ -706,6 +712,85 @@ def _ws_effective_omit_targets(obj):
     tests that only care about deletions, not replacements."""
     return {t for t, (act, _) in _ws_effective_actions(obj).items()
             if act == "omit"}
+
+
+# ---- WIRESCOPE tool-set trim (`tools` / `strip-tools` / `keep-tools`) -------
+# Let a SPAWNER trim a subagent's tool roster on the wire, customizing a
+# predefined agent (whose toolset is frozen in its `.claude/agents/<name>.md`
+# frontmatter) WITHOUT editing its file. This is the biggest token lever we have
+# (default ~33 tools ≈ 24k tok every turn, typical use ~4); native `--tools`
+# trims only the MAIN agent, so per-spawn subagent trimming is a real gap.
+#   `[wirescope:tools Read,Edit,Grep]` — ALLOWLIST: keep ONLY these (mirrors
+#       native --tools; last one wins so spawn overrides body).
+#   `[wirescope:strip-tools Bash,WebFetch]` — DENYLIST: remove these, keep the
+#       rest (safe surgical removal; no need to know the agent's full roster).
+#   `[wirescope:keep-tools Bash]` — cancel a drop / re-admit to the allowlist
+#       (precedence override, e.g. a spawn keep over a body strip).
+# Matching is case-insensitive + liberal-separator (a naive agent writes
+# `strip-tools bash`). tools[] sits IN FRONT of the first cache breakpoint, so a
+# consistent per-instance trim (sticky via _ws_merged_pairs) reshapes the cached
+# prefix to the SMALLER set once, then rides it — a net cache WIN, not a per-turn
+# bust. Forgeable only by system body / spawn-prompt head (never message content,
+# same as omit). Sharp edge (spawner's call, like --tools): if the agent's prompt
+# expects a stripped tool and the model emits it, upstream 400s.
+WS_STRIP_TOOLS = os.environ.get("WS_STRIP_TOOLS", "1") not in (
+    "0", "no", "off", "false")
+
+
+def _ws_resolve_tools(pairs):
+    """Resolve ordered pairs into a tool filter spec {'allow': set|None,
+    'drop': set} (lowercased names). `tools` SETS the allowlist (last wins);
+    `strip-tools` adds to the drop set; `keep-tools` removes from drop AND
+    re-admits to an active allowlist. Non-tool verbs ignored."""
+    allow = None
+    drop = set()
+    for name, value in pairs:
+        if name == "tools":
+            allow = set(_ws_omit_target_list(value))
+        elif name == "strip-tools":
+            drop.update(_ws_omit_target_list(value))
+        elif name == "keep-tools":
+            for t in _ws_omit_target_list(value):
+                drop.discard(t)
+                if allow is not None:
+                    allow.add(t)
+    return {"allow": allow, "drop": drop}
+
+
+def _ws_strip_tools(obj, agent_id=None):
+    """Apply the wirescope tool-trim directives to obj['tools']. Returns a log
+    dict {removed, kept, allow, drop[, miss]} or None (gate off / no tools / no
+    directive). A directive that matches NOTHING is a fail-safe MISS (logged,
+    never over-strips). WS_STRIP_TOOLS=0 is the deployment kill-switch."""
+    if not WS_STRIP_TOOLS:
+        return None
+    tools = obj.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    spec = _ws_resolve_tools(_ws_merged_pairs(obj, agent_id))
+    allow, drop = spec["allow"], spec["drop"]
+    if allow is None and not drop:
+        return None                          # no tool directive in play
+    kept, removed = [], []
+    for t in tools:
+        nm = t.get("name") if isinstance(t, dict) else None
+        low = (nm or "").lower()
+        if allow is not None and low not in allow:
+            removed.append(nm)
+        elif low in drop:
+            removed.append(nm)
+        else:
+            kept.append(t)
+    log = {"allow": sorted(allow) if allow is not None else None,
+           "drop": sorted(drop)}
+    if not removed:
+        log["removed"] = []
+        log["miss"] = True                   # directive present, matched nothing
+        return log
+    obj["tools"] = kept
+    log["removed"] = removed
+    log["kept"] = [t.get("name") for t in kept]
+    return log
 
 
 def _ws_reminder_is_empty(text):

@@ -464,6 +464,15 @@ async def handler(request: Request) -> Response:
                 record["ws_omit"] = wso
                 if wso.get("omitted") or wso.get("replaced"):
                     changed = True
+            # WIRESCOPE [wirescope:tools|strip-tools|keep-tools ...]: trim the
+            # tool roster on the wire (allowlist/denylist), so a spawner can
+            # customize a predefined subagent without editing its file. Must run
+            # BEFORE the directive-strip below (it reads the same directives).
+            wst = transforms_mod._ws_strip_tools(obj, agent_id=agent_id)
+            if wst:
+                record["ws_tools"] = wst
+                if wst.get("removed"):
+                    changed = True
             # WIRESCOPE: capture the display name BEFORE removing the directives,
             # then strip every [wirescope:...] line from system so the model never
             # sees our control lines (and they cost no prefix tokens). Strip is
