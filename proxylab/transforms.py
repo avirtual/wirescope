@@ -21,6 +21,7 @@ from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 from proxylab import warmth as warmth_mod
+from proxylab import writer as writer_mod
 
 # --- EXPERIMENTAL: payload injection (OFF by default; observer mode is default) -
 # Two modes, both mutate the LAST user message of /v1/messages and forward the
@@ -482,6 +483,81 @@ def _strip_system_sections(obj):
                 removed.append({"block": 0, "header": hdr, "chars": n})
         obj["system"] = sys
     return {"removed": removed} if removed else None
+
+
+# ---- WIRESCOPE `[ws:omit ...]` — strip context sections from messages[0] ----
+# Honors the body directive `[ws:omit claudemd,useremail]` (see WIRESCOPE.md):
+# the proxy strips the named `# <Section>` blocks out of the <system-reminder> in
+# the first user message before forwarding — the reconstruction of the CLI's
+# internal omitClaudeMd, generalized (nothing native removes # userEmail). The
+# strip is per-agent-type opt-in (rides system[2], cache-constant), fires every
+# turn deterministically, and is idempotent. messages[0] sits AFTER the
+# system/tools cache breakpoint, so the expensive prefix is untouched.
+# Default OFF (global kill-switch) on top of the per-agent directive opt-in.
+WS_OMIT = os.environ.get("WS_OMIT") in ("1", "yes", "on", "true")
+# directive target token -> the `# <Section>` heading it removes
+_WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
+
+
+def _ws_strip_reminder_section(text, hdr):
+    """Strip the `hdr` section from a <system-reminder> text. Like
+    _strip_section_from_text but the section boundary is the next column-0 `# `
+    header OR the closing </system-reminder> — so removing the LAST section never
+    eats the closing tag. Returns (new_text, chars_removed)."""
+    m = re.search(r"(?m)^[ \t]*" + re.escape(hdr) + r"[ \t]*$", text)
+    if not m:
+        return text, 0
+    start = m.start()
+    rest = text[m.end():]
+    bounds = [c.start() for c in (re.search(r"(?m)^# ", rest),
+                                  re.search(r"</system-reminder>", rest)) if c]
+    end = m.end() + min(bounds) if bounds else len(text)
+    new = text[:start] + text[end:]
+    new = re.sub(r"\n{3,}", "\n\n", new)
+    return new, end - start
+
+
+def _ws_omit(obj):
+    """Apply `[ws:omit <targets>]` from the system body to messages[0]. Returns a
+    log dict {omitted, missed, chars_removed, requested} or None when nothing was
+    requested / the flag is off. A requested target that isn't found (unknown
+    token or format drift) is a logged MISS, never an over-strip (fail-safe)."""
+    if not WS_OMIT:
+        return None
+    raw = writer_mod._ws_directives(obj).get("omit")
+    if not raw:
+        return None
+    requested = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not requested:
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    removed, chars = set(), 0
+    for m in msgs:                       # in practice only messages[0] carries it
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for b in c:
+            if not (isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str)):
+                continue
+            for tgt in requested:
+                hdr = _WS_OMIT_TARGETS.get(tgt)
+                if not hdr or hdr not in b["text"]:
+                    continue
+                new, n = _ws_strip_reminder_section(b["text"], hdr)
+                if n:
+                    b["text"] = new
+                    removed.add(tgt)
+                    chars += n
+    missed = [t for t in requested if t not in removed]
+    if not removed and not missed:
+        return None
+    return {"omitted": sorted(removed), "missed": missed,
+            "chars_removed": chars, "requested": requested}
 
 
 # ---- TOOL SORT (experimental, off by default) -----------------------------

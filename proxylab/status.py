@@ -29,6 +29,7 @@ from proxylab import pinger as pinger_mod
 from proxylab import restore as restore_mod
 from proxylab import subs as subs_mod
 from proxylab import store as store_mod
+from proxylab import transforms as transforms_mod
 from proxylab import warmth as warmth_mod
 
 # Stable product marker. Many proxies can sit on ANTHROPIC_BASE_URL in front of
@@ -56,6 +57,7 @@ def _identity():
             # protocol/contract versions a consumer can branch on
             "identity": IDENTITY_PROTOCOL,
             "subscribers": 1,             # SUBSCRIBERS.md envelope "v"
+            "wirescope": 0,               # WIRESCOPE.md [ws:...] directive spec
         },
         # what THIS process can actually do right now (env flags can disable
         # subsystems) — a subscriber should gate features on these, not assume
@@ -67,6 +69,9 @@ def _identity():
             "stats": True,                # /_status is always served
             "session_view": True,         # /_session HTML
             "codex": True,                # /agent/<name>/openai routing
+            # wirescope body directives (WIRESCOPE.md): agent-name always honored,
+            # omit gated by WS_OMIT (per-agent directive opt-in on top)
+            "wirescope": {"agent_name": True, "omit": transforms_mod.WS_OMIT},
         },
         "endpoints": {
             "identity": "/_identity",

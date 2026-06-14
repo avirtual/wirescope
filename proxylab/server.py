@@ -451,6 +451,13 @@ async def handler(request: Request) -> Response:
             if strp:
                 record["system_strip"] = strp
                 changed = True
+            # WIRESCOPE [ws:omit ...]: strip author-opted-out context sections
+            # (# claudeMd / # userEmail) from messages[0]. Per-agent-type opt-in.
+            wso = transforms_mod._ws_omit(obj)
+            if wso:
+                record["ws_omit"] = wso
+                if wso.get("omitted"):
+                    changed = True
             # Tool sort: alphabetize tools[] for a byte-stable first cache segment.
             srt = transforms_mod._sort_tools(obj)
             if srt:

@@ -185,20 +185,31 @@ def _billing_is_subagent(obj):
     return "cc_is_subagent=true" in _sys_text(obj)
 
 
-# Opt-in subagent display name. The CLI sends NO agent name/type on the wire
-# (verified in CLI source: frontmatter is dropped, only the .md BODY reaches
-# system[]); so the only way an author can surface a human label is to declare
-# it IN THE BODY. Convention: an `[agent: <name>]` sentinel anywhere in the
-# prompt. DISPLAY-GRADE ONLY — no gate reads this; absent -> the view falls back
-# to role + the per-instance agent-id.
-_SUBAGENT_NAME_RE = re.compile(r"\[agent:\s*([^\]\n]{1,64})\]", re.IGNORECASE)
+# --- Wirescope directive protocol (`ws:`) — full spec in WIRESCOPE.md --------
+# Opt-in directives an agent author writes into the agent .md BODY (the only
+# author-controlled text that reaches system[], since the CLI drops frontmatter
+# and never sends an agent name). Form: `[ws:<directive> <value>]`, one per line.
+# Parsed ONLY from the system prompt, NEVER from message content, so nothing a
+# user (or tool result, or quoted transcript) types can forge a directive.
+# Unknown directives are silently ignored -> additive forever.
+_WS_DIRECTIVE_RE = re.compile(r"\[ws:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]",
+                              re.IGNORECASE)
+
+
+def _ws_directives(obj):
+    """All `[ws:<directive> <value>]` directives in the request's system body,
+    as {directive(lowercased): value(str, trimmed)}. Last duplicate wins."""
+    out = {}
+    for m in _WS_DIRECTIVE_RE.finditer(_sys_text(obj)):
+        out[m.group(1).lower()] = (m.group(2) or "").strip()
+    return out
 
 
 def _subagent_marker_name(obj):
-    """The author-declared `[agent: <name>]` label from the subagent's system
-    body, or None. First match wins; trimmed; len-capped by the regex."""
-    m = _SUBAGENT_NAME_RE.search(_sys_text(obj))
-    return m.group(1).strip() if m else None
+    """The author-declared display label from `[ws:agent-name <label>]`, or None.
+    Display-grade only (no gate reads it); len-capped at 64."""
+    name = _ws_directives(obj).get("agent-name")
+    return name[:64] if name else None
 
 
 def _classify_role(obj):

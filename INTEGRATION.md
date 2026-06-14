@@ -96,5 +96,6 @@ Rules of thumb:
 ## Where to look next
 
 - **Push events, field by field:** [`SUBSCRIBERS.md`](./SUBSCRIBERS.md).
+- **Agent-authored body directives (`[ws:agent-name]`, `[ws:omit]`):** [`WIRESCOPE.md`](./WIRESCOPE.md) — the directive grammar an agent author embeds in a `.claude/agents/*.md` body for the proxy to honor.
 - **Live capabilities & version of a specific deployment:** `GET /_identity`.
 - **Reconcile / source of truth:** `GET /_status?session=<id>`.

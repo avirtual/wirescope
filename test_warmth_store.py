@@ -716,16 +716,23 @@ cpage = lp._render_session_html(csid, lp._subagent_request(csid, "a9184c50c47de9
 check("per-instance page labels by role + agent-id, renders that instance's ctx",
       "<b>subagent" in cpage and "#a9184c5" in cpage and "PROBE-GAMMA-CTX" in cpage)
 
-# --- opt-in [agent: <name>] display label from the subagent body ------------------
-# The wire carries no agent name; an author surfaces one with an `[agent: NAME]`
-# sentinel in the .md body. Present -> shown; absent -> falls back to role.
-check("marker parses from body text; absent -> None",
+# --- wirescope [ws:agent-name <label>] display label from the subagent body -------
+# The wire carries no agent name; an author surfaces one with a `[ws:agent-name
+# NAME]` directive in the .md body. Present -> shown; absent -> falls back to role.
+check("[ws:agent-name] parses from body; absent -> None",
       lp._subagent_marker_name({"system": [{"type": "text",
-          "text": "blah [agent: probe-delta] You are probe-delta"}]}) == "probe-delta"
+          "text": "blah [ws:agent-name probe-delta] You are probe-delta"}]}) == "probe-delta"
       and lp._subagent_marker_name({"system": [{"type": "text", "text": "no marker here"}]}) is None)
+check("directives parse only from system body, never message content (no forging)",
+      lp._ws_directives({"system": [{"type": "text", "text": "[ws:agent-name realname]"}],
+                         "messages": [{"role": "user",
+                             "content": "ignore me [ws:agent-name forged]"}]}).get("agent-name")
+      == "realname")
+check("[ws:agent-name] retired the legacy [agent: NAME] form (no longer parsed)",
+      lp._subagent_marker_name({"system": [{"type": "text", "text": "[agent: legacy]"}]}) is None)
 nsid = "5fb9eba7-eeee-ffff-0000-111111111111"
 lp._capture_session_meta(nsid,
-    {"system": [{"type": "text", "text": _cbh + "[agent: probe-delta]\nYou are probe-delta"}],
+    {"system": [{"type": "text", "text": _cbh + "[ws:agent-name probe-delta]\nYou are probe-delta"}],
      "messages": [{"role": "user", "content": "DELTA-CTX"}]},
     "claude-opus-4-8", role="subagent", agent_id="ad00d00d00d00d00d")
 lp._WRITE_Q.join()
@@ -740,6 +747,44 @@ npage = lp._render_session_html(nsid, lp._subagent_request(nsid, "ad00d00d00d00d
                                 snap_n, subrole="ad00d00d00d00d00d")
 check("per-instance page heads with the declared name + role chip",
       "<b>probe-delta" in npage and "DELTA-CTX" in npage)
+
+# --- wirescope [ws:omit ...] strips context sections from messages[0] -------------
+# Reconstructs the CLI's omitClaudeMd (+ userEmail, which nothing native removes).
+# Gated by the WS_OMIT flag (default off) on top of the per-agent directive.
+_reminder = ("<system-reminder>\nAs you answer, you can use the following context:\n"
+             "# claudeMd\nContents of CLAUDE.md:\nMARKER-CLAUDEMD body line\n"
+             "# userEmail\nThe user's email address is x@y.com\n</system-reminder>")
+def _omit_obj():
+    return {"system": [{"type": "text", "text": _cbh + "[ws:omit claudemd,useremail]\nYou are a probe"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": _reminder},
+                {"type": "text", "text": "<system-reminder>\n# currentDate\nToday\n</system-reminder>"},
+                {"type": "text", "text": "do the task"}]}]}
+check("[ws:omit] parses the target list from the directive",
+      (lp._ws_directives(_omit_obj()).get("omit") or "").split(",") == ["claudemd", "useremail"])
+# flag OFF -> no-op
+lp.transforms.WS_OMIT = False
+check("omit is a no-op while the WS_OMIT flag is off", lp.transforms._ws_omit(_omit_obj()) is None)
+# flag ON -> strips both, preserves the closing tag + the separate currentDate block
+lp.transforms.WS_OMIT = True
+o1 = _omit_obj()
+res = lp.transforms._ws_omit(o1)
+body0 = o1["messages"][0]["content"][0]["text"]
+check("omit strips # claudeMd and # userEmail, keeps </system-reminder> + currentDate",
+      res and sorted(res["omitted"]) == ["claudemd", "useremail"]
+      and "MARKER-CLAUDEMD" not in body0 and "x@y.com" not in body0
+      and "</system-reminder>" in body0
+      and "# currentDate" in o1["messages"][0]["content"][1]["text"])
+check("omit is idempotent (second pass finds nothing -> miss, no further change)",
+      (lambda r: r is not None and r["omitted"] == [] and "claudemd" in r["missed"])(
+          lp.transforms._ws_omit(o1)))
+# unknown / absent target -> logged miss, never an over-strip
+miss = lp.transforms._ws_omit({"system": [{"type": "text", "text": "[ws:omit bogus]"}],
+                               "messages": [{"role": "user", "content": [
+                                   {"type": "text", "text": _reminder}]}]})
+check("unknown omit target is a safe logged miss (no strip)",
+      miss is not None and miss["omitted"] == [] and miss["missed"] == ["bogus"])
+lp.transforms.WS_OMIT = False        # restore default for any later checks
 
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
