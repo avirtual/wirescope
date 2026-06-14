@@ -79,7 +79,8 @@ def _identity():
             "wirescope": {"agent_name": True, "omit": transforms_mod.WS_OMIT,
                           "replace": transforms_mod.WS_OMIT, "keep": True,
                           "spawn": writer_mod.WS_SPAWN_DIRECTIVES,
-                          "omit_default": transforms_mod.WS_OMIT_DEFAULT},
+                          "omit_default": transforms_mod.WS_OMIT_DEFAULT,
+                          "spawner_hint": transforms_mod.WS_SPAWNER_HINT},
         },
         "endpoints": {
             "identity": "/_identity",

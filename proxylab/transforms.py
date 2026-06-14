@@ -510,6 +510,21 @@ WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
 WS_OMIT_DEFAULT = [t.strip().lower()
                    for t in os.environ.get("WS_OMIT_DEFAULT", "").split(",")
                    if t.strip()]
+# Spawner discovery hint (WIRESCOPE.md): the ONE place wirescope puts
+# proxy-authored MODEL-VISIBLE text on the wire (everywhere else it strips its
+# own directives). A tiny constant one-line pointer to the grammar, injected
+# ONLY into a spawner's request — a main/parent line (not cc_is_subagent) that
+# actually carries a subagent-spawn tool (Agent/Task) — so an agent that can't
+# spawn never sees it and subagents stay pristine. Operator opt-in, default OFF.
+WS_SPAWNER_HINT = os.environ.get("WS_SPAWNER_HINT", "") in (
+    "1", "yes", "on", "true")
+# tools[] names that mean "this agent can spawn subagents" (clodex: Agent;
+# vanilla Claude Code: Task) — the hint is pointless without one of these.
+_WS_SPAWN_TOOLS = {"Agent", "Task"}
+_WS_HINT_TEXT = ("[wirescope] Spawn directives like "
+                 "`[wirescope:omit claudemd,useremail]` at the head of a "
+                 "subagent's prompt trim its context; full grammar in "
+                 "WIRESCOPE.md.")
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
@@ -697,6 +712,34 @@ def _ws_strip_spawn_directives(obj):
         return None
     b["text"] = new
     return {"stripped": n}
+
+
+def _ws_spawner_hint(obj):
+    """Inject the constant one-line spawner discovery hint (WS_SPAWNER_HINT, see
+    above) as a TRAILING system block — appended after the last system block, so
+    it lands past the system cache breakpoint: stable position, busts nothing
+    before it, ~tiny uncached tail. Gated to spawner requests only (not a
+    subagent; carries a spawn tool). Idempotent (won't double-inject). Returns
+    {injected:True} or None. Default OFF — this is the lone wire-visible
+    proxy-authored text in the whole protocol."""
+    if not WS_SPAWNER_HINT:
+        return None
+    if writer_mod._billing_is_subagent(obj):       # never teach a subagent
+        return None
+    tools = obj.get("tools")
+    if not isinstance(tools, list):
+        return None
+    names = {t.get("name") for t in tools if isinstance(t, dict)}
+    if not (names & _WS_SPAWN_TOOLS):              # can't spawn -> hint is noise
+        return None
+    sys = obj.get("system")
+    if not isinstance(sys, list):                  # only the list-form system
+        return None
+    if any(isinstance(b, dict) and isinstance(b.get("text"), str)
+           and "[wirescope] " in b["text"] for b in sys):
+        return None                                # already present (idempotent)
+    sys.append({"type": "text", "text": _WS_HINT_TEXT})
+    return {"injected": True}
 
 
 # ---- TOOL SORT (experimental, off by default) -----------------------------

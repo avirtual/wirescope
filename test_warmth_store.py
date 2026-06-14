@@ -929,6 +929,34 @@ check("a [wirescope:keep] cancels the operator default (precedence keep > operat
 lp.transforms.WS_OMIT_DEFAULT = _save_omit_default
 lp.transforms.WS_OMIT = False
 
+# --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --
+# The one place wirescope adds proxy-authored visible text: a constant one-line
+# pointer, only for a main agent that can actually spawn (Agent/Task tool), never
+# a subagent, default off.
+_save_hint = lp.transforms.WS_SPAWNER_HINT
+lp.transforms.WS_SPAWNER_HINT = True
+def _spawner_obj(tools=("Agent", "Read"), sysflag="You are Claude Code"):
+    return {"system": [{"type": "text", "text": sysflag}],
+            "tools": [{"name": n} for n in tools],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
+_hobj = _spawner_obj()
+_hres = lp.transforms._ws_spawner_hint(_hobj)
+check("spawner hint appends a trailing system block for a main agent with a spawn tool",
+      _hres and _hres["injected"] and "[wirescope]" in _hobj["system"][-1]["text"]
+      and len(_hobj["system"]) == 2)
+check("spawner hint is idempotent (second pass no-ops, no duplicate block)",
+      lp.transforms._ws_spawner_hint(_hobj) is None and len(_hobj["system"]) == 2)
+check("spawn tool 'Task' (vanilla Claude Code) also triggers the hint",
+      lp.transforms._ws_spawner_hint(_spawner_obj(tools=("Task", "Read"))) is not None)
+check("no hint for a main agent WITHOUT a spawn tool (Agent/Task absent)",
+      lp.transforms._ws_spawner_hint(_spawner_obj(tools=("Read", "Bash"))) is None)
+check("no hint for a subagent (cc_is_subagent), even with a spawn tool",
+      lp.transforms._ws_spawner_hint(_spawner_obj(sysflag="cc_is_subagent=true")) is None)
+lp.transforms.WS_SPAWNER_HINT = False
+check("spawner hint is off by default -> no-op",
+      lp.transforms._ws_spawner_hint(_spawner_obj()) is None)
+lp.transforms.WS_SPAWNER_HINT = _save_hint
+
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
 # "Claude Code" — without the header flag it used to be mislabeled "parent" and

@@ -130,6 +130,22 @@ The model never sees them, and they cost **zero** prefix tokens.
 The strip of body directives is unconditional (the proxy always consumes its own control lines); the spawn strip is gated with the spawn read.
 Both are deterministic, so the forwarded prefix stays cache-constant.
 
+## Discovery — the spawner hint (`WS_SPAWNER_HINT`, the one visible exception)
+
+Everywhere above, wirescope is invisible: the proxy reads directives and strips them so the model never sees them.
+There is **one** opt-in exception, for discoverability — so a spawner learns the syntax with no skill or config.
+
+When `WS_SPAWNER_HINT` is enabled, the proxy appends a **single constant line** pointing at this doc — but only to a **spawner's** request:
+- a **main/parent** line (not a subagent — gated on the `cc_is_subagent` billing-header flag), and
+- one that **actually carries a subagent-spawn tool** (`Agent` / `Task`) — an agent that can't spawn never sees it.
+
+So the hint reaches exactly the agents that can use it, and **never a subagent** (they stay pristine).
+It's a tiny *pointer*, not the grammar; a **constant string at a stable position** (a trailing system block, after the cache breakpoint), so it re-anchors the prefix once and then rides the cache — it busts nothing before it.
+
+This is the lone place wirescope puts proxy-authored, model-visible text on the wire.
+Note the direction: it's proxy→model *output* (a capability advertisement), not author→proxy *input*, so it doesn't expose any directive — but it does add visible text + a little cost, which is why it's **operator opt-in and default OFF**.
+A consumer sees whether it's on via `capabilities.wirescope.spawner_hint`.
+
 ## Cache & correctness semantics
 
 - **System prefix untouched (net).** The only system-body change is the *removal* of body directive lines; deterministic per type, so spawns of one agent still share a system prefix. `messages[0]` (where `omit` and the spawn strip act) sits *after* the system/tools cache breakpoints, so a change there never busts the expensive prefix.
@@ -154,8 +170,9 @@ v1.
 - `keep` — live, the per-target override verb.
 - **spawn-position directives** — capability-gated by `WS_SPAWN_DIRECTIVES` (default on; `=0` disables message-content parsing entirely).
 - **operator default policy** — `WS_OMIT_DEFAULT` (comma list; default empty/off); strips those targets from every subagent spawn, keep-overridable.
+- **spawner discovery hint** — `WS_SPAWNER_HINT` (default off); the one model-visible line, injected only into spawn-capable main agents, never subagents.
 
 Safety is the **fail-safe miss**: a requested section that isn't found (unknown token or `<system-reminder>` format drift) is logged and skipped, never over-stripped.
 A proactive canary fingerprint of the reminder heading structure (alerting on drift even when no `omit` is requested) is a planned follow-up.
 
-`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn, omit_default}` so a consumer can feature-detect before relying on any of it (`omit_default` is the operator's active list — what's already stripped for you).
+`/_identity` advertises `protocols.wirescope = 1` and `capabilities.wirescope = {agent_name, omit, replace, keep, spawn, omit_default, spawner_hint}` so a consumer can feature-detect before relying on any of it (`omit_default` is the operator's active list — what's already stripped for you; `spawner_hint` is whether the discovery line is on).

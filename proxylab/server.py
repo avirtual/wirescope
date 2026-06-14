@@ -475,6 +475,12 @@ async def handler(request: Request) -> Response:
             if wstrs:
                 record["ws_strip_spawn"] = wstrs
                 changed = True
+            # WIRESCOPE: optional spawner discovery hint (operator opt-in, the
+            # one model-visible proxy-authored line; spawner-only, Agent/Task-gated).
+            whint = transforms_mod._ws_spawner_hint(obj)
+            if whint:
+                record["ws_spawner_hint"] = whint
+                changed = True
             # Tool sort: alphabetize tools[] for a byte-stable first cache segment.
             srt = transforms_mod._sort_tools(obj)
             if srt:
