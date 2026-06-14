@@ -514,9 +514,9 @@ WS_OMIT = os.environ.get("WS_OMIT", "1") not in ("0", "no", "off", "false")
 # body/spawn directives). Rule of thumb: "if you'd ever want it kept, it doesn't
 # belong in omit_default." (keep-override is the safety valve for rare misses,
 # not a license to put strategic targets in the blanket default.)
-WS_OMIT_DEFAULT = [t.strip().lower()
-                   for t in os.environ.get("WS_OMIT_DEFAULT", "").split(",")
-                   if t.strip()]
+WS_OMIT_DEFAULT = [t.lower() for t in
+                   re.split(r"[,\s]+", os.environ.get("WS_OMIT_DEFAULT", "").strip())
+                   if t]                          # liberal: commas and/or whitespace
 # Spawner discovery hint (WIRESCOPE.md): the ONE place wirescope puts
 # proxy-authored MODEL-VISIBLE text on the wire (everywhere else it strips its
 # own directives). A small constant SELF-CONTAINED grammar block (the recipient
@@ -549,11 +549,12 @@ _WS_HINT_TEXT = (
     "  [wirescope:agent-name <label>]   improves traceability in logs and "
     "dashboards; costs nothing.\n"
     "\n"
-    "Optional, apply per your own strategy — shape inherited context:\n"
-    "  [wirescope:omit <targets>]            drop inherited context sections\n"
-    "  [wirescope:keep <targets>]            cancel an omit (e.g. an operator "
+    "Optional, apply per your own strategy — shape inherited context "
+    "(targets are comma- or space-separated):\n"
+    "  [wirescope:omit claudemd,useremail]   drop inherited context sections\n"
+    "  [wirescope:keep claudemd]             cancel an omit (e.g. an operator "
     "default)\n"
-    "  [wirescope:replace <target> <text>]   keep the section, swap in a "
+    "  [wirescope:replace claudemd <text>]   keep the section, swap in a "
     "one-line body\n"
     "Targets: claudemd, useremail. Some may already be stripped by an operator "
     "default.")
@@ -598,8 +599,13 @@ def _ws_replace_reminder_section(text, hdr, new_body):
 
 
 def _ws_omit_target_list(value):
-    """Parse a comma-separated `omit`/`keep` value into a lowercased token list."""
-    return [t.strip().lower() for t in (value or "").split(",") if t.strip()]
+    """Parse an `omit`/`keep` value into a lowercased token list. LIBERAL
+    separator (Postel's law): commas and/or whitespace, so `claudemd,useremail`,
+    `claudemd, useremail`, and `claudemd useremail` are all equivalent. An agent
+    that discovered the syntax from the spawner hint tends to write
+    space-separated targets — the most natural naive form must parse, or a
+    correctly-intentioned omit silently no-ops (real catch, 2026-06-14)."""
+    return [t.lower() for t in re.split(r"[,\s]+", (value or "").strip()) if t]
 
 
 def _ws_resolve_actions(pairs):

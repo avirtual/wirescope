@@ -899,6 +899,22 @@ check("action resolver: replace beats omit, keep cancels (per source order)",
       lp.transforms._ws_resolve_actions(
           [("omit", "claudemd"), ("replace", "claudemd LEAN"), ("keep", "useremail")])
       == {"claudemd": ("replace", "LEAN")})
+# Liberal separator (Postel's law): a hint-discovered agent naturally writes
+# SPACE-separated targets; comma / space / comma+space must all parse the same
+# (real catch 2026-06-14: space form silently no-op'd a correct omit).
+check("omit target list: space-separated parses (the naive form)",
+      lp.transforms._ws_omit_target_list("claudemd useremail") == ["claudemd", "useremail"])
+check("omit target list: comma, comma+space, and mixed whitespace all equivalent",
+      lp.transforms._ws_omit_target_list("claudemd,useremail")
+      == lp.transforms._ws_omit_target_list("claudemd, useremail")
+      == lp.transforms._ws_omit_target_list("  claudemd   useremail ")
+      == ["claudemd", "useremail"])
+check("space-separated omit actually strips both sections (end to end)",
+      (lambda r: r is not None and set(r["omitted"]) == {"claudemd", "useremail"})(
+          lp.transforms._ws_omit({"system": [{"type": "text",
+              "text": _cbh + "[wirescope:omit claudemd useremail]\nYou are a probe"}],
+              "messages": [{"role": "user", "content": [
+                  {"type": "text", "text": _reminder}]}]})))
 lp.transforms.WS_OMIT = False
 check("replace is gated by WS_OMIT too (off -> no-op)",
       lp.transforms._ws_omit(_spawn_obj("[wirescope:replace claudemd X]\nx")) is None)

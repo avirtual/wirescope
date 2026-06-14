@@ -19,7 +19,7 @@ If you author `.claude/agents/*.md` files (or spawn agents through the proxy), t
 ```
 
 - `<directive>` — lowercase, `[a-z][a-z0-9-]*`.
-- `<value>` — everything up to the closing `]`, trimmed. Lists are comma-separated (whitespace around items ignored).
+- `<value>` — everything up to the closing `]`, trimmed. Lists (e.g. `omit`/`keep` targets) are **comma- and/or whitespace-separated** — `claudemd,useremail`, `claudemd, useremail`, and `claudemd useremail` are all equivalent (liberal parse, so the most natural naive syntax works).
 - One directive per line.
 - **Unknown directives are ignored** (logged once). A newer directive on an older proxy degrades to a no-op — additive forever, never a hard break.
 - Absent directive ⇒ unchanged behavior. Everything here is opt-in.
