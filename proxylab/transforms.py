@@ -563,6 +563,35 @@ def _ws_omit(obj):
             "chars_removed": chars, "requested": requested}
 
 
+def _ws_strip_directives(obj):
+    """Remove every `[ws:...]` directive from the system text blocks before
+    forwarding. The proxy has already READ and ACTED on them (agent-name captured
+    for display, omit applied to messages[0]); they are proxy control lines, so
+    the MODEL must never see them and they shouldn't cost prefix tokens. Always
+    runs (not WS_OMIT-gated) — the proxy consumes its own directives regardless of
+    whether a given verb is honored. Deterministic per agent type, so the stripped
+    system prefix stays cache-constant (and equals the no-directive body). Returns
+    {stripped, blocks} or None. Whitespace left behind is lightly tidied."""
+    sys = obj.get("system")
+    total, blocks = 0, []
+    if isinstance(sys, list):
+        for bi, b in enumerate(sys):
+            if not (isinstance(b, dict) and isinstance(b.get("text"), str)
+                    and "[ws:" in b["text"]):
+                continue
+            new, n = writer_mod._WS_DIRECTIVE_RE.subn("", b["text"])
+            if n:
+                b["text"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
+                total += n
+                blocks.append(bi)
+    elif isinstance(sys, str) and "[ws:" in sys:
+        new, n = writer_mod._WS_DIRECTIVE_RE.subn("", sys)
+        if n:
+            obj["system"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
+            total, blocks = n, [0]
+    return {"stripped": total, "blocks": blocks} if total else None
+
+
 # ---- TOOL SORT (experimental, off by default) -----------------------------
 # Alphabetically sort body.tools by name. Tools are logically FIRST in the cache
 # order (cached under MARKER 1), so a STABLE order makes that segment byte-stable

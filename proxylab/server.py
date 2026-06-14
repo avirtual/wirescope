@@ -408,6 +408,7 @@ async def handler(request: Request) -> Response:
             if cres is not None:
                 record["canary"] = cres
         # EXPERIMENTAL piggyback: mutate the outbound payload, forward modified bytes
+        ws_display_name = None     # captured pre-strip below; passed to meta
         if obj:
             changed = False
             appended, reason = transforms_mod._decide_injection(obj)
@@ -458,6 +459,15 @@ async def handler(request: Request) -> Response:
                 record["ws_omit"] = wso
                 if wso.get("omitted"):
                     changed = True
+            # WIRESCOPE: capture the display name BEFORE removing the directives,
+            # then strip every [ws:...] line from system so the model never sees
+            # our control lines (and they cost no prefix tokens). Strip is
+            # unconditional; the name is forwarded to meta below.
+            ws_display_name = writer_mod._subagent_marker_name(obj)
+            wstr = transforms_mod._ws_strip_directives(obj)
+            if wstr:
+                record["ws_strip"] = wstr
+                changed = True
             # Tool sort: alphabetize tools[] for a byte-stable first cache segment.
             srt = transforms_mod._sort_tools(obj)
             if srt:
@@ -517,7 +527,8 @@ async def handler(request: Request) -> Response:
             meta_mod._capture_session_meta(session_id, obj, model,
                                            agent=(agent if m else None),
                                            role=role, title_call=title_call,
-                                           agent_id=agent_id)
+                                           agent_id=agent_id,
+                                           display_name=ws_display_name)
             # heaviness snapshot from the model-visible history (main line
             # only: a subagent's small history must not clobber the parent's)
             if session_id and not title_call and role in ("parent", "unknown"):

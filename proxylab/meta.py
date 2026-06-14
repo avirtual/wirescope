@@ -241,7 +241,8 @@ _SUBAGENTS = {}
 _SUBAGENT_LAST_REQ = {}
 
 
-def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None):
+def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None,
+                   display_name=None):
     """Record one subagent turn under its parent session (never touches the
     parent's own identity row). Keyed by INSTANCE — the x-claude-code-agent-id
     header when the wire carries one (present iff subagent, distinct per spawn,
@@ -254,8 +255,11 @@ def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None):
         return
     now = now or time.time()
     key = agent_id or role
-    # opt-in human label declared in the agent body via `[agent: <name>]`
-    name = writer_mod._subagent_marker_name(obj) if isinstance(obj, dict) else None
+    # opt-in label from `[ws:agent-name <name>]`. The server resolves it from the
+    # pre-strip body and passes it in (the directives are stripped before meta
+    # sees obj); fall back to parsing obj directly for callers that don't (tests).
+    name = display_name if display_name is not None else (
+        writer_mod._subagent_marker_name(obj) if isinstance(obj, dict) else None)
     roles = _SUBAGENTS.setdefault(session_id, {})
     e = roles.get(key)
     if e is None:
@@ -292,7 +296,7 @@ def _subagents_snapshot(session_id):
 
 
 def _capture_session_meta(session_id, obj, model, agent=None, role=None,
-                          title_call=False, agent_id=None):
+                          title_call=False, agent_id=None, display_name=None):
     """Per-request meta hook (handler, post-parse). The MAIN LINE (the parent
     agent, role parent/unknown, not a title side-call) owns the durable identity
     row: it bumps last_seen + model and hunts the cwd. A SUBAGENT turn (Plan/
@@ -306,7 +310,8 @@ def _capture_session_meta(session_id, obj, model, agent=None, role=None,
     pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
     if title_call or writer_mod._is_subagent_role(role):
         if writer_mod._is_subagent_role(role):
-            _note_subagent(session_id, role, model, obj=obj, agent_id=agent_id)
+            _note_subagent(session_id, role, model, obj=obj, agent_id=agent_id,
+                           display_name=display_name)
         # last_seen only (model/cwd left untouched -> COALESCE keeps the parent's)
         writer_mod._enqueue_meta(session_id, agent=agent)
         return

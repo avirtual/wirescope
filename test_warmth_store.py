@@ -786,6 +786,33 @@ check("unknown omit target is a safe logged miss (no strip)",
       miss is not None and miss["omitted"] == [] and miss["missed"] == ["bogus"])
 lp.transforms.WS_OMIT = False        # restore default for any later checks
 
+# --- directives are stripped from system before forwarding (no model exposure) ----
+def _dir_obj():
+    return {"system": [{"type": "text", "text": "hdr"},
+                       {"type": "text", "text":
+                        "[ws:agent-name probe-zeta]\n[ws:omit claudemd]\nYou are probe-zeta, a probe."}]}
+d1 = _dir_obj()
+sres = lp.transforms._ws_strip_directives(d1)
+sys2 = d1["system"][1]["text"]
+check("strip removes every [ws:...] line from system, leaves the prose",
+      sres and sres["stripped"] == 2 and "[ws:" not in sys2
+      and "You are probe-zeta" in sys2)
+check("strip is deterministic (same input -> identical bytes; cache-constant)",
+      (lambda a, b: (lp.transforms._ws_strip_directives(a), lp.transforms._ws_strip_directives(b),
+       a["system"][1]["text"] == b["system"][1]["text"])[2])(_dir_obj(), _dir_obj()))
+check("nothing to strip -> None (no-op on a directive-free body)",
+      lp.transforms._ws_strip_directives({"system": [{"type": "text", "text": "plain"}]}) is None)
+# the display name still lands even when the server passes it pre-strip and the
+# obj meta sees is already stripped (simulates the real server ordering)
+zsid = "5fb9eba7-2222-3333-4444-555555555555"
+stripped_obj = _dir_obj(); lp.transforms._ws_strip_directives(stripped_obj)
+lp._capture_session_meta(zsid, stripped_obj, "claude-opus-4-8", role="subagent",
+                         agent_id="aZ00", display_name="probe-zeta")
+lp._WRITE_Q.join()
+zsub = (lp._status_snapshot(session=zsid)["sessions"][0].get("sub_agents") or [{}])[0]
+check("display_name from the pre-strip server param survives a stripped obj",
+      zsub.get("display_name") == "probe-zeta")
+
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
 # "Claude Code" — without the header flag it used to be mislabeled "parent" and

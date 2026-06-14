@@ -63,9 +63,15 @@ Strip the named context sections from the **first user message** (`messages[0]`)
 
 New targets are added here; an unknown target is ignored (logged), not an error.
 
+## Directives are consumed, not forwarded
+
+The proxy reads and acts on directives, then **strips every `[ws:...]` line out of the system prompt before forwarding upstream**.
+The model never sees them, and they cost **zero** prefix tokens — the forwarded system body is identical to one that never carried a directive.
+The strip is unconditional (it runs even where a verb like `omit` is disabled — the proxy always consumes its own control lines) and deterministic per agent type, so the stripped system prefix stays cache-constant.
+
 ## Cache & correctness semantics
 
-- **System prefix untouched.** `messages[0]` sits *after* the system/tools cache breakpoints, so an `omit` strip never busts the expensive prefix.
+- **System prefix untouched (net).** The only system-body change is the *removal* of the directive lines; deterministic per type, so spawns of one agent still share a system prefix. `messages[0]` (where `omit` acts) sits *after* the system/tools cache breakpoints, so a strip there never busts the expensive prefix.
 - **Within-instance message cache stays coherent.** The strip is deterministic, so an instance's `messages[0]` is byte-stable across its turns.
 - **No transcript desync.** It's request-side and idempotent: the CLI rebuilds `messages[0]` locally from its own context each turn; the proxy simply re-applies the same strip in-flight. (Unlike response mutation, this leaves the client's transcript untouched.)
 - **The one invariant:** the strip must fire on every forwarded turn — guaranteed, because the directive rides `system[2]` on every turn.
