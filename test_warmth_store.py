@@ -716,6 +716,31 @@ cpage = lp._render_session_html(csid, lp._subagent_request(csid, "a9184c50c47de9
 check("per-instance page labels by role + agent-id, renders that instance's ctx",
       "<b>subagent" in cpage and "#a9184c5" in cpage and "PROBE-GAMMA-CTX" in cpage)
 
+# --- opt-in [agent: <name>] display label from the subagent body ------------------
+# The wire carries no agent name; an author surfaces one with an `[agent: NAME]`
+# sentinel in the .md body. Present -> shown; absent -> falls back to role.
+check("marker parses from body text; absent -> None",
+      lp._subagent_marker_name({"system": [{"type": "text",
+          "text": "blah [agent: probe-delta] You are probe-delta"}]}) == "probe-delta"
+      and lp._subagent_marker_name({"system": [{"type": "text", "text": "no marker here"}]}) is None)
+nsid = "5fb9eba7-eeee-ffff-0000-111111111111"
+lp._capture_session_meta(nsid,
+    {"system": [{"type": "text", "text": _cbh + "[agent: probe-delta]\nYou are probe-delta"}],
+     "messages": [{"role": "user", "content": "DELTA-CTX"}]},
+    "claude-opus-4-8", role="subagent", agent_id="ad00d00d00d00d00d")
+lp._WRITE_Q.join()
+snap_n = lp._status_snapshot(session=nsid)
+nsub = (snap_n["sessions"][0].get("sub_agents") or [{}])[0]
+check("display_name stored on the subagent entry from the marker",
+      nsub.get("display_name") == "probe-delta" and nsub.get("role") == "subagent")
+admin_n = lp._render_admin_html(snap_n, host="t:7800")
+check("admin shows the declared name as the link label, role dimmed beside it",
+      ">probe-delta</a>" in admin_n and "ad00d00d"[:8] in admin_n)
+npage = lp._render_session_html(nsid, lp._subagent_request(nsid, "ad00d00d00d00d00d"),
+                                snap_n, subrole="ad00d00d00d00d00d")
+check("per-instance page heads with the declared name + role chip",
+      "<b>probe-delta" in npage and "DELTA-CTX" in npage)
+
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------
 # A CUSTOM .claude/agents subagent matches no signature and its prose says
 # "Claude Code" — without the header flag it used to be mislabeled "parent" and

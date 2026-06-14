@@ -204,12 +204,15 @@ def _render_admin_html(snap, host="", show=60):
         resumeb = (f' <span class="badge warn" title="resumed from a cold cache '
                    f'{nres}× — each a full prefix re-write at the write premium">'
                    f'&#8635;{nres}</span>' if nres else "")
-        # Link per-instance (sub=<agent-id|role>); a short agent-id chip
+        # Link per-instance (sub=<agent-id|role>); prefer the author-declared
+        # [agent: <name>] label, fall back to role; a short agent-id chip
         # disambiguates concurrent same-role subagents at a glance.
         subline = "".join(
             f'<br><span class="subagent">&#8627; '
             f'<a href="/_session?session={e(sid)}&amp;sub={e(sa.get("key") or sa.get("role"))}">'
-            f'{e(sa.get("role"))}</a>'
+            f'{e(sa.get("display_name") or sa.get("role"))}</a>'
+            + (f' <span class="dim">{e(sa.get("role"))}</span>'
+               if sa.get("display_name") and sa.get("role") != sa.get("display_name") else "")
             + (f' <span class="dim">#{e((sa.get("agent_id") or "")[:8])}</span>'
                if sa.get("agent_id") else "")
             + f' <span class="dim">{e(writer_mod._short_model(sa.get("model")))}'
@@ -499,9 +502,11 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
         # label by the human role (the raw key may be an opaque agent-id hex).
         sub = next((sa for sa in (s.get("sub_agents") or [])
                     if sa.get("key") == subrole or sa.get("role") == subrole), {})
-        lbl = sub.get("role") or subrole
+        lbl = sub.get("display_name") or sub.get("role") or subrole
         aid = sub.get("agent_id")
-        lbl_html = e(lbl) + (f' <small class="dim">#{e(aid[:8])}</small>' if aid else "")
+        rolechip = (f' <small class="dim">{e(sub.get("role"))}</small>'
+                    if sub.get("display_name") and sub.get("role") != sub.get("display_name") else "")
+        lbl_html = e(lbl) + rolechip + (f' <small class="dim">#{e(aid[:8])}</small>' if aid else "")
         ptitle = s.get("title") or "(untitled)"
         head = (f'<h1>{e(ptitle)} <small>&#8627; <b>{lbl_html}</b></small> '
                 f'<small>· <code>{e(sid)}</code></small></h1>'

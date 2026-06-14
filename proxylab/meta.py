@@ -254,15 +254,18 @@ def _note_subagent(session_id, role, model, now=None, obj=None, agent_id=None):
         return
     now = now or time.time()
     key = agent_id or role
+    # opt-in human label declared in the agent body via `[agent: <name>]`
+    name = writer_mod._subagent_marker_name(obj) if isinstance(obj, dict) else None
     roles = _SUBAGENTS.setdefault(session_id, {})
     e = roles.get(key)
     if e is None:
         roles[key] = {"key": key, "role": role, "agent_id": agent_id,
-                      "model": model, "requests": 1, "last_seen": now,
-                      "first_seen": now}
+                      "display_name": name, "model": model, "requests": 1,
+                      "last_seen": now, "first_seen": now}
     else:
         e["model"] = model or e["model"]
         e["role"] = role or e.get("role")
+        e["display_name"] = name or e.get("display_name")   # sticky once seen
         e["requests"] += 1
         e["last_seen"] = now
     if isinstance(obj, dict):

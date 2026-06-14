@@ -185,6 +185,22 @@ def _billing_is_subagent(obj):
     return "cc_is_subagent=true" in _sys_text(obj)
 
 
+# Opt-in subagent display name. The CLI sends NO agent name/type on the wire
+# (verified in CLI source: frontmatter is dropped, only the .md BODY reaches
+# system[]); so the only way an author can surface a human label is to declare
+# it IN THE BODY. Convention: an `[agent: <name>]` sentinel anywhere in the
+# prompt. DISPLAY-GRADE ONLY — no gate reads this; absent -> the view falls back
+# to role + the per-instance agent-id.
+_SUBAGENT_NAME_RE = re.compile(r"\[agent:\s*([^\]\n]{1,64})\]", re.IGNORECASE)
+
+
+def _subagent_marker_name(obj):
+    """The author-declared `[agent: <name>]` label from the subagent's system
+    body, or None. First match wins; trimmed; len-capped by the regex."""
+    m = _SUBAGENT_NAME_RE.search(_sys_text(obj))
+    return m.group(1).strip() if m else None
+
+
 def _classify_role(obj):
     """Infer the agent role from the system-prompt signature, with the billing
     header's cc_is_subagent flag as the authoritative subagent backstop."""
