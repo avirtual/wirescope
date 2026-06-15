@@ -7,7 +7,9 @@ The push-feed event schema lives in its own deep-dive, [`SUBSCRIBERS.md`](./SUBS
 ## The deal
 
 wirescope sits transparently on the wire between an agent CLI (claude / codex) and the model backend.
-It forwards bytes verbatim — your traffic is unchanged — while observing what only the wire can see.
+It observes what only the wire can see; by default it **also applies a few deterministic, cache-coherent transforms** to the request (alphabetize `tools[]`, relocate the volatile `# Environment` block to the tail, an operator `omit` floor) plus any `[wirescope:…]` directives you opt into.
+Every transform is deterministic and flag-gated; run it with `WIRESCOPE_PASSTHROUGH=1` for a byte-for-byte forward (`capabilities.passthrough` tells you which mode a given deployment is in).
+Either way, observation never alters or blocks the byte path.
 In return for routing through it you get:
 
 - **the real per-turn bill** — priced usage from the response receipts (the CLI's own `total_cost_usd` under-reports);
@@ -28,15 +30,18 @@ Before you integrate, probe the proxy ROOT and check the product marker:
 
     { "product": "wirescope", "version": "...",
       "protocols": { "identity": 2, "subscribers": 1, "wirescope": 1 },
-      "capabilities": { "subscribers": true, "warmth": true, "ping": true,
+      "capabilities": { "passthrough": false, "subscribers": true,
+                        "warmth": true, "ping": true,
                         "hold": true, "stats": true, "session_view": true,
                         "codex": true,
                         "wirescope": { "agent_name": true, "omit": true,
                                        "replace": true, "keep": true,
-                                       "spawn": true,
+                                       "spawn": true, "strip_tools": true,
                                        "omit_default": ["useremail"],
-                                       "spawner_hint": true } },
+                                       "spawner_hint": false } },
       "endpoints": { ... }, "docs": "INTEGRATION.md" }
+
+`capabilities.passthrough` is `true` when the deployment runs with `WIRESCOPE_PASSTHROUGH=1` (verbatim forward, all transforms off); `false` means the default transforms + directives are active.
 
 - **Branch on `product == "wirescope"`.** A different proxy 404s `/_identity` or returns a body without these fields — don't attempt wirescope-specific calls.
 - `capabilities` are the **live** flags of *this* process (env can disable a subsystem). Gate every feature on them — e.g. only call `/_ping` when `ping` is true. `endpoints` tells you where each one lives.
@@ -101,13 +106,14 @@ The verbs:
 | `[wirescope:omit claudemd,useremail]` | Drop the `# claudeMd` / `# userEmail` sections from the first user message — reclaims tokens (claudeMd is usually the bulk) and reduces fable refusal-classifier hits. |
 | `[wirescope:replace claudemd <inline text>]` | Keep the section heading but swap its body for a one-line substitute (e.g. point the agent at a leaner doc). Single-line; for more, `omit` and write your own. |
 | `[wirescope:keep <targets>]` | Override verb — cancel an `omit`/`replace` a body default would apply (precedence: spawn > body). |
+| `[wirescope:tools Read,Glob]` | Allowlist a subagent's tool roster — the biggest per-turn lever (the ~33-tool / ~24k-token default that native `--tools` can't reach for a subagent). `strip-tools <names>` is the denylist variant, `keep-tools <names>` the override. Gated by `WS_STRIP_TOOLS`. |
 
 Example — spawn a stock `general-purpose` subagent but strip the project CLAUDE.md and email from *this* call:
 
     [wirescope:omit claudemd,useremail]
     Search the repo for all callers of foo() and summarize.
 
-**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0` or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`). It also carries two operator-configured fields:
+**Feature-detect before relying on it:** `capabilities.wirescope` (from `/_identity`) reports `{agent_name, omit, replace, keep, spawn, strip_tools}` as live booleans (a deployment can disable `omit`/`replace` via `WS_OMIT=0`, the tool-roster verbs via `WS_STRIP_TOOLS=0`, or spawn-position reading via `WS_SPAWN_DIRECTIVES=0`). It also carries two operator-configured fields:
 
 - `omit_default` — the list **already stripped from every subagent spawn** with no directive at all (e.g. `["useremail"]`). Check it before adding your own `omit`; the universal case may already be handled.
 - `spawner_hint` (bool) — when on, the proxy appends one self-contained line to spawn-capable **main** agents pointing them at this directive grammar. It's a discovery aid the *agent* sees, not something you call; if your app already teaches its agents the grammar you can ignore it.

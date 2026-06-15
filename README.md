@@ -2,7 +2,7 @@
 
 **A transparent, analytical forward-proxy for the Claude Code and Codex CLIs — that can also reshape the wire.**
 It sits between your agent CLI and the model backend, observing what only the wire can see (the real per-turn bill, prompt-cache warmth, refusals, the assistant's text as it streams) and, when you ask it to, **trimming the context the CLI sends** — stripping `CLAUDE.md` from a subagent, cutting a bloated tool roster, keeping a session's cache warm.
-Point a CLI at it with one environment variable. Observation is automatic and invisible; the payload-shaping is opt-in and deterministic.
+Point a CLI at it with one environment variable. Observation is automatic and invisible; the wire-reshaping is deterministic and flag-gated — a few cache-coherent transforms run by default, the `[wirescope:…]` directive shaping is opt-in, and `WIRESCOPE_PASSTHROUGH=1` turns all of it off for a byte-faithful forward.
 
 ```
    claude / codex CLI  ──►  wirescope (localhost)  ──►  api.anthropic.com
@@ -56,7 +56,7 @@ This is the namesake feature. You annotate **an agent's `.md` body** (a property
 
 Directives are read **only** from the system body or the strict head of a spawn's prompt — never from arbitrary message content, so they can't be forged downstream — and are **sticky per subagent instance** (they persist past turn 1). An operator can set a deployment-wide floor (`WS_OMIT_DEFAULT=useremail`), and a default-off **spawner hint** (`WS_SPAWNER_HINT`) can teach the syntax to spawn-capable agents on the wire. The full grammar, precedence, and cache semantics are in **[`WIRESCOPE.md`](./WIRESCOPE.md)**.
 
-> **It's deterministic, not verbatim.** Even with no directives, wirescope applies a few cache-coherent default transforms (alphabetize `tools[]`, relocate the volatile `# Environment` block to the tail, strip the `# Session-specific guidance` system section) — each deterministic so spawns of one agent still share a cached prefix. All of it is behind flags; set the kill-switches (`WS_OMIT=0`, `WS_STRIP_TOOLS=0`, `SORT_TOOLS=0`, `RELOCATE_ENV_TO_TAIL=0`, `STRIP_SYSTEM_SECTIONS=''`) for a byte-faithful forward.
+> **It's deterministic, not verbatim.** Even with no directives, wirescope applies a few cache-coherent default transforms (alphabetize `tools[]`, relocate the volatile `# Environment` block to the tail, strip the `# Session-specific guidance` system section) — each deterministic so instances of one agent still share a cached prefix. All of it is behind flags; run with **`WIRESCOPE_PASSTHROUGH=1`** for a byte-faithful forward (the single master switch — capture/billing/warmth still run), or flip individual kill-switches (`WS_OMIT=0`, `WS_STRIP_TOOLS=0`, `SORT_TOOLS=0`, `RELOCATE_ENV_TO_TAIL=0`, `STRIP_SYSTEM_SECTIONS=''`).
 
 ## Quick start
 
@@ -91,6 +91,15 @@ The proxy proves where the waste is; some of the fix is native CLI flags, and so
 - **Inline files with `@file`.** `@path` inlines the file *and* primes the read-state, so the model edits directly instead of spending a Read turn. Measured A/B: **−47.6% tokens, −16% USD, half the latency**.
 - **Replace the system prompt** with `--system-prompt-file` when you drive headless.
 - **Keep the cache warm** across idle gaps with `/_hold` / `/warm-cache` instead of paying a cold prefix write on the next turn.
+
+### Does it actually save anything? (reproducible proof)
+
+[`experiments/`](./experiments) is the receipts: an A/B harness that drives the same workload through wirescope and through a byte-verbatim `WIRESCOPE_PASSTHROUGH=1` control (same binary, zero code drift), and prices both from the real wire receipts. The honest findings, measured (sonnet):
+
+- **Subagent shaping is the robust win:** a realistic fan-out (omit `CLAUDE.md` + trim each subagent's tool roster) carried **−45%** context and cost **−21%** — the entire win is the subagent line, doing what no native flag can.
+- **The default main-line transforms pay off *across instances*, not within one session.** Their value is cross-instance prefix sharing: two worktrees of one project share the system prefix as a cheap read instead of each cold-writing it, and that recurs per ephemeral run / is kept warm collectively by a fleet. Within a single isolated session they're ~cost-neutral — so judge them by fleet economics, not one session.
+
+See [`experiments/README.md`](./experiments/README.md) for the methodology and the subtle why's (the model-specific cache thresholds, why passthrough is the honest control).
 
 ## Integrating a tool with the proxy
 
