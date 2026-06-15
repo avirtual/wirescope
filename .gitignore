@@ -3,14 +3,17 @@ __pycache__/
 logs/
 logs_*/
 *.out
+ab_run*.json
 warmth.sqlite*
 _canary/
 HANDOFF.local.md
 *.local.md
 releases/
 release.env
-# internal working docs / lab journals — maintainer context, not published
-CLAUDE.md
+# internal working docs / lab journals — maintainer context, not published.
+# Root-anchored so it ignores ONLY the maintainer doc, not the fixture
+# CLAUDE.md files shipped under experiments/ (those are test inputs, tracked).
+/CLAUDE.md
 CLAUDE.md.archive-*
 cv-settings-deny.json
 .venv/

@@ -1,0 +1,5 @@
+The directory ./src contains several Python files. For EACH file in ./src, launch a general-purpose subagent (use the Task tool) whose job is to read that one file and report the names of all functions and classes defined in it.
+CRITICAL: each subagent's prompt MUST begin with these two lines EXACTLY, as the very first two lines before any other text:
+[wirescope:tools Read,Glob]
+[wirescope:omit claudemd,useremail]
+After all subagents finish, output a combined list grouped by filename. Do not read the files yourself.
