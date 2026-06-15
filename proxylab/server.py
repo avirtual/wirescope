@@ -413,7 +413,10 @@ async def handler(request: Request) -> Response:
         # turns): threads into _ws_omit so a spawn directive remembered on turn 1
         # re-applies on continuation turns; reused for _capture_session_meta below.
         agent_id = request.headers.get("x-claude-code-agent-id")
-        if obj:
+        # PASSTHROUGH (A/B control arm): skip the entire mutation chain so the
+        # forwarded bytes equal the received bytes. Capture/billing/warmth below
+        # still run (they only read obj). One guard instead of N per-feature 0s.
+        if obj and not transforms_mod.PASSTHROUGH:
             changed = False
             appended, reason = transforms_mod._decide_injection(obj)
             if appended:

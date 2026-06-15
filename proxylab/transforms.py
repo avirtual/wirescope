@@ -23,6 +23,18 @@ from starlette.routing import Route
 from proxylab import warmth as warmth_mod
 from proxylab import writer as writer_mod
 
+# --- MASTER PASSTHROUGH (A/B CONTROL ARM) ------------------------------------
+# WIRESCOPE_PASSTHROUGH=1 turns this proxy into a provably byte-verbatim
+# forwarder: the server skips the ENTIRE request-mutation chain (inject /
+# shortcircuit / relocate / strip / wirescope omit+tools+hint / sort /
+# compact-strip / hold-echo), so the forwarded bytes equal the received bytes.
+# Capture, billing, warmth-ledger and the subscriber feed still run (they read,
+# never mutate). This is the CONTROL arm for measuring what wirescope's
+# transforms actually buy vs a transparent logging proxy — one flag instead of
+# a long list of per-feature 0s, so a new transform can't silently leak into
+# the control. Read live (PEP 562 shim) so it can be flipped per process.
+PASSTHROUGH = os.environ.get("WIRESCOPE_PASSTHROUGH", "") not in ("", "0", "false", "False")
+
 # --- EXPERIMENTAL: payload injection (OFF by default; observer mode is default) -
 # Two modes, both mutate the LAST user message of /v1/messages and forward the
 # MODIFIED bytes (tail-only edit => the cached prefix still hits; we re-encode

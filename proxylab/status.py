@@ -64,6 +64,10 @@ def _identity():
         # what THIS process can actually do right now (env flags can disable
         # subsystems) — a subscriber should gate features on these, not assume
         "capabilities": {
+            # A/B control arm: when true this port is a byte-verbatim forwarder
+            # (whole mutation chain skipped) — the experiment's CONTROL. Analyzers
+            # read this to label an arm without guessing from the env.
+            "passthrough": transforms_mod.PASSTHROUGH,
             "subscribers": subs_mod.SUBSCRIBERS,
             "warmth": warmth_mod.WARMTH_LEDGER,
             "ping": pinger_mod.WARMTH_PINGER,
