@@ -133,8 +133,14 @@ Wirescope's `RELOCATE_ENV_TO_TAIL` + `RELOCATE_CLAUDEMD_PATHSTAMP` peel `# Envir
 
 The single-agent / single-cwd A/B only ever sees the *one-time reshape cost* — that is the positive main line in the headline (+10.5% $ in steady state, +24% if you count the cold rep).
 It **cannot** see the payoff, which is instance 2..N reading the shared segment instead of cold-writing their own copy.
-This is the clodex pattern exactly: many agents, one project, different branches.
-The benefit compounds with the number of concurrent instances, which is why it's the headline benefit in practice even though our A/B can't price it.
+
+Don't under-read that payoff as "a one-time turn-1 saving." Its value scales with **(fleet size × restart/wake frequency)**, two ways (see `long-session/README.md` for the worked numbers):
+
+- **Ephemeral / recurring agents** (bug-fixers, PR reviewers, CI, event handlers) spawn a *fresh* agent per run, each restarting at turn 1 — so the saving **recurs every run**, and for short-lived agents turn-1 is most of their cost (measured: startup cost −76%, $0.0266→$0.0064; multiply by run count).
+- **Reactive / long-idle agents:** because the shared segment is *one warmth lineage* and TTL slides on every read, an active fleet collectively keeps the segment warm — a reactive agent waking after 90 min (past even the 1h TTL) finds it still hot, where stock's cwd-unique prefix would have expired and must cold-rewrite. Warmth becomes a shared fleet resource instead of a decaying private one.
+
+This is the clodex pattern, but far broader than "different branches": any system with many ephemeral or reactive agents over one project.
+The benefit compounds with instance count and restart frequency, which is why it's the headline benefit in practice even though our single-agent A/B can't price it.
 
 **Corollary (now measured — `long-session/`):** the main-line transforms' value is cross-instance, *not* within-session.
 A 14-turn single-cwd session shows the cumulative cost gap is essentially all turn-1 (the cross-instance warm-prefix read vs a stock cold write) and barely moves over 18 steps; after turn 1 the per-turn cost is ~neutral, the only steady saving being the small `strip-system-sections` trim (~156 tok/turn, ~2% of carriage).

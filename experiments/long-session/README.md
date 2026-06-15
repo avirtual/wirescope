@@ -49,6 +49,25 @@ Relocating `# Environment` is **per-turn cost-neutral within a session**: it mov
 - **The main-line transforms' value is cross-instance, full stop.** The −22% here is the *same* cross-worktree/cross-instance sharing from `../worktree-sharing/`, surfacing on turn 1 because treatment's system prefix is globally shared while every fresh stock cwd cold-writes its own. It is not a within-session effect.
 - **Implication for the warmth-gating question:** do **not** warmth-gate the main-line transforms per session. Their payoff *requires* the reshaped prefix to be byte-identical across instances; gating the reshape off when a given session's prefix looks cold would defeat the very sharing that is the entire benefit. The reshape is a one-time global cost, then shared. Leave them default-on.
 
+## What the cross-instance win is actually worth (don't under-read it)
+
+"All the gain is turn 1" sounds small, but turn-1 is the wrong axis to judge these transforms on. Two scenarios show why the value scales with **(fleet size × restart/wake frequency)**, not with session length:
+
+**1. Ephemeral / recurring agents — turn-1 is "per run," not "once."**
+An agentic system that fixes bugs, reviews PRs, or handles CI spawns a *fresh* ephemeral agent per run, and each one restarts at turn 1.
+The saving is not amortized away over a long life — it **recurs every run**, and for short-lived agents turn-1 *is* most of the total cost.
+The measured per-run startup cost dropped from **$0.02656 → $0.00642 (−76%)** here: treatment reads its shared ~5.5k-token prefix warm, stock cold-writes ~8k tokens of system prose for its fresh cwd.
+Multiply by the number of runs: at 10k bug-fix runs that is ~$200 saved purely on system-prefix cold-writes stock repeats every single time.
+The `../worktree-sharing/` probe *is* this measurement — "instance B" is literally "the next ephemeral agent."
+
+**2. Reactive / long-idle agents — shared warmth is a fleet resource, collectively maintained.**
+This follows from two things already established (not a fresh claim): the shared segment is **one warmth lineage** (the worktree probe: all treatment instances resolve to the *same* hash `aab31357`; stock instances are all unique), and **TTL slides on every read** (a hard fact in the project notes).
+So a segment shared by an active fleet has its TTL reset by *whichever* sibling touches it — it effectively never expires while the fleet is busy.
+A reactive agent that wakes after 90 minutes (past even the 1h TTL) finds its prefix **still warm because siblings kept it alive**; stock cannot do this, because each agent's cwd-unique prefix is touched by no one else and has expired, so it cold-rewrites on wake.
+Normalizing the prefix turns cache warmth from a *per-agent private asset that decays* into a *shared fleet resource that stays hot*.
+
+So the within-session finding ("no amortization") stands, but it is not the axis these transforms should be judged on. For ephemeral task-runners and event-driven reactors — the systems people are actually building — the cross-instance recurrence + collective warmth can dominate the bill.
+
 ## Caveat
 
 Treatment's turn-1 was warm because earlier runs (the worktree probe) had already warmed its cwd-independent prefix — which is exactly the realistic steady state for ongoing use, but means this run does not measure a *cold-start* single session.
