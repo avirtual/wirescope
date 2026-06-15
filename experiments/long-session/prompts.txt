@@ -1,0 +1,14 @@
+Read src/validator.py and list the functions and classes defined in it. Be brief.
+Read src/pricing.py and list the functions and classes defined in it. Be brief.
+Read src/promotions.py and list the functions and classes defined in it. Be brief.
+Read src/emitter.py and list the functions and classes defined in it. Be brief.
+Per CLAUDE.md, which processing stage is described as the hot path? One line.
+Across the four files you read, list every class name. One line.
+List every public function you saw (no leading underscore). One line.
+Per the conventions in CLAUDE.md, how is money represented? One line.
+What is the processing order of the stages, per the architecture section? One line.
+Which stage is described as order-dependent? One line.
+Name one convention that using a float for a price would violate. One line.
+Summarize what promotions.py does, in one sentence.
+Summarize what emitter.py does, in one sentence.
+Give a three-bullet summary of the whole orderflow project.

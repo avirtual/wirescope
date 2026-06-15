@@ -136,9 +136,10 @@ It **cannot** see the payoff, which is instance 2..N reading the shared segment 
 This is the clodex pattern exactly: many agents, one project, different branches.
 The benefit compounds with the number of concurrent instances, which is why it's the headline benefit in practice even though our A/B can't price it.
 
-**Corollary (open question):** on a *single short* session the main-line transforms (relocate/strip/sort) are net-negative — they bust the globally-warm vanilla prefix without enough reuse to amortize.
-Their value is precisely the cross-instance sharing above plus long-session amortization.
-Whether they should be warmth-gated or left default-on is a real decision, pending the worktree probe (next) and a long multi-turn measurement.
+**Corollary (now measured — `long-session/`):** the main-line transforms' value is cross-instance, *not* within-session.
+A 14-turn single-cwd session shows the cumulative cost gap is essentially all turn-1 (the cross-instance warm-prefix read vs a stock cold write) and barely moves over 18 steps; after turn 1 the per-turn cost is ~neutral, the only steady saving being the small `strip-system-sections` trim (~156 tok/turn, ~2% of carriage).
+There is no meaningful single-session amortization, and relocating `# Environment` is per-turn cost-neutral (it moves bytes to a tail message, doesn't remove them).
+**Decision it implies:** do *not* warmth-gate the main-line transforms per session — the payoff requires the reshaped prefix to be byte-identical across instances, so gating the reshape off would defeat the sharing that is the entire benefit. Leave them default-on (one-time global reshape, then shared).
 
 ## `worktree-sharing/` — the payoff finding 2's A/B can't price
 
@@ -148,9 +149,11 @@ Result (sonnet, real `claude -p`, 5 reps, deterministic — zero variance): unde
 Under wirescope the cwd is relocated to an uncached tail, the segments are byte-identical (same hash, and the *same* hash across all reps), and instance B *reads* 5,536 tokens instead of cold-writing them (writes just ~942; shared 5/5).
 That is the compounding cross-instance benefit a one-cwd A/B structurally cannot see.
 
-## What's not here yet
+## `long-session/` — the within-session question, answered
 
-- A long multi-turn main-session run to measure relocate amortization on one long-lived agent. *(optional)*
+The multi-turn single-cwd run (built; see `long-session/README.md`).
+It confirms the main-line transforms have **no meaningful within-session amortization**: the cumulative cost gap over 14 turns is essentially all turn-1 (cross-instance warmth), and per-turn cost is ~neutral after that.
+This is the experiment that closes the "should the main-line transforms be warmth-gated?" question — answer: no, leave them default-on, their value is cross-instance.
 
 ## File map
 
@@ -168,6 +171,11 @@ experiments/
     README.md                       <- finding 3 in detail + the result
     run.sh                          <- builds two worktrees, runs claude -p in each, prices it
     probe.py                        <- compares the system-segment hash + cache_read across worktrees
+  long-session/
+    README.md                       <- the within-session question (answered: no amortization)
+    run.sh                          <- drives a 14-turn resumed session through each arm
+    prompts.txt                     <- the fixed turn sequence
+    trajectory.py                   <- per-turn cumulative cost both arms + crossover
 ../ab_run.py                        <- the A-then-B rep driver (kept at repo root; general tool)
 ../ab_analyze.py                    <- the offline pricer over two corpora
 ```
