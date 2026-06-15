@@ -17,6 +17,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 FIXTURE="$HERE/../subagent-ab/fixtures/orderflow"   # reuse the realistic project
 
 MODEL="${MODEL:-claude-sonnet-4-6}"
+REPS="${REPS:-5}"
 A_PORT="${A_PORT:-7802}"; B_PORT="${B_PORT:-7803}"
 TREAT_URL="http://127.0.0.1:$A_PORT"; CTRL_URL="http://127.0.0.1:$B_PORT"
 TREAT_DIR="${TREAT_DIR:-$REPO/logs_ab_treat}"
@@ -38,17 +39,7 @@ EOF
   exit 1
 fi
 
-# --- build two worktrees of one project (same files, different cwd + branch) ---
-BASE="$(mktemp -d)"
-PROJ="$BASE/proj"; WTB="$BASE/wt-b"
-mkdir -p "$PROJ"
-cp -R "$FIXTURE"/. "$PROJ"/
-( cd "$PROJ"
-  git init -q && git add -A && git -c user.email=ab@x -c user.name=ab commit -qm init
-  git worktree add -q "$WTB" -b feature-b >/dev/null )
-echo ">> worktree A = $PROJ   (branch main)"
-echo ">> worktree B = $WTB    (branch feature-b)"
-echo ">> arms: treatment=$TREAT_URL control=$CTRL_URL  model=$MODEL"
+echo ">> arms: treatment=$TREAT_URL control=$CTRL_URL  model=$MODEL  reps=$REPS"
 
 # run one first-turn session in $cwd through $url; echo its session_id
 _run() {  # $1=url  $2=cwd
@@ -58,23 +49,29 @@ _run() {  # $1=url  $2=cwd
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('session_id',''))"
 }
 
-echo; echo ">> TREATMENT  A (warm) then B (share?) ..."
-T_A="$(_run "$TREAT_URL" "$PROJ")"; echo "   treat-A session=$T_A"
-T_B="$(_run "$TREAT_URL" "$WTB")";  echo "   treat-B session=$T_B"
-echo ">> CONTROL    A (warm) then B (share?) ..."
-C_A="$(_run "$CTRL_URL" "$PROJ")";  echo "   ctrl-A  session=$C_A"
-C_B="$(_run "$CTRL_URL" "$WTB")";   echo "   ctrl-B  session=$C_B"
+T_A=""; T_B=""; C_A=""; C_B=""        # comma-accumulated, rep-aligned for probe.py
+for rep in $(seq 1 "$REPS"); do
+  # fresh worktrees each rep (fresh cwds): same project, different cwd + branch.
+  BASE="$(mktemp -d)"; PROJ="$BASE/proj"; WTB="$BASE/wt-b"
+  mkdir -p "$PROJ"; cp -R "$FIXTURE"/. "$PROJ"/
+  ( cd "$PROJ"
+    git init -q && git add -A && git -c user.email=ab@x -c user.name=ab commit -qm init
+    git worktree add -q "$WTB" -b "feature-$rep" >/dev/null )
 
-if [ -z "$T_A$T_B$C_A$C_B" ] || [ -z "$T_B" ] || [ -z "$C_B" ]; then
-  echo "ERROR: a run did not return a session_id (claude failed?)." >&2
-  echo "worktrees left at $BASE for inspection." >&2
-  exit 1
-fi
+  echo ">> rep $rep/$REPS  (A=$PROJ  B=$WTB)"
+  ta="$(_run "$TREAT_URL" "$PROJ")"; tb="$(_run "$TREAT_URL" "$WTB")"
+  ca="$(_run "$CTRL_URL"  "$PROJ")"; cb="$(_run "$CTRL_URL"  "$WTB")"
+  if [ -z "$ta" ] || [ -z "$tb" ] || [ -z "$ca" ] || [ -z "$cb" ]; then
+    echo "ERROR rep $rep: a run returned no session_id (claude failed?)." >&2
+    rm -rf "$BASE"; exit 1
+  fi
+  echo "   treat A=$ta B=$tb | ctrl A=$ca B=$cb"
+  T_A="$T_A${T_A:+,}$ta"; T_B="$T_B${T_B:+,}$tb"
+  C_A="$C_A${C_A:+,}$ca"; C_B="$C_B${C_B:+,}$cb"
+  rm -rf "$BASE"                       # captures live in LOG_DIR by session_id; worktree not needed
+done
 
 echo
 python3 "$HERE/probe.py" \
   --treat-dir "$TREAT_DIR" --ctrl-dir "$CTRL_DIR" \
   --treat-a "$T_A" --treat-b "$T_B" --ctrl-a "$C_A" --ctrl-b "$C_B"
-
-echo
-echo ">> worktrees left at $BASE (temp dir; safe to rm -rf when done)."

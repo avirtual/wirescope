@@ -28,18 +28,23 @@ PORT=7803 LOG_DIR=logs_ab_ctrl  WIRESCOPE_PASSTHROUGH=1            ./start_proxy
 experiments/worktree-sharing/run.sh          # MODEL=… to vary; sonnet default
 ```
 
-## Result (sonnet, real `claude -p` first turns)
+## Result (sonnet, real `claude -p` first turns, 5 reps with fresh cwds each)
 
-| arm | system segment (hash · chars) | instance-B cache_read | instance-B cold write |
-|---|---|---|---|
-| **CONTROL** (stock bytes) | A `fccd7d16` · 13474 / B `893e2e87` · 13474 | 2,182 (tools only) | **8,004** |
-| **TREATMENT** (relocate) | A `aab31357` · 11812 / B `aab31357` · 11812 | **5,536** | 946 |
+| arm | system segment across the two worktrees | instance-B cache_read | instance-B cold write | shared |
+|---|---|---|---|---|
+| **CONTROL** (stock bytes) | A≠B every rep; all 10 hashes unique, all 13474 chars | 2,182 (tools only) | **~7,998** | 0/5 |
+| **TREATMENT** (relocate) | A=B every rep, *and* the same hash `aab31357` across all reps; 11812 chars | **5,536** | ~942 | 5/5 |
 
-The cleanest line in the whole experiment is the **control's two hashes: identical length (13474 chars), different value.**
-The two worktrees' system blocks differ by *nothing but the embedded cwd string* — and that alone busts the entire ~8k-token system write on the second instance.
-Under treatment the cwd is relocated to an uncached tail, so both worktrees produce the *same* system segment (`aab31357`) → instance B reads it (5,536) instead of cold-writing it (946 vs 8,004).
+The numbers are essentially a point mass — `cache_read` was 2,182 (control) and 5,536 (treatment) in *every* rep, zero variance.
 
-`env=relocated→tail` and `claudemd-stamp=normalized` in the treatment rows (vs `in system[]` / `abs-path` for control) confirm *why*: the volatile bits left the cached prefix.
+The cleanest line in the whole experiment is the **control's two system hashes: identical length (13474 chars), different value — in all 5 reps.**
+The two worktrees' system blocks differ by *nothing but the embedded cwd string*, and that alone busts the entire ~8k-token system write on the second instance.
+Under treatment the cwd is relocated to an uncached tail, so both worktrees produce the *same* segment (`aab31357`) → instance B reads it (5,536) instead of cold-writing it (~942 vs ~7,998).
+Note the treatment hash is identical *across reps too*: relocate makes the segment fully cwd-independent, so it's the same bytes every time and warm from the first instance onward — the cross-instance sharing thesis at its strongest.
+
+`env→tail` and `normalized` in the treatment rows (vs `env-in-sys` / `abs-path` for control) confirm *why*: the volatile bits left the cached prefix.
+
+Re-run with more reps via `REPS=N experiments/worktree-sharing/run.sh` (default 5).
 
 ## Why this matters more than the A/B headline
 

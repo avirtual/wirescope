@@ -144,8 +144,8 @@ Whether they should be warmth-gated or left default-on is a real decision, pendi
 
 The probe for finding 3 (built; see `worktree-sharing/README.md`).
 Two git worktrees of one project, the same agent in each, comparing the *second* instance's first-turn cache behaviour.
-Result (sonnet, real `claude -p`): under the stock control the two worktrees' system segments have **identical length but different hashes** — the cwd string alone busts the whole ~8k-token system write, so instance B cold-writes 8,004 tokens.
-Under wirescope the cwd is relocated to an uncached tail, the segments are byte-identical (same hash), and instance B *reads* 5,536 tokens instead of cold-writing them (writes just 946).
+Result (sonnet, real `claude -p`, 5 reps, deterministic — zero variance): under the stock control the two worktrees' system segments have **identical length but different hashes** in every rep — the cwd string alone busts the whole ~8k-token system write, so instance B cold-writes ~7,998 tokens (segment shared 0/5).
+Under wirescope the cwd is relocated to an uncached tail, the segments are byte-identical (same hash, and the *same* hash across all reps), and instance B *reads* 5,536 tokens instead of cold-writing them (writes just ~942; shared 5/5).
 That is the compounding cross-instance benefit a one-cwd A/B structurally cannot see.
 
 ## What's not here yet
