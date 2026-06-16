@@ -66,10 +66,16 @@ if [ -f release.env ]; then
 fi
 
 # Canonical defaults for flags that are off in code ("-" not ":-" so an
-# explicit empty/0 from the caller is respected):
+# explicit empty/0 from the caller — or a release.env line above — is respected):
 export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
 export WARMTH_BLOCK_COLD_PING="${WARMTH_BLOCK_COLD_PING-1}"
 export WARMTH_LOG_FILE="${WARMTH_LOG_FILE-1}"
+# Wirescope discoverability defaults: a fresh clone gets the spawner grammar hint
+# and the userEmail omit floor on, no release.env needed (code default stays OFF
+# so library embeddings/tests are unaffected — this is the canonical-proxy stance,
+# not a code-level behavior change). Override with WS_SPAWNER_HINT=0 / WS_OMIT_DEFAULT=.
+export WS_SPAWNER_HINT="${WS_SPAWNER_HINT-1}"
+export WS_OMIT_DEFAULT="${WS_OMIT_DEFAULT-useremail}"
 
 # Refuse to double-bind the port.
 if lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
