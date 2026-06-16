@@ -1939,6 +1939,34 @@ check("/_context _reminder_kind tolerant of the vanilla 'Task tool' variant",
       lp._reminder_kind("<system-reminder>\nAvailable agent types for the "
                         "Task tool:\n- x") == "agents")
 
+# opus-4-8 mid-conversation-system wire: the roster+skills arrive UNWRAPPED as a
+# trailing role:"system" message, BOTH lists concatenated in one block (string
+# content). Must still split agents|skills, never miss for lack of a wrapper.
+_AGENTS_TXT = "Available agent types for the Agent tool:\n- general-purpose: " + "A" * 500
+_SKILLS_TXT = "\nThe following skills are available for use with the Skill tool:\n- warm-cache: " + "S" * 200
+_opus_obj = {
+    "model": "claude-opus-4-8",
+    "system": [{"type": "text", "text": "AGENT PROMPT " * 10}],
+    "messages": [
+        {"role": "user", "content": "kick off"},
+        {"role": "system", "content": _AGENTS_TXT + _SKILLS_TXT},   # combined, string, unwrapped
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "by the way, Available agent types for the "
+             "Agent tool: is just something we were discussing"}]}]}   # decoy mid-text
+lp._LAST_REQUEST["sess-opus-1"] = {"obj": _opus_obj, "ts": 2200.0,
+                                   "headers": {}, "needs_auth": False}
+_oc = {c["category"]: c["tokens"] for c in
+       lp._context_snapshot("sess-opus-1")["agents"][0]["composition"]["by_category"]}
+check("/_context composition: unwrapped role:system roster splits agents|skills",
+      _oc.get("agents", 0) == len(_AGENTS_TXT) // 4
+      and _oc.get("skills", 0) == len(_SKILLS_TXT) // 4)
+check("/_context composition: decoy conversational mention stays assistant, not agents",
+      _oc.get("assistant", 0) > 0
+      and _oc["agents"] == len(_AGENTS_TXT) // 4)   # decoy NOT added to agents
+check("/_context _reminder_kind: unwrapped opener matches, mid-text does not",
+      lp._reminder_kind(_AGENTS_TXT) == "agents"
+      and lp._reminder_kind("blah Available agent types for the Agent tool: x") is None)
+
 # --- /_context utilization: per-tool used counts + deadweight (disk scan) -----
 # Write a small capture corpus for one session: main line (parent) loads
 # [Bash,Read,Edit]; a subagent instance (agent_id a1util) loads [Read,Glob].

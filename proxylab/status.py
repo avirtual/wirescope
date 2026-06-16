@@ -315,23 +315,38 @@ def _is_injected_reminder(text):
             or t.startswith("<local-command-"))
 
 
-# The CLI injects the agent roster and the skills list as their OWN
-# <system-reminder> blocks in messages[0], each led by a fixed line (verified
-# canonical over thousands of captures; tool word is Agent in clodex / Task in
-# vanilla CC, hence the \w+). Detecting them lets composition attribute their
-# carriage (~1k tok/turn) apart from the agent system prompt — and a consumer
-# can attach the matching trim lever (deny built-in agents / deny skills in
-# settings). Whole-block categories: the entire reminder is the roster/list.
+# The CLI injects the agent roster and the skills list as fixed-opener blocks,
+# detected by their canonical lead line (tool word is Agent in clodex / Task in
+# vanilla CC, hence the \w+). TWO wire shapes seen, BOTH must match:
+#   (old/sonnet) a <system-reminder>-wrapped block inside messages[0]
+#   (opus-4-8 mid-conversation-system beta) a trailing role:"system" message,
+#     UNWRAPPED — text starts directly with the opener, no <system-reminder>.
+# Hence the optional wrapper prefix. The match is ANCHORED to the block start
+# (^) on purpose: these exact strings also appear mid-text in tool-results and
+# assistant turns when an agent is *discussing* them — a substring match would
+# false-positive, the anchor won't. Detecting them lets composition attribute
+# their carriage (~1k tok/turn) apart from the agent system prompt, and a
+# consumer can attach a trim lever (deny built-in agents / skillOverrides off).
+# Whole-block categories: the entire block is the roster/list.
 _RE_REMINDER_AGENTS = re.compile(
-    r"^<system-reminder>\s*Available agent types for the \w+ tool:")
+    r"^(?:<system-reminder>\s*)?Available agent types for the \w+ tool:")
 _RE_REMINDER_SKILLS = re.compile(
-    r"^<system-reminder>\s*The following skills are available for use with the \w+ tool:")
+    r"^(?:<system-reminder>\s*)?The following skills are available for use with the \w+ tool:")
+# The opus-4-8 wire CONCATENATES the roster + skills list into ONE role:"system"
+# message (agents first, then the skills opener on its own line). This finds that
+# inner boundary so a combined block splits agents|skills (line-anchored: only a
+# real list opener, never a mid-sentence mention).
+_RE_SKILLS_LINE = re.compile(
+    r"(?m)^The following skills are available for use with the \w+ tool:")
 
 
 def _reminder_kind(text):
-    """Classify a <system-reminder> block: 'agents' (CLI agent roster), 'skills'
-    (CLI skills list), or None (the # claudeMd/# userEmail context bundle or any
-    other reminder/command expansion — handled by the generic split)."""
+    """Classify a context block by its anchored opener: 'agents' (CLI agent
+    roster), 'skills' (CLI skills list), or None (the # claudeMd/# userEmail
+    context bundle, any other reminder/command expansion, or genuine
+    conversation — all handled elsewhere). Matches both the <system-reminder>-
+    wrapped form (old wire, messages[0]) and the unwrapped trailing role:"system"
+    form (opus-4-8 mid-conversation-system beta)."""
     t = (text or "").lstrip()
     if _RE_REMINDER_AGENTS.match(t):
         return "agents"
@@ -384,16 +399,24 @@ def _composition(obj, total_tokens=None):
             bt = b.get("type")
             if bt == "text":
                 text = b.get("text") or ""
-                if _is_injected_reminder(text):
-                    kind = _reminder_kind(text)
-                    if kind:                       # whole-block agents/skills list
-                        chars[kind] += len(text)
+                kind = _reminder_kind(text)        # agents/skills, any wire shape
+                if kind == "agents":               # checked FIRST: the opus-4-8
+                    #  roster arrives unwrapped (not an injected-reminder) AND may
+                    #  carry the skills list appended in the same block -> split.
+                    m = _RE_SKILLS_LINE.search(text)
+                    if m:
+                        chars["agents"] += m.start()
+                        chars["skills"] += len(text) - m.start()
                     else:
-                        cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
-                        ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
-                        chars["claudemd"] += cm
-                        chars["useremail"] += ue
-                        chars["system"] += max(0, len(text) - cm - ue)
+                        chars["agents"] += len(text)
+                elif kind == "skills":
+                    chars["skills"] += len(text)
+                elif _is_injected_reminder(text):
+                    cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
+                    ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
+                    chars["claudemd"] += cm
+                    chars["useremail"] += ue
+                    chars["system"] += max(0, len(text) - cm - ue)
                 else:
                     chars["assistant" if role == "assistant" else "user"] += len(text)
             elif bt in ("thinking", "redacted_thinking"):
