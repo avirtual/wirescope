@@ -316,6 +316,32 @@ def _is_injected_reminder(text):
             or t.startswith("<local-command-"))
 
 
+def _reminder_section_chars(text, hdr):
+    """Char span of one CLI reminder section (# claudeMd / # userEmail /
+    # currentDate) for COMPOSITION SIZING — from its header to the NEXT reminder
+    header, else the LAST </system-reminder> (the structural close), else end.
+
+    Distinct from the forward-path strip helper on purpose: that one fail-safe
+    stops at the FIRST </system-reminder> so an `omit` never over-strips. But a
+    memory file (this very CLAUDE.md / HANDOFF) routinely QUOTES </system-reminder>
+    in its prose — the strip extent then truncates mid-content and the rest of the
+    block lands in the `system` bucket (the "system prompt 51k" miscount). Sizing
+    instead spans by reminder HEADERS (calibrated lowercase-camelCase, never a
+    Title-Case content heading) and falls back to the LAST close tag (rfind), so a
+    quoted </system-reminder> inside the body can't truncate the measurement. 0 if
+    the header is absent."""
+    m = re.search(r"(?m)^[ \t]*" + re.escape(hdr) + r"[ \t]*$", text)
+    if not m:
+        return 0
+    rest = text[m.end():]
+    nxt = re.search(transforms_mod._WS_SECTION_HDR_RE, rest)
+    if nxt:
+        return (m.end() + nxt.start()) - m.start()
+    close = rest.rfind("</system-reminder>")
+    end = m.end() + (close if close != -1 else len(rest))
+    return end - m.start()
+
+
 # The CLI injects the agent roster and the skills list as fixed-opener blocks,
 # detected by their canonical lead line (tool word is Agent in clodex / Task in
 # vanilla CC, hence the \w+). TWO wire shapes seen, BOTH must match:
@@ -488,8 +514,8 @@ def _composition(obj, total_tokens=None):
                 elif kind == "skills":
                     chars["skills"] += len(text)
                 elif _is_injected_reminder(text):
-                    cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
-                    ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
+                    cm = _reminder_section_chars(text, "# claudeMd")
+                    ue = _reminder_section_chars(text, "# userEmail")
                     chars["claudemd"] += cm
                     chars["useremail"] += ue
                     chars["system"] += max(0, len(text) - cm - ue)

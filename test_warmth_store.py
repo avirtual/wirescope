@@ -1967,6 +1967,37 @@ check("/_context _reminder_kind: unwrapped opener matches, mid-text does not",
       lp._reminder_kind(_AGENTS_TXT) == "agents"
       and lp._reminder_kind("blah Available agent types for the Agent tool: x") is None)
 
+# regression: a memory file (# claudeMd) whose body QUOTES </system-reminder> (as
+# this very CLAUDE.md / HANDOFF do — they document the wire format) must NOT
+# truncate the claudemd sizing at the quoted tag, else ~all of it spills into the
+# `system` bucket (the "System prompt 51k" miscount). Sizing spans by the next
+# reminder header, falling back to the LAST close tag, never the first.
+_qmem = ("# claudeMd\nContents of CLAUDE.md:\n"
+         "the docs here mention the literal </system-reminder> tag inline\n"
+         + "MEMORY " * 300)
+_quote_block = ("<system-reminder>\nAs you answer the user's questions:\n"
+                + _qmem + "\n# userEmail\nx@y.z\n</system-reminder>")
+_cm_start = _quote_block.index("# claudeMd")
+_ue_start = _quote_block.index("# userEmail")
+check("/_context: claudeMd section spans to the next reminder header, not a quoted close tag",
+      lp._reminder_section_chars(_quote_block, "# claudeMd") == _ue_start - _cm_start)
+_qobj = {"model": "claude-opus-4-8",
+         "system": [{"type": "text", "text": "SYS"}],
+         "messages": [{"role": "user", "content": [
+             {"type": "text", "text": _quote_block},
+             {"type": "text", "text": "real question"}]}]}
+_qc = {c["category"]: c["tokens"] for c in lp._composition(_qobj)["by_category"]}
+check("/_context composition: quoted </system-reminder> in # claudeMd doesn't leak into system",
+      _qc.get("claudemd", 0) >= len("MEMORY " * 300) // 4
+      and _qc.get("claudemd", 0) > _qc.get("system", 0))
+# the last-section fallback: a # claudeMd with NO following reminder header still
+# sizes to the real (last) </system-reminder>, not a quoted one in the body.
+_qlast = ("<system-reminder>\nintro\n# claudeMd\nbody quotes </system-reminder> "
+          "then keeps going " + "X" * 400 + "\n</system-reminder>")
+check("/_context: claudeMd last-section sizing uses the final close tag, not a quoted one",
+      lp._reminder_section_chars(_qlast, "# claudeMd")
+      == _qlast.rfind("</system-reminder>") - _qlast.index("# claudeMd"))
+
 # --- /_context utilization: per-tool used counts + deadweight (disk scan) -----
 # Write a small capture corpus for one session: main line (parent) loads
 # [Bash,Read,Edit]; a subagent instance (agent_id a1util) loads [Read,Glob].
