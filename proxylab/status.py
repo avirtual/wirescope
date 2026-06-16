@@ -75,6 +75,7 @@ def _identity():
             "stats": True,                # /_status is always served
             "session_view": True,         # /_session HTML
             "context_view": True,         # /_context tool-roster JSON
+            "context_composition": True,  # /_context per-category token breakdown
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -302,6 +303,95 @@ def _tool_roster(obj):
             "per_tool": per}
 
 
+def _is_injected_reminder(text):
+    """A user-role text block that is harness-injected context, NOT genuine user
+    prompt: the `<system-reminder>` bundle (carries # claudeMd / # userEmail /
+    # currentDate, plus our relocated env tail) and <command-*>/<local-command-*>
+    expansions. Bucketed apart from real `user` text so the composition reflects
+    what's actually a person's words vs auto-loaded context."""
+    t = (text or "").lstrip()
+    return (t.startswith("<system-reminder>") or t.startswith("<command-")
+            or t.startswith("<local-command-"))
+
+
+def _composition(obj, total_tokens=None):
+    """Token composition of ONE forwarded body, by category — 'what is taking up
+    the context window'. Generic vocabulary any consumer can render:
+    system / claudemd / useremail / tools / user / assistant / thinking /
+    tool_calls / tool_results (file reads & command output land in tool_results,
+    usually the bulk). claudemd & useremail are split out of the system-reminder
+    so a consumer can attach a real trim lever (the wirescope omit directives).
+
+    Sizing is char-based (len, /4 — same basis as _tool_roster/analyze_tools.py);
+    this is a READ-only endpoint computation, never on the forward path. When a
+    real receipt `total_tokens` is given (main line), categories are scaled to
+    sum to it (basis 'receipt') so the breakdown agrees with the wire-measured
+    window total; otherwise raw char-estimate (basis 'estimate'). None for an
+    openai/codex body or an empty one."""
+    if not isinstance(obj, dict) or codex_mod._is_openai_body(obj):
+        return None
+    chars = collections.defaultdict(int)
+    sysf = obj.get("system")
+    if isinstance(sysf, list):
+        for b in sysf:
+            if isinstance(b, dict):
+                chars["system"] += len(b.get("text") or "")
+    elif isinstance(sysf, str):
+        chars["system"] += len(sysf)
+    for t in (obj.get("tools") or []):
+        if isinstance(t, dict):
+            chars["tools"] += len(json.dumps(t, ensure_ascii=False))
+    for m in (obj.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        c = m.get("content")
+        blocks = (c if isinstance(c, list)
+                  else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                text = b.get("text") or ""
+                if _is_injected_reminder(text):
+                    cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
+                    ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
+                    chars["claudemd"] += cm
+                    chars["useremail"] += ue
+                    chars["system"] += max(0, len(text) - cm - ue)
+                else:
+                    chars["assistant" if role == "assistant" else "user"] += len(text)
+            elif bt in ("thinking", "redacted_thinking"):
+                chars["thinking"] += len(b.get("thinking") or b.get("data")
+                                         or json.dumps(b, ensure_ascii=False))
+            elif bt == "tool_use":
+                chars["tool_calls"] += len(json.dumps(b, ensure_ascii=False))
+            elif bt == "tool_result":
+                bc = b.get("content")
+                ln = (len(bc) if isinstance(bc, str)
+                      else sum(len(x.get("text") or "") for x in bc
+                               if isinstance(x, dict)) if isinstance(bc, list)
+                      else len(json.dumps(bc, ensure_ascii=False)) if bc is not None
+                      else 0)
+                chars["tool_results"] += ln
+    raw = {k: v // _CHARS_PER_TOK for k, v in chars.items() if v > 0}
+    raw_total = sum(raw.values())
+    if not raw_total:
+        return None
+    if total_tokens and total_tokens > 0:
+        basis, total = "receipt", total_tokens
+        cats = [{"category": k, "tokens": round(v * total_tokens / raw_total)}
+                for k, v in raw.items()]
+    else:
+        basis, total = "estimate", raw_total
+        cats = [{"category": k, "tokens": v} for k, v in raw.items()]
+    for c in cats:
+        c["pct"] = round(100.0 * c["tokens"] / total, 1) if total else 0.0
+    cats.sort(key=lambda x: x["tokens"], reverse=True)
+    return {"total_tokens": total, "basis": basis, "by_category": cats}
+
+
 def _context_snapshot(session):
     """`GET /_context?session=<id>`: the tool rosters loaded for a session,
     main/parent line and each subagent INSTANCE reported separately (they carry
@@ -316,13 +406,17 @@ def _context_snapshot(session):
         main = dict(main) if main else None     # shallow copy; obj read outside lock
     if main:
         obj = main.get("obj")
+        # main line carries a real usage receipt -> anchor the composition total
+        # to the wire-measured window size so it agrees with /_status.input_tokens
+        total = meta_mod._input_token_total(meta_mod._LAST_USAGE.get(session))
         agents.append({
             "line": "main", "role": "parent", "agent_id": None,
             "display_name": None,
             "model": (obj or {}).get("model") if isinstance(obj, dict) else None,
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": main.get("ts"),
-            "tools": _tool_roster(obj)})
+            "tools": _tool_roster(obj),
+            "composition": _composition(obj, total)})
     for s in meta_mod._subagent_request_objs(session):
         obj = s.get("obj")
         agents.append({
@@ -331,7 +425,8 @@ def _context_snapshot(session):
             "model": s.get("model"),
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": s.get("last_seen"),
-            "tools": _tool_roster(obj)})
+            "tools": _tool_roster(obj),
+            "composition": _composition(obj)})    # no sub receipt -> estimate
     note = None
     if not agents:
         note = ("no in-memory request for this session "

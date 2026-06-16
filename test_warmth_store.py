@@ -1861,8 +1861,55 @@ check("/_context openai/codex body -> wire=openai, tools=None",
 _idc = lp._identity()
 check("/_identity exposes /_context + context_view capability",
       _idc["endpoints"].get("context") == "/_context"
-      and _idc["capabilities"].get("context_view") is True)
+      and _idc["capabilities"].get("context_view") is True
+      and _idc["capabilities"].get("context_composition") is True)
+
+# --- /_context composition: per-category token breakdown ---------------------
+_comp_obj = {
+    "model": "claude-opus-4-8",
+    "system": [{"type": "text", "text": "AGENT PROMPT " * 20}],   # ~260 chars
+    "tools": [{"name": "Bash", "description": "x" * 100}],
+    "messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>\n# claudeMd\n"
+                + "C" * 800 + "\n# userEmail\n" + "E" * 40
+                + "\n# currentDate\ntoday\n</system-reminder>"},
+            {"type": "text", "text": "what is the real question"}]},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "T" * 120},
+            {"type": "text", "text": "an answer"},
+            {"type": "tool_use", "name": "Bash", "input": {"cmd": "ls"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "content": "R" * 4000}]}]}
+lp._LAST_REQUEST["sess-comp-1"] = {"obj": _comp_obj, "ts": 2000.0,
+                                   "headers": {}, "needs_auth": False}
+lp._LAST_USAGE["sess-comp-1"] = {"cache_read_input_tokens": 1000}   # receipt total
+_cp = lp._context_snapshot("sess-comp-1")["agents"][0]["composition"]
+_cats = {c["category"]: c["tokens"] for c in _cp["by_category"]}
+check("/_context composition: receipt basis scaled to the real total",
+      _cp["basis"] == "receipt" and _cp["total_tokens"] == 1000
+      and abs(sum(_cats.values()) - 1000) <= len(_cats))   # rounding slack
+check("/_context composition: claudemd + useremail split out of system-reminder",
+      "claudemd" in _cats and "useremail" in _cats
+      and _cats["claudemd"] > _cats["useremail"])
+check("/_context composition: tool_results captured + biggest-first ordering",
+      "tool_results" in _cats
+      and _cp["by_category"] == sorted(_cp["by_category"],
+                                       key=lambda x: x["tokens"], reverse=True)
+      and all(set(c) == {"category", "tokens", "pct"} for c in _cp["by_category"]))
+check("/_context composition: real user prompt not miscounted as reminder",
+      "user" in _cats and "assistant" in _cats and "thinking" in _cats
+      and "tool_calls" in _cats)
+# estimate basis when there's no receipt (the subagent path)
+_cp_est = lp._composition(_comp_obj)
+check("/_context composition: estimate basis sums raw char-est, no receipt",
+      _cp_est["basis"] == "estimate"
+      and _cp_est["total_tokens"] == sum(c["tokens"] for c in _cp_est["by_category"]))
+check("/_context composition: None for openai/codex body",
+      lp._composition({"input": [], "instructions": "hi"}) is None)
+del lp._LAST_USAGE["sess-comp-1"]
 del lp._LAST_REQUEST["sess-ctx-1"], lp._LAST_REQUEST["sess-ctx-cdx"]
+del lp._LAST_REQUEST["sess-comp-1"]
 
 print()
 if FAILS:
