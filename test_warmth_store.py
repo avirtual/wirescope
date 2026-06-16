@@ -2192,6 +2192,121 @@ del lp._LAST_USAGE["sess-comp-1"]
 del lp._LAST_REQUEST["sess-ctx-1"], lp._LAST_REQUEST["sess-ctx-cdx"]
 del lp._LAST_REQUEST["sess-comp-1"]
 
+# --- /_report: per-session cost/efficiency report (report.py) ----------------
+_rep_dir = os.path.join(os.environ["LOG_DIR"], "sess-report-1")
+os.makedirs(_rep_dir, exist_ok=True)
+_REP_RATES = lp.PRICES["claude-opus-4-8"]   # in5 out25 cr0.5 cw5m6.25 cw1h10
+
+
+def _rep_usd(tk):
+    return round(tk.get("input_tokens", 0) * _REP_RATES["in"] / 1e6
+                 + tk.get("output_tokens", 0) * _REP_RATES["out"] / 1e6
+                 + tk.get("cache_read_input_tokens", 0) * _REP_RATES["cache_read"] / 1e6
+                 + tk.get("cache_write_1h_tokens", 0) * _REP_RATES["cache_write_1h"] / 1e6, 6)
+
+
+# the representative steady-state body: 3 tools (Edit never used -> deadweight),
+# a # claudeMd/# userEmail reminder, and a skills block (alpha-skill never used).
+_REP_BODY = {
+    "model": "claude-opus-4-8",
+    "system": [{"type": "text", "text": "You are Claude Code. " * 20}],
+    "tools": [{"name": "Bash", "description": "b" * 400},
+              {"name": "Read", "description": "r" * 40},
+              {"name": "Edit", "description": "e" * 40}],
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder>\n# claudeMd\nProject doc.\n"
+                                 + "c" * 400 + "\n# userEmail\nme@example.com\n</system-reminder>"},
+        {"type": "text", "text": "The following skills are available for use with "
+                                 "the Skill tool:\n- alpha-skill: does alpha " + "a" * 200 + "\n"},
+        {"type": "text", "text": "do the thing"}]}],
+}
+
+
+def _rep_turn(seq, ts, tokens, tool_uses, woa, sysseg="SEG", text="ok"):
+    base = os.path.join(_rep_dir, f"{seq:03d}-r")
+    json.dump({"summary": {"role": "parent", "n_tools": 3, "agent_id": None,
+                           "model": "claude-opus-4-8"}, "ts": ts, "body": _REP_BODY},
+              open(base + ".request.json", "w"))
+    json.dump({"status_code": 200, "role": "parent", "model": "claude-opus-4-8",
+               "billing": {"billable": True, "model": "claude-opus-4-8",
+                           "tokens": tokens, "est_usd": _rep_usd(tokens)},
+               "meta": {"tool_uses": tool_uses, "text": text}},
+              open(base + ".response.json", "w"))
+    json.dump({"hash": f"h{seq}", "ttl": 3600, "ts": ts, "warm_on_arrival": woa,
+               "cache_read_input_tokens": tokens.get("cache_read_input_tokens", 0),
+               "segments": {"system": {"hash": sysseg, "ttl": 3600}}},
+              open(base + ".warmth.json", "w"))
+
+
+_T0 = 1_700_000_000.0
+# turn1 cold establish (write); turns 2-3 warm reads; turn4 idle-gap miss (>1h gap, cold rewrite)
+_rep_turn(1, _T0, {"input_tokens": 10, "output_tokens": 50,
+                   "cache_read_input_tokens": 0, "cache_write_1h_tokens": 10000}, ["Read"], False)
+_rep_turn(2, _T0 + 60, {"input_tokens": 5, "output_tokens": 50,
+                        "cache_read_input_tokens": 10000, "cache_write_1h_tokens": 0}, ["Read"], True)
+_rep_turn(3, _T0 + 120, {"input_tokens": 5, "output_tokens": 50,
+                         "cache_read_input_tokens": 10000, "cache_write_1h_tokens": 0}, ["Bash"], True)
+_rep_turn(4, _T0 + 120 + 7200, {"input_tokens": 8, "output_tokens": 50,
+                                "cache_read_input_tokens": 0, "cache_write_1h_tokens": 10000}, ["Read"], False)
+
+_rep = lp.session_report("sess-report-1")
+check("/_report scope: 4 requests, 4 turns, opus model",
+      _rep["scope"]["requests"] == 4 and _rep["scope"]["turns"] == 4
+      and _rep["scope"]["models"] == ["claude-opus-4-8"])
+_rtot = _rep["totals"]
+check("/_report totals sum per-request billing (NOT cumulative)",
+      _rtot["tokens"]["cache_read"] == 20000
+      and _rtot["tokens"]["cache_write_1h"] == 20000
+      and "global across all sessions" in _rtot["basis"])
+_cd = _rep["cost_decomposition"]
+_bk = {b["bucket"]: b for b in _cd["by_bucket"]}
+check("/_report cost: cache_read bucket present + priced at read rate",
+      _bk["cache_read"]["tokens"] == 20000
+      and abs(_bk["cache_read"]["usd"] - 20000 * _REP_RATES["cache_read"] / 1e6) < 1e-9)
+check("/_report INVARIANT: Σ buckets == totals.est_usd (± rounding)",
+      abs(sum(b["usd"] for b in _cd["by_bucket"]) - _rtot["est_usd"]) < 1e-6)
+_cm = _cd["cache_misses"]
+check("/_report cache_miss: idle-gap rewrite detected + localised to preamble",
+      _cm["count"] == 1 and _cm["by_cause"].get("idle_gap_gt_ttl") == 1
+      and _cm["events"][0]["where"] == "preamble"
+      and _cm["events"][0]["idle_gap_s"] == 7200.0)
+check("/_report cost: turn-4 rewrite is the cache_write_rewrite bucket, turn-1 is initial",
+      _bk["cache_write_rewrite"]["tokens"] == 10000
+      and _bk["cache_write_initial"]["tokens"] == 10000)
+_byc = {f["category"]: f for f in _rep["findings"]}
+check("/_report finding: deadweight_tools flags Edit (loaded, never called)",
+      _byc["deadweight_tools"]["confidence"] == "high"
+      and _byc["deadweight_tools"]["evidence"]["used"] == 2
+      and _byc["deadweight_tools"]["additive"] is True)
+check("/_report finding: deadweight_skills flags alpha-skill (never invoked)",
+      "deadweight_skills" in _byc and _byc["deadweight_skills"]["confidence"] == "high")
+check("/_report finding: cache_misses surfaced with keep-warm lever",
+      "warm-cache" in _byc["cache_misses"]["lever"]
+      and _byc["cache_misses"]["suspected_cause"] == "idle_gap_gt_ttl")
+_pa = _rep["token_decomposition"]["preamble"]
+_dead_pt = sum(f["reclaimable_tokens_per_turn"] for f in _rep["findings"]
+               if f["category"] in ("deadweight_tools", "deadweight_skills")
+               and f["line"] == "main")
+check("/_report INVARIANT: preamble.unused_tokens_per_turn == Σ main deadweight/turn",
+      _pa["unused_tokens_per_turn"] == _dead_pt and _dead_pt > 0)
+check("/_report preamble used + unused == total per turn",
+      _pa["used_tokens_per_turn"] + _pa["unused_tokens_per_turn"] == _pa["tokens_per_turn"])
+_rv = _rep["verdict"]
+check("/_report verdict: score 0-100 + rating + factual headline",
+      0 <= _rv["score"] <= 100 and _rv["rating"] in ("optimal", "suboptimal", "wasteful")
+      and "cache-read" in _rv["headline"])
+check("/_report verdict score ignores low-confidence (non-additive) findings",
+      _rv["reclaimable_usd_total"] == round(sum(
+          f["reclaimable_usd"] for f in _rep["findings"]
+          if f.get("additive") and f["confidence"] in ("high", "medium")), 6))
+check("/_report report_version + disk basis stamped",
+      _rep["report_version"] == lp.report.REPORT_VERSION and _rep["basis"] == "on-disk-capture")
+check("/_report cold/unknown session -> note, no crash",
+      lp.session_report("sess-does-not-exist")["scope"]["requests"] == 0)
+check("/_identity exposes context_report capability + endpoint",
+      lp._identity()["capabilities"].get("context_report") is True
+      and lp._identity()["endpoints"].get("report") == "/_report")
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

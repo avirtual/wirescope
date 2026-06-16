@@ -28,6 +28,7 @@ from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
 from proxylab import receipts as receipts_mod
+from proxylab import report as report_mod
 from proxylab import restore as restore_mod
 from proxylab import status as status_mod
 from proxylab import subs as subs_mod
@@ -213,6 +214,19 @@ async def handler(request: Request) -> Response:
                             status_code=400, media_type="application/json")
         util = request.query_params.get("utilization") in ("1", "yes", "true")
         res = status_mod._context_snapshot(sess, utilization=util)
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
+    # GET /_report?session=<id>[&detail=1] — read-only, spends nothing. The
+    # per-session cost/efficiency report (where the tokens AND dollars went +
+    # findings + verdict). DISK-based (works on ended/historical sessions),
+    # heavy (scans the whole capture dir) -> on-demand only, off the poll path.
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_report":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response(json.dumps({"error": "session required"}),
+                            status_code=400, media_type="application/json")
+        detail = request.query_params.get("detail") in ("1", "yes", "true")
+        res = report_mod.session_report(sess, detail=detail)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
     # ---- admin page: the same snapshot for humans ------------------------------
