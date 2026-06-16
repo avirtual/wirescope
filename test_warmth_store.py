@@ -1898,6 +1898,47 @@ check("/_context composition: tool_results captured + biggest-first ordering",
                                        key=lambda x: x["tokens"], reverse=True)
       and all(set(c) == {"category", "tokens", "pct"} for c in _cp["by_category"]))
 
+# --- /_context composition: agent-roster + skills split out of `system` -------
+# The CLI injects these as their OWN <system-reminder> blocks in messages[0];
+# they must be attributed to `agents`/`skills`, never lumped into `system`.
+_as_obj = {
+    "model": "claude-sonnet-4-6",
+    "system": [{"type": "text", "text": "AGENT PROMPT " * 10}],
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder>\nAvailable agent types for "
+            "the Agent tool:\n- general-purpose: " + "A" * 600 + "\n</system-reminder>"},
+        {"type": "text", "text": "<system-reminder>\nThe following skills are "
+            "available for use with the Skill tool:\n- warm-cache: " + "S" * 400
+            + "\n</system-reminder>"},
+        {"type": "text", "text": "<system-reminder>\nAs you answer the user's "
+            "questions, you can use the following context:\n# claudeMd\n"
+            + "C" * 300 + "\n# userEmail\nx@y.z\n</system-reminder>"},
+        {"type": "text", "text": "the real user question"}]}]}
+lp._LAST_REQUEST["sess-as-1"] = {"obj": _as_obj, "ts": 2100.0,
+                                 "headers": {}, "needs_auth": False}
+_asc = lp._context_snapshot("sess-as-1")["agents"][0]["composition"]
+_ascat = {c["category"]: c["tokens"] for c in _asc["by_category"]}
+check("/_context composition: agents category split from the roster reminder",
+      _ascat.get("agents", 0) > 100
+      and _ascat["agents"] == len(_as_obj["messages"][0]["content"][0]["text"]) // 4)
+check("/_context composition: skills category split from the skills reminder",
+      _ascat.get("skills", 0) > 50
+      and _ascat["skills"] == len(_as_obj["messages"][0]["content"][1]["text"]) // 4)
+check("/_context composition: claudemd still split, user prompt not polluted",
+      _ascat.get("claudemd", 0) > 50 and _ascat.get("useremail", 0) > 0
+      and _ascat.get("user", 0) == len("the real user question") // 4)
+check("/_context composition: agents/skills NOT folded into system bucket",
+      # system holds only the genuine agent prompt + the context-bundle intro,
+      # never the roster/skills char counts
+      _ascat.get("system", 0) < _ascat["agents"])
+check("/_context _reminder_kind classifies roster/skills, None for context bundle",
+      lp._reminder_kind(_as_obj["messages"][0]["content"][0]["text"]) == "agents"
+      and lp._reminder_kind(_as_obj["messages"][0]["content"][1]["text"]) == "skills"
+      and lp._reminder_kind(_as_obj["messages"][0]["content"][2]["text"]) is None)
+check("/_context _reminder_kind tolerant of the vanilla 'Task tool' variant",
+      lp._reminder_kind("<system-reminder>\nAvailable agent types for the "
+                        "Task tool:\n- x") == "agents")
+
 # --- /_context utilization: per-tool used counts + deadweight (disk scan) -----
 # Write a small capture corpus for one session: main line (parent) loads
 # [Bash,Read,Edit]; a subagent instance (agent_id a1util) loads [Read,Glob].

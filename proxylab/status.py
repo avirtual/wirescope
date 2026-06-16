@@ -315,13 +315,42 @@ def _is_injected_reminder(text):
             or t.startswith("<local-command-"))
 
 
+# The CLI injects the agent roster and the skills list as their OWN
+# <system-reminder> blocks in messages[0], each led by a fixed line (verified
+# canonical over thousands of captures; tool word is Agent in clodex / Task in
+# vanilla CC, hence the \w+). Detecting them lets composition attribute their
+# carriage (~1k tok/turn) apart from the agent system prompt — and a consumer
+# can attach the matching trim lever (deny built-in agents / deny skills in
+# settings). Whole-block categories: the entire reminder is the roster/list.
+_RE_REMINDER_AGENTS = re.compile(
+    r"^<system-reminder>\s*Available agent types for the \w+ tool:")
+_RE_REMINDER_SKILLS = re.compile(
+    r"^<system-reminder>\s*The following skills are available for use with the \w+ tool:")
+
+
+def _reminder_kind(text):
+    """Classify a <system-reminder> block: 'agents' (CLI agent roster), 'skills'
+    (CLI skills list), or None (the # claudeMd/# userEmail context bundle or any
+    other reminder/command expansion — handled by the generic split)."""
+    t = (text or "").lstrip()
+    if _RE_REMINDER_AGENTS.match(t):
+        return "agents"
+    if _RE_REMINDER_SKILLS.match(t):
+        return "skills"
+    return None
+
+
 def _composition(obj, total_tokens=None):
     """Token composition of ONE forwarded body, by category — 'what is taking up
     the context window'. Generic vocabulary any consumer can render:
-    system / claudemd / useremail / tools / user / assistant / thinking /
-    tool_calls / tool_results (file reads & command output land in tool_results,
-    usually the bulk). claudemd & useremail are split out of the system-reminder
-    so a consumer can attach a real trim lever (the wirescope omit directives).
+    system / claudemd / useremail / agents / skills / tools / user / assistant /
+    thinking / tool_calls / tool_results (file reads & command output land in
+    tool_results, usually the bulk). claudemd & useremail are split out of the
+    system-reminder so a consumer can attach a real trim lever (the wirescope
+    omit directives); agents (the CLI agent roster) & skills (the CLI skills
+    list) are likewise split out of their own system-reminder blocks — each
+    ~hundreds of tok/turn that would otherwise hide inside 'system', and each
+    has its own trim lever (deny built-in agents / deny skills in settings).
 
     Sizing is char-based (len, /4 — same basis as _tool_roster/analyze_tools.py);
     this is a READ-only endpoint computation, never on the forward path. When a
@@ -356,11 +385,15 @@ def _composition(obj, total_tokens=None):
             if bt == "text":
                 text = b.get("text") or ""
                 if _is_injected_reminder(text):
-                    cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
-                    ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
-                    chars["claudemd"] += cm
-                    chars["useremail"] += ue
-                    chars["system"] += max(0, len(text) - cm - ue)
+                    kind = _reminder_kind(text)
+                    if kind:                       # whole-block agents/skills list
+                        chars[kind] += len(text)
+                    else:
+                        cm = transforms_mod._ws_strip_reminder_section(text, "# claudeMd")[1]
+                        ue = transforms_mod._ws_strip_reminder_section(text, "# userEmail")[1]
+                        chars["claudemd"] += cm
+                        chars["useremail"] += ue
+                        chars["system"] += max(0, len(text) - cm - ue)
                 else:
                     chars["assistant" if role == "assistant" else "user"] += len(text)
             elif bt in ("thinking", "redacted_thinking"):
