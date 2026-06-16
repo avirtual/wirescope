@@ -49,6 +49,22 @@ if ! "$PY" -c 'import uvicorn' >/dev/null 2>&1; then
   fi
 fi
 
+# Operator policy / secrets: load release.env (gitignored, per-machine — the
+# SAME file run_release.sh sources, so start_proxy.sh and the release path get
+# identical deployment-local flags like WS_SPAWNER_HINT / WS_OMIT_DEFAULT /
+# SUBSCRIBERS_TOKEN). Caller-supplied env STILL WINS: we only fill a key that
+# isn't already in the environment, so `FOO=0 ./start_proxy.sh` overrides the
+# file just like it overrides the code defaults below. (A fresh clone has no
+# release.env — recreate it per machine; that's how the off-by-code-default
+# discoverability flags become the local default behavior on a new laptop.)
+if [ -f release.env ]; then
+  while IFS= read -r line; do
+    case "$line" in ''|[[:space:]]*|\#*) continue ;; esac   # skip blanks + comments
+    key="${line%%=*}"
+    printenv "$key" >/dev/null 2>&1 || export "${line?}"
+  done < release.env
+fi
+
 # Canonical defaults for flags that are off in code ("-" not ":-" so an
 # explicit empty/0 from the caller is respected):
 export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
