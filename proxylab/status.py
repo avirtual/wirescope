@@ -74,6 +74,7 @@ def _identity():
             "hold": hold_mod.WARMTH_HOLD,
             "stats": True,                # /_status is always served
             "session_view": True,         # /_session HTML
+            "context_view": True,         # /_context tool-roster JSON
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -100,6 +101,7 @@ def _identity():
             "end": "/_end",
             "admin": "/_admin",
             "session": "/_session",
+            "context": "/_context",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
     }
@@ -265,3 +267,73 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
     if meta_err:
         res["proxy"]["session_meta_error"] = meta_err
     return res
+
+
+# Rough JSON-chars -> tokens divisor for tool schema sizing. Mirrors
+# analyze_tools.py's CHARS_PER_TOK so the live endpoint and the offline ledger
+# price a tool the same way; the ranking (what to trim) is robust to the exact
+# ratio.
+_CHARS_PER_TOK = 4
+
+
+def _tool_roster(obj):
+    """The tool composition of ONE forwarded request body (the post-transform
+    obj — i.e. what actually reached the model, reflecting any wirescope
+    tool-trim/sort). Returns {count, names, total_schema_chars, est_tokens,
+    per_tool:[{name, schema_chars, est_tokens}]} with per_tool biggest-first
+    (the 'what to trim' view). None for an openai/codex body (different wire,
+    server-side caching, no anthropic tools[]) or when there are no tools."""
+    if not isinstance(obj, dict) or codex_mod._is_openai_body(obj):
+        return None
+    tools = obj.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    per = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        chars = len(json.dumps(t, ensure_ascii=False))
+        per.append({"name": t.get("name"), "schema_chars": chars,
+                    "est_tokens": chars // _CHARS_PER_TOK})
+    per.sort(key=lambda x: x["schema_chars"], reverse=True)
+    total = sum(p["schema_chars"] for p in per)
+    return {"count": len(per), "names": [p["name"] for p in per],
+            "total_schema_chars": total, "est_tokens": total // _CHARS_PER_TOK,
+            "per_tool": per}
+
+
+def _context_snapshot(session):
+    """`GET /_context?session=<id>`: the tool rosters loaded for a session,
+    main/parent line and each subagent INSTANCE reported separately (they carry
+    distinct, possibly wirescope-trimmed sets). Read-only over the in-memory
+    last forwarded request bodies (parent in pinger._LAST_REQUEST, subagents in
+    meta._SUBAGENT_LAST_REQ) — so it answers 'what tools are enabled for session
+    X right now'. No disk lookup: an ended/restored/cold session with nothing in
+    memory returns agents=[] plus an explanatory note."""
+    agents = []
+    with pinger_mod._LAST_REQUEST_LOCK:
+        main = pinger_mod._LAST_REQUEST.get(session)
+        main = dict(main) if main else None     # shallow copy; obj read outside lock
+    if main:
+        obj = main.get("obj")
+        agents.append({
+            "line": "main", "role": "parent", "agent_id": None,
+            "display_name": None,
+            "model": (obj or {}).get("model") if isinstance(obj, dict) else None,
+            "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
+            "last_seen": main.get("ts"),
+            "tools": _tool_roster(obj)})
+    for s in meta_mod._subagent_request_objs(session):
+        obj = s.get("obj")
+        agents.append({
+            "line": "subagent", "role": s.get("role"),
+            "agent_id": s.get("agent_id"), "display_name": s.get("display_name"),
+            "model": s.get("model"),
+            "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
+            "last_seen": s.get("last_seen"),
+            "tools": _tool_roster(obj)})
+    note = None
+    if not agents:
+        note = ("no in-memory request for this session "
+                "(cold/restored/ended); query while it is active")
+    return {"session_id": session, "agents": agents, "note": note}

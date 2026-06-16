@@ -1805,6 +1805,65 @@ check("/_session renders the codex payload end to end",
       and "assistant (response)" in page_cdx and "reasoning" in page_cdx
       and "awaiting auth" not in page_cdx)
 
+# --- /_context: per-session tool rosters (main + each subagent) --------------
+_ctx_main = {
+    "model": "claude-opus-4-8",
+    "tools": [
+        {"name": "Bash", "description": "x" * 200, "input_schema": {"a": 1}},
+        {"name": "Read", "description": "y"},
+        {"name": "Edit", "description": "zz"}],
+    "messages": [{"role": "user", "content": "go"}]}
+lp._LAST_REQUEST["sess-ctx-1"] = {"obj": _ctx_main, "ts": 1000.0,
+                                  "headers": {}, "needs_auth": False}
+# a subagent instance sharing the session, with a TRIMMED roster
+lp._note_subagent("sess-ctx-1", "general-purpose", "claude-haiku-4-5",
+                  obj={"model": "claude-haiku-4-5",
+                       "tools": [{"name": "Read"}, {"name": "Glob"}],
+                       "messages": [{"role": "user", "content": "scan"}]},
+                  agent_id="a1ctx", now=1001.0)
+_ctx = lp._context_snapshot("sess-ctx-1")
+check("/_context reports one main + one subagent line",
+      len(_ctx["agents"]) == 2
+      and _ctx["agents"][0]["line"] == "main"
+      and _ctx["agents"][1]["line"] == "subagent"
+      and _ctx["note"] is None)
+_cm = _ctx["agents"][0]
+check("/_context main roster: count/names/model correct",
+      _cm["tools"]["count"] == 3
+      and set(_cm["tools"]["names"]) == {"Bash", "Read", "Edit"}
+      and _cm["model"] == "claude-opus-4-8" and _cm["wire"] == "anthropic")
+check("/_context per_tool sorted biggest-first (Bash leads)",
+      _cm["tools"]["per_tool"][0]["name"] == "Bash"
+      and _cm["tools"]["per_tool"] ==
+          sorted(_cm["tools"]["per_tool"],
+                 key=lambda x: x["schema_chars"], reverse=True))
+check("/_context est_tokens == total_schema_chars // 4",
+      _cm["tools"]["est_tokens"] == _cm["tools"]["total_schema_chars"] // 4
+      and _cm["tools"]["total_schema_chars"]
+          == sum(p["schema_chars"] for p in _cm["tools"]["per_tool"]))
+_cs = _ctx["agents"][1]
+check("/_context subagent shows its OWN trimmed roster",
+      _cs["tools"]["count"] == 2
+      and set(_cs["tools"]["names"]) == {"Read", "Glob"}
+      and _cs["role"] == "general-purpose" and _cs["agent_id"] == "a1ctx")
+_ctx_empty = lp._context_snapshot("sess-ctx-absent-xyz")
+check("/_context unknown session -> agents=[] + note",
+      _ctx_empty["agents"] == [] and bool(_ctx_empty["note"]))
+lp._LAST_REQUEST["sess-ctx-cdx"] = {
+    "obj": {"model": "gpt-5.5", "input": [{"type": "message"}],
+            "instructions": "be nice"},
+    "ts": 1000.0, "headers": {}, "needs_auth": False}
+_ctx_cdx = lp._context_snapshot("sess-ctx-cdx")
+check("/_context openai/codex body -> wire=openai, tools=None",
+      _ctx_cdx["agents"][0]["wire"] == "openai"
+      and _ctx_cdx["agents"][0]["tools"] is None)
+# /_identity advertises the new endpoint + capability
+_idc = lp._identity()
+check("/_identity exposes /_context + context_view capability",
+      _idc["endpoints"].get("context") == "/_context"
+      and _idc["capabilities"].get("context_view") is True)
+del lp._LAST_REQUEST["sess-ctx-1"], lp._LAST_REQUEST["sess-ctx-cdx"]
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

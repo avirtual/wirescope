@@ -201,6 +201,19 @@ async def handler(request: Request) -> Response:
                                all_sessions=q.get("all") in ("1", "yes", "true"))
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
+    # ---- context: tool rosters loaded for a session (main + each subagent) -----
+    # GET /_context?session=<id> — read-only, spends nothing. Surfaces what
+    # /_status deliberately omits: the actually-forwarded tool set per agent line
+    # (post-transform, so wirescope trims show). In-memory only; cold/ended
+    # sessions return agents=[] + note.
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_context":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response(json.dumps({"error": "session required"}),
+                            status_code=400, media_type="application/json")
+        res = status_mod._context_snapshot(sess)
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
     # ---- admin page: the same snapshot for humans ------------------------------
     # GET /_admin[?session=<id>][&all=1] — read-only HTML view of /_status.
     if request.method == "GET" and request.url.path.rstrip("/") == "/_admin":

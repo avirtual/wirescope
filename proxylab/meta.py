@@ -295,6 +295,29 @@ def _subagents_snapshot(session_id):
     return out
 
 
+def _subagent_request_objs(session_id):
+    """Join each subagent INSTANCE's identity (_SUBAGENTS: role/model/agent_id/
+    display_name/last_seen) with its latest forwarded request body
+    (_SUBAGENT_LAST_REQ), so a reader like /_context can inspect what each
+    subagent actually carries (tools, etc.) WITHOUT reaching into the two
+    private maps itself. `obj` is the post-transform body (None if no request
+    body was ever captured for that instance). Newest-active first; [] if none."""
+    roles = _SUBAGENTS.get(session_id)
+    if not roles:
+        return []
+    reqs = _SUBAGENT_LAST_REQ.get(session_id) or {}
+    out = []
+    for key, v in roles.items():
+        e = reqs.get(key)
+        out.append({"key": key, "role": v.get("role"),
+                    "agent_id": v.get("agent_id"),
+                    "display_name": v.get("display_name"),
+                    "model": v.get("model"), "last_seen": v.get("last_seen"),
+                    "obj": e.get("obj") if e else None})
+    out.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
+    return out
+
+
 def _capture_session_meta(session_id, obj, model, agent=None, role=None,
                           title_call=False, agent_id=None, display_name=None):
     """Per-request meta hook (handler, post-parse). The MAIN LINE (the parent
