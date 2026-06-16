@@ -77,6 +77,7 @@ def _identity():
             "context_view": True,         # /_context tool-roster JSON
             "context_composition": True,  # /_context per-category token breakdown
             "context_utilization": True,  # /_context?...&utilization=1 used/deadweight
+            "context_skills": True,       # /_context per-skill roster + utilization
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -355,6 +356,81 @@ def _reminder_kind(text):
     return None
 
 
+# A skills-block entry: a column-0 `- <name>:` line (the CLI formats each skill
+# as `- skill-name: <description>`). Same shape as the agent-roster entries, so
+# we only ever scan it on the slice that starts AT the skills opener (agents that
+# precede it in the opus-4-8 combined block are excluded by construction).
+_RE_SKILL_ENTRY = re.compile(r"(?m)^- ([a-z0-9][\w.-]*):")
+
+
+def _iter_body_texts(obj):
+    """Yield every text string in a request body: system[] blocks (or a string
+    system), then each message's text blocks. The home of the injected skills
+    list on both wires (system[] / messages[0] reminder / trailing role:system)."""
+    sysf = obj.get("system")
+    if isinstance(sysf, list):
+        for b in sysf:
+            if isinstance(b, dict) and isinstance(b.get("text"), str):
+                yield b["text"]
+    elif isinstance(sysf, str):
+        yield sysf
+    for m in obj.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            yield c
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "text" \
+                        and isinstance(b.get("text"), str):
+                    yield b["text"]
+
+
+def _find_skills_block(obj):
+    """The CLI skills list as a raw substring (opener through end of its block),
+    found wherever it rides — own <system-reminder>, messages[0], or the opus-4-8
+    combined trailing role:system message (slice from the skills opener so the
+    agent roster ahead of it is dropped). None if no skills are loaded."""
+    for t in _iter_body_texts(obj):
+        m = _RE_SKILLS_LINE.search(t)
+        if m:
+            block = t[m.start():]
+            end = block.find("</system-reminder>")
+            return block[:end] if end != -1 else block
+    return None
+
+
+def _skill_roster(obj):
+    """The skills composition of ONE forwarded body — the per-skill twin of
+    _tool_roster. Returns {count, names, total_schema_chars, est_tokens,
+    per_skill:[{name, schema_chars, est_tokens}]} biggest-first ('what to trim';
+    the lever is skillOverrides:{name:off}, which actually reclaims the tokens —
+    permissions.deny only gates invocation). Each skill's size = chars from its
+    `- name:` line to the next entry (last entry → end of block). None for a
+    codex body or when no skills block is present."""
+    if not isinstance(obj, dict) or codex_mod._is_openai_body(obj):
+        return None
+    block = _find_skills_block(obj)
+    if not block:
+        return None
+    entries = list(_RE_SKILL_ENTRY.finditer(block))
+    if not entries:
+        return None
+    per = []
+    for i, e in enumerate(entries):
+        start = e.start()
+        end = entries[i + 1].start() if i + 1 < len(entries) else len(block)
+        chars = end - start
+        per.append({"name": e.group(1), "schema_chars": chars,
+                    "est_tokens": chars // _CHARS_PER_TOK})
+    per.sort(key=lambda x: x["schema_chars"], reverse=True)
+    total = sum(p["schema_chars"] for p in per)
+    return {"count": len(per), "names": [p["name"] for p in per],
+            "total_schema_chars": total, "est_tokens": total // _CHARS_PER_TOK,
+            "per_skill": per}
+
+
 def _composition(obj, total_tokens=None):
     """Token composition of ONE forwarded body, by category — 'what is taking up
     the context window'. Generic vocabulary any consumer can render:
@@ -525,6 +601,91 @@ def _apply_utilization(tools, ustats):
             "deadweight_tokens": deadweight}
 
 
+def _skill_utilization(session):
+    """Lifetime skill-INVOCATION tally for a session, scanned from its capture
+    dir — the per-skill twin of _utilization. Answers 'of the skills loaded every
+    turn, which ever got invoked?'.
+
+    The skill NAME is not in response meta.tool_uses (that records only the tool
+    name "Skill") — it lives in the assistant `tool_use` block's INPUT
+    (`{skill, args}`), which surfaces in the message history of LATER requests.
+    So we scan request bodies' assistant tool_use blocks where name=="Skill" and
+    count by input["skill"]. History accumulates, so the SAME tool_use id repeats
+    across a line's turns → we dedupe by id (counted once, at first sighting).
+    Ids never cross agent lines (separate threads), so the global seen-set is safe.
+
+    evaluable_turns = turns that LOADED skills (the list was in the body) AND ran
+    200 — the 'chance to invoke', mirroring _utilization's tool accounting.
+
+    Returns {key -> {evaluable_turns, by_skill: {name -> count}}}, key resolved
+    the same way as _utilization ('main' / subagent agent_id-or-role)."""
+    out = {}
+    d = core_mod.LOG_DIR / session
+    if not d.is_dir():
+        return out
+    seen = set()                          # tool_use ids counted once per session
+    for f in sorted(d.glob("*.request.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except Exception:
+            continue
+        body = rec.get("body") or {}
+        if not isinstance(body, dict):
+            continue
+        summ = rec.get("summary") or {}
+        role = summ.get("role")
+        key = "main" if role in ("parent", "unknown", None) \
+            else (summ.get("agent_id") or role)
+        g = out.setdefault(key, {"evaluable_turns": 0,
+                                 "by_skill": collections.Counter()})
+        if any(_RE_SKILLS_LINE.search(t) for t in _iter_body_texts(body)):
+            rp = f.with_name(f.name.replace(".request.json", ".response.json"))
+            try:
+                if json.loads(rp.read_text()).get("status_code") == 200:
+                    g["evaluable_turns"] += 1
+            except Exception:
+                pass
+        for m in body.get("messages") or []:
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            c = m.get("content")
+            if not isinstance(c, list):
+                continue
+            for b in c:
+                if not (isinstance(b, dict) and b.get("type") == "tool_use"
+                        and b.get("name") == "Skill"):
+                    continue
+                bid = b.get("id")
+                if bid in seen:
+                    continue
+                seen.add(bid)
+                sk = (b.get("input") or {}).get("skill")
+                if sk:
+                    g["by_skill"][sk] += 1
+    return out
+
+
+def _apply_skill_utilization(skills, ustats):
+    """Fold a session's skill-invocation tally into its skill roster IN PLACE:
+    stamp per_skill[].used, re-sort deadweight-first, and return a rollup
+    {basis, evaluable_turns, loaded, used_distinct, deadweight_tokens} — the
+    per-skill twin of _apply_utilization. deadweight_tokens = per-turn carriage of
+    loaded-but-never-invoked skills (the skillOverrides:off reclaim payoff). None
+    when there is no roster."""
+    if not skills:
+        return None
+    by_skill = (ustats or {}).get("by_skill") or {}
+    evaluable = (ustats or {}).get("evaluable_turns", 0)
+    for p in skills["per_skill"]:
+        p["used"] = int(by_skill.get(p["name"], 0))
+    skills["per_skill"].sort(key=lambda x: (x["used"] > 0, -x["est_tokens"]))
+    used_distinct = sum(1 for p in skills["per_skill"] if p["used"] > 0)
+    deadweight = sum(p["est_tokens"] for p in skills["per_skill"] if p["used"] == 0)
+    return {"basis": "capture-scan", "evaluable_turns": evaluable,
+            "loaded": skills["count"], "used_distinct": used_distinct,
+            "deadweight_tokens": deadweight}
+
+
 def _context_snapshot(session, utilization=False):
     """`GET /_context?session=<id>`: the tool rosters loaded for a session,
     main/parent line and each subagent INSTANCE reported separately (they carry
@@ -541,6 +702,7 @@ def _context_snapshot(session, utilization=False):
     path is unchanged for the poll/admin callers."""
     agents = []
     util = _utilization(session) if utilization else {}
+    skutil = _skill_utilization(session) if utilization else {}
     with pinger_mod._LAST_REQUEST_LOCK:
         main = pinger_mod._LAST_REQUEST.get(session)
         main = dict(main) if main else None     # shallow copy; obj read outside lock
@@ -557,9 +719,12 @@ def _context_snapshot(session, utilization=False):
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": main.get("ts"),
             "tools": roster,
+            "skills": _skill_roster(obj),
             "composition": _composition(obj, total)}
         if utilization:
             entry["utilization"] = _apply_utilization(roster, util.get("main"))
+            entry["skills_utilization"] = _apply_skill_utilization(
+                entry["skills"], skutil.get("main"))
         agents.append(entry)
     for s in meta_mod._subagent_request_objs(session):
         obj = s.get("obj")
@@ -571,10 +736,13 @@ def _context_snapshot(session, utilization=False):
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": s.get("last_seen"),
             "tools": roster,
+            "skills": _skill_roster(obj),
             "composition": _composition(obj)}    # no sub receipt -> estimate
         if utilization:
             ukey = s.get("agent_id") or s.get("role")
             entry["utilization"] = _apply_utilization(roster, util.get(ukey))
+            entry["skills_utilization"] = _apply_skill_utilization(
+                entry["skills"], skutil.get(ukey))
         agents.append(entry)
     note = None
     if not agents:

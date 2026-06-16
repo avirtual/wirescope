@@ -2048,6 +2048,115 @@ check("/_context composition: estimate basis sums raw char-est, no receipt",
       and _cp_est["total_tokens"] == sum(c["tokens"] for c in _cp_est["by_category"]))
 check("/_context composition: None for openai/codex body",
       lp._composition({"input": [], "instructions": "hi"}) is None)
+
+# --- /_context skills: per-skill roster + utilization (v0.4.14) ---------------
+# The per-skill twin of the tool roster/utilization above. Roster parsed from the
+# injected skills list (both wire shapes); utilization scanned from assistant
+# `tool_use` blocks where name=="Skill" (skill name in input["skill"], deduped by
+# tool_use id across the history that re-ships it every turn).
+_SKILLS_BLOCK = ("<system-reminder>\nThe following skills are available for use "
+                 "with the Skill tool:\n- alpha-skill: " + "A" * 400
+                 + "\n- beta-skill: " + "B" * 200
+                 + "\n- gamma-skill: " + "G" * 80 + "\n</system-reminder>")
+_skill_obj = {
+    "model": "claude-sonnet-4-6",
+    "system": [{"type": "text", "text": "PROMPT"}],
+    "messages": [{"role": "user", "content": [
+        {"type": "text", "text": _SKILLS_BLOCK},
+        {"type": "text", "text": "do the thing"}]}]}
+_sr = lp._skill_roster(_skill_obj)
+check("/_context skills: roster parses entries biggest-first",
+      _sr["count"] == 3 and _sr["names"][0] == "alpha-skill"
+      and _sr["per_skill"][0]["schema_chars"] > _sr["per_skill"][1]["schema_chars"]
+      and [p["name"] for p in _sr["per_skill"]]
+          == ["alpha-skill", "beta-skill", "gamma-skill"])
+check("/_context skills: roster shape mirrors tools (totals + est_tokens)",
+      _sr["total_schema_chars"] == sum(p["schema_chars"] for p in _sr["per_skill"])
+      and _sr["est_tokens"] == _sr["total_schema_chars"] // 4)
+check("/_context skills: no skills block -> None roster",
+      lp._skill_roster({"model": "m",
+                        "messages": [{"role": "user", "content": "hi"}]}) is None)
+check("/_context skills: openai/codex body -> None",
+      lp._skill_roster({"input": [], "instructions": "hi"}) is None)
+# opus-4-8 unwrapped combined block: agents roster + skills list in one string;
+# the parse must slice from the SKILLS opener so the agent entry ahead is excluded.
+_skill_opus_obj = {
+    "model": "claude-opus-4-8",
+    "messages": [{"role": "user", "content": "go"},
+                 {"role": "system", "content": _AGENTS_TXT + _SKILLS_TXT}]}
+_sro = lp._skill_roster(_skill_opus_obj)
+check("/_context skills: unwrapped opus block -> skills only, agent entry excluded",
+      _sro is not None and _sro["count"] == 1 and _sro["names"] == ["warm-cache"])
+
+# skills utilization: disk-scan a small corpus (request bodies with the skills
+# block + assistant Skill tool_use history).
+_sk_dir = os.path.join(os.environ["LOG_DIR"], "sess-skill-1")
+os.makedirs(_sk_dir, exist_ok=True)
+
+
+def _write_skill_turn(seq, role, has_skills, status, skill_calls, agent_id=None):
+    # skill_calls: list of (tool_use_id, skill_name) present in this body's history
+    base = os.path.join(_sk_dir, f"{seq:03d}-t")
+    first = ({"role": "user", "content": [{"type": "text", "text": _SKILLS_BLOCK}]}
+             if has_skills else {"role": "user", "content": "go"})
+    msgs = [first]
+    for tid, sk in skill_calls:
+        msgs.append({"role": "assistant", "content": [
+            {"type": "tool_use", "id": tid, "name": "Skill",
+             "input": {"skill": sk, "args": "x"}}]})
+    with open(base + ".request.json", "w") as fh:
+        json.dump({"summary": {"role": role, "agent_id": agent_id},
+                   "body": {"messages": msgs}}, fh)
+    with open(base + ".response.json", "w") as fh:
+        json.dump({"status_code": status}, fh)
+
+
+# main: alpha invoked (u1, repeats turn3 -> dedup), beta invoked (u2), gamma dead.
+_write_skill_turn(1, "parent", True, 200, [])
+_write_skill_turn(2, "parent", True, 200, [("u1", "alpha-skill")])
+_write_skill_turn(3, "parent", True, 200,
+                  [("u1", "alpha-skill"), ("u2", "beta-skill")])   # u1 repeat
+_write_skill_turn(4, "parent", False, 200, [])     # no skills loaded -> not evaluable
+_write_skill_turn(5, "parent", True, 500, [])      # errored -> not a use-chance
+# subagent instance a2sk invokes gamma once
+_write_skill_turn(6, "general-purpose", True, 200,
+                  [("u3", "gamma-skill")], agent_id="a2sk")
+
+lp._LAST_REQUEST["sess-skill-1"] = {"obj": _skill_obj, "ts": 4000.0,
+                                    "headers": {}, "needs_auth": False}
+lp._note_subagent("sess-skill-1", "general-purpose", "claude-haiku-4-5",
+                  obj=_skill_obj, agent_id="a2sk", now=4001.0)
+
+_su = lp._context_snapshot("sess-skill-1", utilization=True)
+_sm = _su["agents"][0]
+check("/_context skills util: dedup by id (u1 repeat once), beta 1, gamma dead",
+      {p["name"]: p["used"] for p in _sm["skills"]["per_skill"]}
+      == {"alpha-skill": 1, "beta-skill": 1, "gamma-skill": 0})
+check("/_context skills util: rollup (3 evaluable; no-skills + errored excluded)",
+      _sm["skills_utilization"]["basis"] == "capture-scan"
+      and _sm["skills_utilization"]["evaluable_turns"] == 3
+      and _sm["skills_utilization"]["loaded"] == 3
+      and _sm["skills_utilization"]["used_distinct"] == 2)
+_gamma_tok = next(p["est_tokens"] for p in _sm["skills"]["per_skill"]
+                  if p["name"] == "gamma-skill")
+check("/_context skills util: deadweight = unused carriage, sorted deadweight-first",
+      _sm["skills_utilization"]["deadweight_tokens"] == _gamma_tok
+      and _sm["skills"]["per_skill"][0]["name"] == "gamma-skill")   # unused floats up
+_ss = _su["agents"][1]
+check("/_context skills util: subagent line tallied by its own agent_id",
+      _ss["agent_id"] == "a2sk"
+      and {p["name"]: p["used"] for p in _ss["skills"]["per_skill"]}
+          == {"alpha-skill": 0, "beta-skill": 0, "gamma-skill": 1}
+      and _ss["skills_utilization"]["used_distinct"] == 1)
+_su0 = lp._context_snapshot("sess-skill-1")
+check("/_context skills: without utilization=, roster present but no used/rollup",
+      _su0["agents"][0]["skills"]["count"] == 3
+      and "skills_utilization" not in _su0["agents"][0]
+      and "used" not in _su0["agents"][0]["skills"]["per_skill"][0])
+check("/_identity exposes context_skills capability",
+      lp._identity()["capabilities"].get("context_skills") is True)
+del lp._LAST_REQUEST["sess-skill-1"]
+
 del lp._LAST_USAGE["sess-comp-1"]
 del lp._LAST_REQUEST["sess-ctx-1"], lp._LAST_REQUEST["sess-ctx-cdx"]
 del lp._LAST_REQUEST["sess-comp-1"]
