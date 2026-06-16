@@ -76,6 +76,7 @@ def _identity():
             "session_view": True,         # /_session HTML
             "context_view": True,         # /_context tool-roster JSON
             "context_composition": True,  # /_context per-category token breakdown
+            "context_utilization": True,  # /_context?...&utilization=1 used/deadweight
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -392,15 +393,98 @@ def _composition(obj, total_tokens=None):
     return {"total_tokens": total, "basis": basis, "by_category": cats}
 
 
-def _context_snapshot(session):
+def _utilization(session):
+    """Lifetime tool-USE tally for a session, scanned from its capture dir
+    (LOG_DIR/<session>/). Answers 'of the tools loaded every turn, which ever
+    got exercised?' — the deadweight question, made per-session and live.
+
+    On-demand only (a disk scan): callers gate it behind
+    `/_context?...&utilization=1` so the 10s poll / admin path never pays for it.
+    Scoped to the ONE session dir => naturally bounded to the live session_id (a
+    /clear mints a fresh id => fresh dir => the tally never spans the boundary).
+
+    Mirrors analyze_tools.py's accounting, joined request<->response by file
+    stem: only turns that LOADED tools AND actually RAN (200) count as a 'chance
+    to use' (a no-tools title side-call or an errored turn is not evidence of
+    waste). `used` is the RAW invocation count (3 Reads in one turn = 3; from
+    response meta.tool_uses), per clodex's contract.
+
+    Returns {key -> {evaluable_turns, by_tool: {name -> used_count}}} keyed by
+    agent line: 'main' for the routed parent/unknown-role turns, else the
+    subagent INSTANCE's x-claude-code-agent-id (fallback role) — the same key
+    _context_snapshot resolves per agent, so the merge lines up. Empty map for a
+    cold/absent dir."""
+    out = {}
+    d = core_mod.LOG_DIR / session
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("*.request.json")):
+        try:
+            rec = json.loads(f.read_text())
+        except Exception:
+            continue
+        summ = rec.get("summary") or {}
+        if not (summ.get("n_tools") or 0):
+            continue                       # no tools loaded => not a use-chance
+        role = summ.get("role")
+        key = "main" if role in ("parent", "unknown", None) \
+            else (summ.get("agent_id") or role)
+        rp = f.with_name(f.name.replace(".request.json", ".response.json"))
+        ok, called = False, []
+        try:
+            resp = json.loads(rp.read_text())
+            ok = resp.get("status_code") == 200
+            called = (resp.get("meta") or {}).get("tool_uses") or []
+        except Exception:
+            pass
+        g = out.setdefault(key, {"evaluable_turns": 0,
+                                 "by_tool": collections.Counter()})
+        if ok:
+            g["evaluable_turns"] += 1
+            for name in called:
+                if name:
+                    g["by_tool"][name] += 1
+    return out
+
+
+def _apply_utilization(tools, ustats):
+    """Fold one agent line's lifetime tally (from _utilization) into its tools
+    roster IN PLACE: stamp per_tool[].used, re-sort deadweight-first (never-used
+    first, then biggest schema = the 'trim me' order clodex renders), and return
+    a rollup {basis, evaluable_turns, loaded, used_distinct, deadweight_tokens}.
+    deadweight_tokens = per-turn schema carriage of the currently-loaded tools
+    that were never called — the concrete 'free up ~N tokens' payoff. None when
+    there is no roster (codex / no tools)."""
+    if not tools:
+        return None
+    by_tool = (ustats or {}).get("by_tool") or {}
+    evaluable = (ustats or {}).get("evaluable_turns", 0)
+    for p in tools["per_tool"]:
+        p["used"] = int(by_tool.get(p["name"], 0))
+    tools["per_tool"].sort(key=lambda x: (x["used"] > 0, -x["est_tokens"]))
+    used_distinct = sum(1 for p in tools["per_tool"] if p["used"] > 0)
+    deadweight = sum(p["est_tokens"] for p in tools["per_tool"] if p["used"] == 0)
+    return {"basis": "capture-scan", "evaluable_turns": evaluable,
+            "loaded": tools["count"], "used_distinct": used_distinct,
+            "deadweight_tokens": deadweight}
+
+
+def _context_snapshot(session, utilization=False):
     """`GET /_context?session=<id>`: the tool rosters loaded for a session,
     main/parent line and each subagent INSTANCE reported separately (they carry
     distinct, possibly wirescope-trimmed sets). Read-only over the in-memory
     last forwarded request bodies (parent in pinger._LAST_REQUEST, subagents in
     meta._SUBAGENT_LAST_REQ) — so it answers 'what tools are enabled for session
     X right now'. No disk lookup: an ended/restored/cold session with nothing in
-    memory returns agents=[] plus an explanatory note."""
+    memory returns agents=[] plus an explanatory note.
+
+    When `utilization=True` each agent's tools roster is additionally enriched
+    with per-tool `used` counts + a `utilization` rollup (deadweight pricing)
+    via a one-time disk scan of the session's capture dir (_utilization) — the
+    'did the loaded tools pay off?' view. Off by default so the cheap in-memory
+    path is unchanged for the poll/admin callers."""
     agents = []
+    util = _utilization(session) if utilization else {}
     with pinger_mod._LAST_REQUEST_LOCK:
         main = pinger_mod._LAST_REQUEST.get(session)
         main = dict(main) if main else None     # shallow copy; obj read outside lock
@@ -409,24 +493,33 @@ def _context_snapshot(session):
         # main line carries a real usage receipt -> anchor the composition total
         # to the wire-measured window size so it agrees with /_status.input_tokens
         total = meta_mod._input_token_total(meta_mod._LAST_USAGE.get(session))
-        agents.append({
+        roster = _tool_roster(obj)
+        entry = {
             "line": "main", "role": "parent", "agent_id": None,
             "display_name": None,
             "model": (obj or {}).get("model") if isinstance(obj, dict) else None,
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": main.get("ts"),
-            "tools": _tool_roster(obj),
-            "composition": _composition(obj, total)})
+            "tools": roster,
+            "composition": _composition(obj, total)}
+        if utilization:
+            entry["utilization"] = _apply_utilization(roster, util.get("main"))
+        agents.append(entry)
     for s in meta_mod._subagent_request_objs(session):
         obj = s.get("obj")
-        agents.append({
+        roster = _tool_roster(obj)
+        entry = {
             "line": "subagent", "role": s.get("role"),
             "agent_id": s.get("agent_id"), "display_name": s.get("display_name"),
             "model": s.get("model"),
             "wire": "openai" if codex_mod._is_openai_body(obj) else "anthropic",
             "last_seen": s.get("last_seen"),
-            "tools": _tool_roster(obj),
-            "composition": _composition(obj)})    # no sub receipt -> estimate
+            "tools": roster,
+            "composition": _composition(obj)}    # no sub receipt -> estimate
+        if utilization:
+            ukey = s.get("agent_id") or s.get("role")
+            entry["utilization"] = _apply_utilization(roster, util.get(ukey))
+        agents.append(entry)
     note = None
     if not agents:
         note = ("no in-memory request for this session "

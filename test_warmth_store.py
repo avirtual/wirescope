@@ -1897,6 +1897,78 @@ check("/_context composition: tool_results captured + biggest-first ordering",
       and _cp["by_category"] == sorted(_cp["by_category"],
                                        key=lambda x: x["tokens"], reverse=True)
       and all(set(c) == {"category", "tokens", "pct"} for c in _cp["by_category"]))
+
+# --- /_context utilization: per-tool used counts + deadweight (disk scan) -----
+# Write a small capture corpus for one session: main line (parent) loads
+# [Bash,Read,Edit]; a subagent instance (agent_id a1util) loads [Read,Glob].
+_util_dir = os.path.join(os.environ["LOG_DIR"], "sess-util-1")
+os.makedirs(_util_dir, exist_ok=True)
+
+
+def _write_turn(seq, role, n_tools, status, tool_uses, agent_id=None):
+    base = os.path.join(_util_dir, f"{seq:03d}-t")
+    with open(base + ".request.json", "w") as fh:
+        json.dump({"summary": {"role": role, "n_tools": n_tools,
+                               "agent_id": agent_id}}, fh)
+    with open(base + ".response.json", "w") as fh:
+        json.dump({"status_code": status, "meta": {"tool_uses": tool_uses}}, fh)
+
+
+# main: Read x3 (2 in turn 1 + 1 in turn 2), Bash x1, Edit never -> dead
+_write_turn(1, "parent", 3, 200, ["Read", "Read"])
+_write_turn(2, "parent", 3, 200, ["Read"])
+_write_turn(3, "parent", 3, 200, ["Bash"])
+_write_turn(4, "parent", 0, 200, [])              # title side-call: skipped (no tools)
+_write_turn(5, "parent", 3, 500, [])              # errored turn: not a use-chance
+# subagent instance a1util: Read x1, Glob never -> dead
+_write_turn(6, "general-purpose", 2, 200, ["Read"], agent_id="a1util")
+
+lp._LAST_REQUEST["sess-util-1"] = {
+    "obj": {"model": "claude-opus-4-8",
+            "tools": [{"name": "Bash", "description": "x" * 200},
+                      {"name": "Read", "description": "y"},
+                      {"name": "Edit", "description": "zz"}],
+            "messages": [{"role": "user", "content": "go"}]},
+    "ts": 3000.0, "headers": {}, "needs_auth": False}
+lp._note_subagent("sess-util-1", "general-purpose", "claude-haiku-4-5",
+                  obj={"model": "claude-haiku-4-5",
+                       "tools": [{"name": "Read"}, {"name": "Glob"}],
+                       "messages": [{"role": "user", "content": "scan"}]},
+                  agent_id="a1util", now=3001.0)
+
+_u = lp._context_snapshot("sess-util-1", utilization=True)
+_um = _u["agents"][0]
+_uperc = {p["name"]: p["used"] for p in _um["tools"]["per_tool"]}
+check("/_context utilization: main per-tool raw counts (3 Reads = 3, Edit 0)",
+      _uperc == {"Read": 3, "Bash": 1, "Edit": 0})
+check("/_context utilization: main rollup (3 evaluable turns, title+error excluded)",
+      _um["utilization"]["basis"] == "capture-scan"
+      and _um["utilization"]["evaluable_turns"] == 3
+      and _um["utilization"]["loaded"] == 3
+      and _um["utilization"]["used_distinct"] == 2)
+_edit_tok = next(p["est_tokens"] for p in _um["tools"]["per_tool"]
+                 if p["name"] == "Edit")
+check("/_context utilization: deadweight_tokens = unused tools' schema cost",
+      _um["utilization"]["deadweight_tokens"] == _edit_tok)
+check("/_context utilization: per_tool sorted deadweight-first (unused, then cost)",
+      _um["tools"]["per_tool"][0]["name"] == "Edit"        # used 0 floats up
+      and _um["tools"]["per_tool"][1]["name"] == "Bash"    # then biggest of used
+      and _um["tools"]["per_tool"][2]["name"] == "Read")
+_us = _u["agents"][1]
+check("/_context utilization: subagent line tallied by its own agent_id",
+      _us["agent_id"] == "a1util"
+      and {p["name"]: p["used"] for p in _us["tools"]["per_tool"]}
+          == {"Read": 1, "Glob": 0}
+      and _us["utilization"]["evaluable_turns"] == 1
+      and _us["utilization"]["used_distinct"] == 1)
+# default (no utilization=) stays the cheap in-memory path: no scan, no used keys
+_u0 = lp._context_snapshot("sess-util-1")
+check("/_context without utilization=: unchanged (no used/utilization fields)",
+      "utilization" not in _u0["agents"][0]
+      and "used" not in _u0["agents"][0]["tools"]["per_tool"][0]
+      and _u0["agents"][0]["tools"]["per_tool"][0]["name"] == "Bash")  # biggest-first
+check("/_identity exposes context_utilization capability",
+      lp._identity()["capabilities"].get("context_utilization") is True)
 check("/_context composition: real user prompt not miscounted as reminder",
       "user" in _cats and "assistant" in _cats and "thinking" in _cats
       and "tool_calls" in _cats)

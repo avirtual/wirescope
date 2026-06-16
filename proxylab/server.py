@@ -211,7 +211,8 @@ async def handler(request: Request) -> Response:
         if not sess:
             return Response(json.dumps({"error": "session required"}),
                             status_code=400, media_type="application/json")
-        res = status_mod._context_snapshot(sess)
+        util = request.query_params.get("utilization") in ("1", "yes", "true")
+        res = status_mod._context_snapshot(sess, utilization=util)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
     # ---- admin page: the same snapshot for humans ------------------------------
@@ -555,6 +556,9 @@ async def handler(request: Request) -> Response:
             "messages_chars": msg_chars,
             "n_tools": len(obj.get("tools", []) or []),
             "tool_names": [t.get("name") for t in (obj.get("tools") or []) if isinstance(t, dict)],
+            # per-instance key for the /_context utilization scan (present iff a
+            # subagent turn; lets the disk tally attribute each sub line apart)
+            "agent_id": agent_id,
         }
         # session identity for /_status: bump last_seen/model; hunt the cwd
         # until found; flag the title side-call so the response capture can
