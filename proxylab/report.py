@@ -831,14 +831,17 @@ def _series(pairs):
         spine["generation"] += gen_usd
         spine["read_cached"] += read_cached
         spine["read_uncached"] += read_uncached
-        # carriage (read+write) apportioned to content by token share (estimate)
+        # READ $ apportioned to content by token share (estimate). Read ONLY (not
+        # read+write) so Σ content_carriage_est == spine.read exactly — the content
+        # pie is "what the read pays to re-carry", tying to the read slice of the
+        # spine. (Write is the one-off cache toll, kept separate in the spine.)
         tot_tok = sum(bands.values()) or 1
-        carriage = read_usd + write_usd
         for name, _keys in _TL_BANDS:
-            content[name] += carriage * bands[name] / tot_tok
+            content[name] += read_usd * bands[name] / tot_tok
     return {
         "basis": "main-line requests, chronological; spine = receipt-exact $, "
-                 "content = char-estimate token-share of carriage (read+write). "
+                 "content_carriage_est = the READ $ apportioned to content by "
+                 "char-estimate token share (Σ content == spine.read). "
                  "ALL billed main-line requests are included — req 1 is typically "
                  "the ~1.2k-char title/side-call (tiny window, no preamble), so the "
                  "composition only reaches steady state from the first tool-loaded "

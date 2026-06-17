@@ -820,11 +820,11 @@ def _tl_pie(cx, cy, r, slices, title):
             anchor = "start" if math.cos(am) >= 0 else "end"
             g.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" '
                      f'fill="{color}" font-size="11.5" font-weight="700" {halo}>'
-                     f'{html.escape(label)} {frac*100:.0f}%</text>')
+                     f'{html.escape(label)} ${val:,.2f} · {frac*100:.0f}%</text>')
         a0 = a1
     g.append(f'<circle cx="{cx}" cy="{cy}" r="{r*0.52:.0f}" fill="#1b1e24"/>'
              f'<text x="{cx}" y="{cy-2}" text-anchor="middle" fill="#eee" '
-             f'font-size="16" font-weight="700">${total:,.0f}</text>'
+             f'font-size="15" font-weight="700">${total:,.2f}</text>'
              f'<text x="{cx}" y="{cy+13}" text-anchor="middle" fill="#8a93a0" '
              f'font-size="10">total</text>')
     return "".join(g)

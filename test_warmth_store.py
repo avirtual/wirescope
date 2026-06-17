@@ -2344,6 +2344,8 @@ check("/_report series: per-request total == read+write+generation (each row rec
           for r in _ser["requests"]))
 check("/_report series: content carriage estimate split present (read drill-down)",
       set(_ser["content_carriage_est"]) == {"preamble", "conversation", "thinking"})
+check("/_report series INVARIANT: Σ content_carriage_est == spine.read (read-only apportionment)",
+      abs(sum(_ser["content_carriage_est"].values()) - _sp["read"]) < 1e-6)
 
 # claudemd/useremail carriage is SUBAGENT-scoped (v4): the [wirescope:omit] lever
 # only shapes spawns, so MAIN-line claudemd is informational (legitimate context,
