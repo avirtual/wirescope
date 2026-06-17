@@ -2250,8 +2250,8 @@ _rep_turn(4, _T0 + 120 + 7200, {"input_tokens": 8, "output_tokens": 50,
                                 "cache_read_input_tokens": 0, "cache_write_1h_tokens": 10000}, ["Read"], False)
 
 _rep = lp.session_report("sess-report-1")
-check("/_report scope: 4 requests, 4 turns, opus model",
-      _rep["scope"]["requests"] == 4 and _rep["scope"]["turns"] == 4
+check("/_report scope: 4 wire requests, 1 user turn (the carriage multiplier is requests)",
+      _rep["scope"]["requests"] == 4 and _rep["scope"]["turns"] == 1
       and _rep["scope"]["models"] == ["claude-opus-4-8"])
 _rtot = _rep["totals"]
 check("/_report totals sum per-request billing (NOT cumulative)",
@@ -2284,13 +2284,14 @@ check("/_report finding: cache_misses surfaced with keep-warm lever",
       "warm-cache" in _byc["cache_misses"]["lever"]
       and _byc["cache_misses"]["suspected_cause"] == "idle_gap_gt_ttl")
 _pa = _rep["token_decomposition"]["preamble"]
-_dead_pt = sum(f["reclaimable_tokens_per_turn"] for f in _rep["findings"]
+_dead_pt = sum(f["reclaimable_tokens_per_request"] for f in _rep["findings"]
                if f["category"] in ("deadweight_tools", "deadweight_skills")
                and f["line"] == "main")
-check("/_report INVARIANT: preamble.unused_tokens_per_turn == Σ main deadweight/turn",
-      _pa["unused_tokens_per_turn"] == _dead_pt and _dead_pt > 0)
-check("/_report preamble used + unused == total per turn",
-      _pa["used_tokens_per_turn"] + _pa["unused_tokens_per_turn"] == _pa["tokens_per_turn"])
+check("/_report INVARIANT: preamble.unused_tokens_per_request == Σ main deadweight/request",
+      _pa["unused_tokens_per_request"] == _dead_pt and _dead_pt > 0)
+check("/_report preamble used + unused == total per request",
+      _pa["used_tokens_per_request"] + _pa["unused_tokens_per_request"]
+      == _pa["tokens_per_request"])
 _rv = _rep["verdict"]
 check("/_report verdict: score 0-100 + rating + factual headline",
       0 <= _rv["score"] <= 100 and _rv["rating"] in ("optimal", "suboptimal", "wasteful")

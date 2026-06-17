@@ -31,9 +31,15 @@ from . import billing as billing_mod
 from . import core as core_mod
 from . import status as status_mod
 
-REPORT_VERSION = 2          # v2: added `waste` section; cache_misses finding
-#                             reclaimable is now MARGINAL (net of the warm read),
-#                             while cost_decomposition.cache_misses stays gross.
+REPORT_VERSION = 3          # v2: added `waste` section; cache_misses finding
+#                             reclaimable is MARGINAL (net of the warm read), while
+#                             cost_decomposition.cache_misses stays gross.
+#                           v3: carriage multiplier is REQUESTS, not turns (each
+#                             request re-sends the prefix; one user turn fans out
+#                             into many). Renamed *_per_turn -> *_per_request,
+#                             turns_resent -> requests_resent, finding `turns` ->
+#                             `requests`; scope.turns now = user prompts (the human
+#                             "turn"), scope.requests = wire requests (the multiplier).
 
 # Verdict thresholds, driven by reclaimable_pct of HIGH+MEDIUM-confidence
 # findings only (low-conf heuristics inform prose, never the rating — clodex's
@@ -270,29 +276,30 @@ def _token_decomposition(pairs, util_by_line, skutil_by_line):
     if not comp:
         return None, {}
     cats = {c["category"]: c["tokens"] for c in comp["by_category"]}
-    preamble_per_turn = sum(cats.get(k, 0) for k in _PREAMBLE_CATEGORIES)
+    preamble_per_request = sum(cats.get(k, 0) for k in _PREAMBLE_CATEGORIES)
 
     # deadweight (provably unused) on the main line, from the disk util scans
     tools = status_mod._tool_roster(body)
     skills = status_mod._skill_roster(body)
     t_roll = status_mod._apply_utilization(tools, util_by_line.get("main")) if tools else None
     s_roll = status_mod._apply_skill_utilization(skills, skutil_by_line.get("main")) if skills else None
-    unused_per_turn = ((t_roll or {}).get("deadweight_tokens", 0)
-                       + (s_roll or {}).get("deadweight_tokens", 0))
+    unused_per_request = ((t_roll or {}).get("deadweight_tokens", 0)
+                          + (s_roll or {}).get("deadweight_tokens", 0))
 
-    main_turns = (util_by_line.get("main") or {}).get("evaluable_turns", 0)
+    # the carriage multiplier is REQUESTS (each re-sends the prefix), not user turns
+    main_requests = (util_by_line.get("main") or {}).get("evaluable_turns", 0)
     conversation = sum(cats.get(k, 0) for k in
                        ("user", "assistant", "thinking", "tool_calls", "tool_results"))
     decomp = {
         "basis": "estimate",          # char/4; the $ truth lives in cost_decomposition
         "preamble": {
-            "tokens_per_turn": preamble_per_turn,
-            "turns_resent": main_turns,
-            "total_resent_tokens": preamble_per_turn * main_turns,
-            "used_tokens_per_turn": max(0, preamble_per_turn - unused_per_turn),
-            "unused_tokens_per_turn": unused_per_turn,
+            "tokens_per_request": preamble_per_request,
+            "requests_resent": main_requests,
+            "total_resent_tokens": preamble_per_request * main_requests,
+            "used_tokens_per_request": max(0, preamble_per_request - unused_per_request),
+            "unused_tokens_per_request": unused_per_request,
             "stable": True,           # byte-stable prefix => proven re-sent, not estimated
-            "by_category": [{"category": k, "tokens_per_turn": cats[k]}
+            "by_category": [{"category": k, "tokens_per_request": cats[k]}
                             for k in _PREAMBLE_CATEGORIES if cats.get(k)],
         },
         "conversation_tokens": conversation,
@@ -314,15 +321,16 @@ def _line_rates(pairs, line):
     return None, None
 
 
-def _reclaimable_carriage_usd(tokens_per_turn, turns, rates):
-    """A preamble token that rides the cache is paid as a cache_read every warm
-    turn, plus one cold write to establish it. Honest reclaimable $ = recurring
-    reads × turns + one 5m write (NOT full input rate — it was never full-priced
-    after turn 1)."""
-    if not rates or not tokens_per_turn:
+def _reclaimable_carriage_usd(tokens_per_request, requests, rates):
+    """A preamble token that rides the cache is paid as a cache_read on every warm
+    REQUEST (not per user turn — one turn fans out into many requests, each
+    re-sending the prefix), plus one cold write to establish it. Honest
+    reclaimable $ = recurring reads × requests + one 5m write (NOT full input rate
+    — it was never full-priced after the first write)."""
+    if not rates or not tokens_per_request:
         return 0.0
-    recurring = _usd(tokens_per_turn, rates["cache_read"]) * max(turns, 1)
-    one_write = _usd(tokens_per_turn, rates["cache_write_5m"])
+    recurring = _usd(tokens_per_request, rates["cache_read"]) * max(requests, 1)
+    one_write = _usd(tokens_per_request, rates["cache_write_5m"])
     return round(recurring + one_write, 6)
 
 
@@ -407,7 +415,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
         s_roll = status_mod._apply_skill_utilization(skills, skutil_by_line.get(line)) if skills else None
         attr = attribution.get(line, {})
         if t_roll and t_roll["deadweight_tokens"] > 0:
-            turns = t_roll["evaluable_turns"]
+            reqs = t_roll["evaluable_turns"]      # tool-loaded requests (the multiplier)
             dead = [pp for pp in tools["per_tool"] if pp["used"] == 0]
             evid = [{"name": pp["name"], "est_tokens": pp["est_tokens"],
                      "calls": attr.get(pp["name"], {}).get("calls", 0)}
@@ -417,33 +425,33 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                 "category": "deadweight_tools", "line": line,
                 "title": f"{len(dead)} of {t_roll['loaded']} tools loaded, never called"
                          + (" (subagent)" if is_sub else ""),
-                "detail": "Schemas re-sent every turn, 0 calls over "
-                          f"{turns} turns: " + ", ".join(pp["name"] for pp in dead[:8]),
-                "reclaimable_tokens_per_turn": t_roll["deadweight_tokens"],
-                "reclaimable_tokens": t_roll["deadweight_tokens"] * turns,
-                "reclaimable_usd": _reclaimable_carriage_usd(t_roll["deadweight_tokens"], turns, rates),
-                "turns": turns,
+                "detail": "Schemas re-sent every request, 0 calls over "
+                          f"{reqs} requests: " + ", ".join(pp["name"] for pp in dead[:8]),
+                "reclaimable_tokens_per_request": t_roll["deadweight_tokens"],
+                "reclaimable_tokens": t_roll["deadweight_tokens"] * reqs,
+                "reclaimable_usd": _reclaimable_carriage_usd(t_roll["deadweight_tokens"], reqs, rates),
+                "requests": reqs,
                 "evidence": {"loaded": t_roll["loaded"], "used": t_roll["used_distinct"],
-                             "evaluable_turns": turns, "per_tool": evid},
+                             "evaluable_requests": reqs, "per_tool": evid},
                 "confidence": "high", "additive": True,
                 "lever": ("[wirescope:strip-tools …] on the spawn prompt" if is_sub
                           else '--tools "Read Edit Write Bash Glob Grep"'),
             })
         if s_roll and s_roll["deadweight_tokens"] > 0:
-            turns = s_roll["evaluable_turns"]
+            reqs = s_roll["evaluable_turns"]
             dead = [pp for pp in skills["per_skill"] if pp["used"] == 0]
             out.append({
                 "id": f"deadweight_skills:{line}",
                 "category": "deadweight_skills", "line": line,
                 "title": f"{len(dead)} of {s_roll['loaded']} skills loaded, never invoked",
-                "detail": "Skills list re-sent every turn, 0 invocations over "
-                          f"{turns} turns: " + ", ".join(pp["name"] for pp in dead[:8]),
-                "reclaimable_tokens_per_turn": s_roll["deadweight_tokens"],
-                "reclaimable_tokens": s_roll["deadweight_tokens"] * turns,
-                "reclaimable_usd": _reclaimable_carriage_usd(s_roll["deadweight_tokens"], turns, rates),
-                "turns": turns,
+                "detail": "Skills list re-sent every request, 0 invocations over "
+                          f"{reqs} requests: " + ", ".join(pp["name"] for pp in dead[:8]),
+                "reclaimable_tokens_per_request": s_roll["deadweight_tokens"],
+                "reclaimable_tokens": s_roll["deadweight_tokens"] * reqs,
+                "reclaimable_usd": _reclaimable_carriage_usd(s_roll["deadweight_tokens"], reqs, rates),
+                "requests": reqs,
                 "evidence": {"loaded": s_roll["loaded"], "used": s_roll["used_distinct"],
-                             "evaluable_turns": turns},
+                             "evaluable_requests": reqs},
                 "confidence": "high", "additive": True,
                 "lever": "skillOverrides:{\"<name>\":\"off\"} in settings (reclaims tokens; "
                          "permissions.deny only gates invocation)",
@@ -455,22 +463,22 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
     if comp:
         cats = {c["category"]: c["tokens"] for c in comp["by_category"]}
         rates, _ = _line_rates(pairs, "main")
-        turns = (util_by_line.get("main") or {}).get("evaluable_turns", 0)
+        reqs = (util_by_line.get("main") or {}).get("evaluable_turns", 0)
         for cat, lever in (("claudemd", "[wirescope:omit claudemd] on subagent spawns"),
                            ("useremail", "[wirescope:omit useremail] / WS_OMIT_DEFAULT")):
             tok = cats.get(cat, 0)
-            if tok > 0 and turns:
+            if tok > 0 and reqs:
                 out.append({
                     "id": f"reclaimable_{cat}", "category": f"reclaimable_{cat}",
                     "line": "main",
-                    "title": f"{cat} re-sent every turn ({tok} tok/turn)",
-                    "detail": f"{cat} rides the cached preamble on all {turns} turns; "
+                    "title": f"{cat} re-sent every request ({tok} tok/request)",
+                    "detail": f"{cat} rides the cached preamble on all {reqs} requests; "
                               "a file-reading subagent rarely needs it.",
-                    "reclaimable_tokens_per_turn": tok,
-                    "reclaimable_tokens": tok * turns,
-                    "reclaimable_usd": _reclaimable_carriage_usd(tok, turns, rates),
-                    "turns": turns,
-                    "evidence": {"tokens_per_turn": tok},
+                    "reclaimable_tokens_per_request": tok,
+                    "reclaimable_tokens": tok * reqs,
+                    "reclaimable_usd": _reclaimable_carriage_usd(tok, reqs, rates),
+                    "requests": reqs,
+                    "evidence": {"tokens_per_request": tok},
                     "confidence": "medium", "additive": True, "lever": lever,
                 })
 
@@ -484,7 +492,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                 "detail": f"{f} was read {n} times on this line — re-reads ship the "
                           "full file each time.",
                 "reclaimable_tokens": 0, "reclaimable_usd": 0.0,
-                "turns": n, "evidence": {"file": f, "reads": n},
+                "occurrences": n, "evidence": {"file": f, "reads": n},
                 "confidence": "low", "additive": False, "lever": "cache the read / @file"})
         elif h[0] == "cheaper_tool":
             _, line, cmd, alt, n = h
@@ -494,7 +502,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                 "detail": f"`{cmd}` was shelled out {n}× via Bash; the {alt} tool does "
                           "the same job without spawning a shell.",
                 "reclaimable_tokens": 0, "reclaimable_usd": 0.0,
-                "turns": n, "evidence": {"command": cmd, "alternative": alt, "count": n},
+                "occurrences": n, "evidence": {"command": cmd, "alternative": alt, "count": n},
                 "confidence": "low", "additive": False,
                 "lever": f"use the {alt} tool instead of Bash {cmd}"})
 
@@ -516,15 +524,15 @@ def _verdict(findings, total_usd, preamble, totals_tokens):
         rating = "wasteful"
     score = round(max(0.0, 100.0 * (1.0 - min(pct, _SCORE_PCT_CEILING) / _SCORE_PCT_CEILING)))
     # factual headline: lead with the dominant cost bucket.
-    pre = (preamble or {}).get("tokens_per_turn", 0)
-    turns = (preamble or {}).get("turns_resent", 0)
+    pre = (preamble or {}).get("tokens_per_request", 0)
+    reqs = (preamble or {}).get("requests_resent", 0)
     cr = next((b for b in totals_tokens.get("by_bucket", [])
                if b["bucket"] == "cache_read"), None)
-    if cr and turns:
+    if cr and reqs:
         headline = (f"{cr['pct']:.0f}% of ${total_usd:.2f} is cache-read of a "
-                    f"~{pre/1000:.0f}k-token preamble re-sent {turns}×")
+                    f"~{pre/1000:.0f}k-token preamble re-sent {reqs}× (requests)")
     else:
-        headline = f"${total_usd:.2f} over {turns} turns"
+        headline = f"${total_usd:.2f} over {reqs} requests"
     return {"rating": rating, "score": score, "headline": headline,
             "reclaimable_usd_total": round(reclaimable, 6),
             "reclaimable_pct": round(pct, 1),
@@ -581,8 +589,40 @@ def _waste_section(findings, total_usd):
     }
 
 
+def _user_turns(pairs):
+    """Genuine conversation turns = user PROMPTS on the main line (what a human
+    means by 'turn'), NOT wire requests. The full conversation lives in the last
+    (largest) main request body; count user messages that are real prompts — not
+    tool_result continuations and not harness-injected reminders. One user turn
+    fans out into many requests (each tool-loop hop), which is why carriage is
+    priced per-REQUEST, not per-turn."""
+    last_main = None
+    for p in pairs:
+        if p["line"] == "main" and isinstance(p["req"].get("body"), dict):
+            last_main = p["req"]["body"]
+    if not last_main:
+        return 0
+    n = 0
+    for m in last_main.get("messages") or []:
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        blocks = (c if isinstance(c, list)
+                  else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
+            continue                      # tool-loop continuation, not a prompt
+        texts = [b.get("text", "") for b in blocks
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        # count if ANY block is genuine prose — the harness bundles the injected
+        # reminders alongside the real prompt as separate blocks in the first
+        # message, so "exclude if any reminder" would drop that opening turn.
+        if any(t.strip() and not status_mod._is_injected_reminder(t) for t in texts):
+            n += 1
+    return n
+
+
 def _scope(pairs):
-    reqs = billed = turns = 0
+    reqs = billed = 0
     models = set()
     first = last = None
     lines = {}                           # key -> {line, role, agent_id, model, requests}
@@ -595,9 +635,6 @@ def _scope(pairs):
         if p["ts"]:
             first = p["ts"] if first is None else min(first, p["ts"])
             last = p["ts"] if last is None else max(last, p["ts"])
-        # a "turn" = a main-line text-producing response (mirror billing._bump)
-        if p["line"] == "main" and (p["resp"].get("meta") or {}).get("text"):
-            turns += 1
         summ = p["summ"]
         k = p["line"]
         e = lines.setdefault(k, {"line": "main" if k == "main" else "subagent",
@@ -605,7 +642,9 @@ def _scope(pairs):
                                  "agent_id": summ.get("agent_id"),
                                  "model": p["model"], "requests": 0})
         e["requests"] += 1
-    return {"requests": reqs, "billed_requests": billed, "turns": turns,
+    return {"requests": reqs,             # wire requests (the carriage multiplier)
+            "billed_requests": billed,
+            "turns": _user_turns(pairs),  # user prompts = conversation turns (human)
             "first_ts": first, "last_ts": last, "models": sorted(models),
             "agents": list(lines.values())}
 
@@ -671,7 +710,7 @@ def session_report(session, detail=False):
             "detail": f"{misses['count']} turns paid a full prefix re-write "
                       f"({misses['tokens']} tok) — dominant cause: {cause}.",
             "reclaimable_tokens": misses["tokens"], "reclaimable_usd": marginal,
-            "turns": misses["count"], "where": misses["where"],
+            "events": misses["count"], "where": misses["where"],
             "suspected_cause": cause, "by_cause": misses["by_cause"],
             "evidence": {"events": misses["events"], "gross_write_usd": misses["usd"],
                          "read_equiv_usd": round(read_equiv, 6),
@@ -700,7 +739,9 @@ def session_report(session, detail=False):
         "invariants": {
             "cost_buckets_sum_to_totals": "Σ by_bucket.usd == totals.est_usd (± rounding)",
             "preamble_unused_eq_deadweight": "token_decomposition.preamble."
-                "unused_tokens_per_turn == Σ findings[deadweight_*].reclaimable_tokens_per_turn",
+                "unused_tokens_per_request == Σ findings[deadweight_*]."
+                "reclaimable_tokens_per_request (main line; carriage is per-REQUEST, "
+                "not per user turn — one turn fans out into many requests)",
             "cache_misses_subset_of_rewrite": "cost_decomposition.cache_misses.usd == "
                 "the cache_write_rewrite by_bucket row (localised drill-down, ALREADY "
                 "counted in by_bucket — NOT an additional addend; by_bucket stays the "
