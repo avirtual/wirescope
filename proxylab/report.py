@@ -31,7 +31,9 @@ from . import billing as billing_mod
 from . import core as core_mod
 from . import status as status_mod
 
-REPORT_VERSION = 1
+REPORT_VERSION = 2          # v2: added `waste` section; cache_misses finding
+#                             reclaimable is now MARGINAL (net of the warm read),
+#                             while cost_decomposition.cache_misses stays gross.
 
 # Verdict thresholds, driven by reclaimable_pct of HIGH+MEDIUM-confidence
 # findings only (low-conf heuristics inform prose, never the rating — clodex's
@@ -530,6 +532,55 @@ def _verdict(findings, total_usd, preamble, totals_tokens):
                           else "medium"}
 
 
+# Map each finding category to a waste TYPE (the consolidated "what could have
+# gone better" grouping). Low-confidence heuristics (cheaper_tool/redundant_read)
+# are additive:false and never enter the waste $ — they're quality hints.
+_WASTE_TYPE = {
+    "cache_misses": "cold_cache",
+    "deadweight_tools": "deadweight_tools",
+    "deadweight_skills": "deadweight_skills",
+    "reclaimable_claudemd": "claudemd_carriage",
+    "reclaimable_useremail": "useremail_carriage",
+}
+
+
+def _waste_section(findings, total_usd):
+    """The consolidated WASTE view — 'what could have gone better', priced as the
+    real saving (NET reclaimable), aggregated by type across all agent lines.
+    Distinct from cost_decomposition (which is gross — every dollar actually paid):
+    waste is the avoidable SUBSET. A cold-cache re-write enters at its marginal
+    cost (write − the read you'd pay warm); unused tools/skills/claudemd enter at
+    their carriage (cached-read rate × requests + one write). Only `additive`
+    findings count; sorted by $ desc. total == verdict.reclaimable_usd_total."""
+    agg = {}
+    for f in findings:
+        if not f.get("additive"):
+            continue
+        wt = _WASTE_TYPE.get(f["category"], f["category"])
+        a = agg.setdefault(wt, {"type": wt, "usd": 0.0, "tokens": 0, "items": 0,
+                                "confidence": f.get("confidence"),
+                                "lever": f.get("lever")})
+        a["usd"] += f.get("reclaimable_usd", 0.0)
+        a["tokens"] += f.get("reclaimable_tokens", 0) or 0
+        a["items"] += 1
+        # a high-confidence contributor upgrades the group's confidence label
+        if f.get("confidence") == "high":
+            a["confidence"] = "high"
+    by_type = sorted(agg.values(), key=lambda x: x["usd"], reverse=True)
+    for a in by_type:
+        a["usd"] = round(a["usd"], 6)
+    total = round(sum(a["usd"] for a in by_type), 6)
+    return {
+        "total_usd": total,
+        "pct_of_session": round(100.0 * total / total_usd, 1) if total_usd else 0.0,
+        "by_type": by_type,
+        "basis": "net reclaimable (the real saving), aggregated by type: cold-cache "
+                 "at marginal cost (2× write − 0.1× read you'd pay warm); unused "
+                 "tools/skills/claudemd at carriage (cached-read rate × requests + "
+                 "one write). Subset of cost_decomposition; == verdict.reclaimable_usd_total.",
+    }
+
+
 def _scope(pairs):
     reqs = billed = turns = 0
     models = set()
@@ -601,28 +652,38 @@ def session_report(session, detail=False):
     attribution, hints = _tool_result_attribution(pairs)
     findings = _findings(pairs, util, skutil, td_extra, attribution, hints)
 
-    # fold the cache-miss localisation into a finding (medium; additive — the
-    # rewrite $ a keep-warm / hold would reclaim).
+    # fold the cache-miss localisation into a finding (medium; additive — the $ a
+    # keep-warm / hold would reclaim). Priced MARGINAL: a cold prefix is billed as
+    # a 2× (1h) write, but even kept warm you'd pay the 0.1× read — so the true
+    # saving is write − read, not the gross write (which stays in cost_decomposition
+    # as what you actually PAID). At 1h that's ~95% of the write; at 5m less.
     if misses["count"]:
         cause = max(misses["by_cause"], key=misses["by_cause"].get)
         lever = ("/warm-cache N (or POST /_hold) — keep the prefix warm across idle gaps"
                  if cause == "idle_gap_gt_ttl"
                  else "stabilise the prefix (relocate volatile env to tail — on by default)")
+        mrates, _ = _line_rates(pairs, "main")
+        read_equiv = _usd(misses["tokens"], mrates["cache_read"]) if mrates else 0.0
+        marginal = round(max(0.0, misses["usd"] - read_equiv), 6)
         findings.append({
             "id": "cache_misses", "category": "cache_misses", "line": "main",
             "title": f"Cache re-written {misses['count']}× after it had been warm",
             "detail": f"{misses['count']} turns paid a full prefix re-write "
                       f"({misses['tokens']} tok) — dominant cause: {cause}.",
-            "reclaimable_tokens": misses["tokens"], "reclaimable_usd": misses["usd"],
+            "reclaimable_tokens": misses["tokens"], "reclaimable_usd": marginal,
             "turns": misses["count"], "where": misses["where"],
             "suspected_cause": cause, "by_cause": misses["by_cause"],
-            "evidence": {"events": misses["events"]},
+            "evidence": {"events": misses["events"], "gross_write_usd": misses["usd"],
+                         "read_equiv_usd": round(read_equiv, 6),
+                         "note": "reclaimable = gross write − the 0.1× read you'd pay "
+                                 "even kept warm; gross is in cost_decomposition"},
             "confidence": "medium", "additive": True, "lever": lever,
         })
         findings.sort(key=lambda x: x.get("reclaimable_usd", 0.0), reverse=True)
 
     preamble = (token_decomp or {}).get("preamble", {})
     verdict = _verdict(findings, cost["total_usd"], preamble, cost)
+    waste = _waste_section(findings, cost["total_usd"])
 
     return {
         "report_version": REPORT_VERSION,
@@ -634,6 +695,7 @@ def session_report(session, detail=False):
         "cost_decomposition": {**cost, "basis": "receipt", "cache_misses": misses},
         "token_decomposition": token_decomp,
         "findings": findings,
+        "waste": waste,
         "verdict": verdict,
         "invariants": {
             "cost_buckets_sum_to_totals": "Σ by_bucket.usd == totals.est_usd (± rounding)",
@@ -644,5 +706,10 @@ def session_report(session, detail=False):
                 "counted in by_bucket — NOT an additional addend; by_bucket stays the "
                 "sum-to-totals set). cache_write_initial and cache_write_rewrite are "
                 "disjoint and together equal total cache writes.",
+            "waste_is_net_reclaimable": "waste.total_usd == verdict.reclaimable_usd_total "
+                "== Σ additive findings.reclaimable_usd. waste is the AVOIDABLE SUBSET of "
+                "cost_decomposition priced as the real saving (NET): cold-cache marginal "
+                "(write − warm read), carriage at cached-read rate. cost_decomposition is "
+                "GROSS (every dollar paid); waste is what better choices would reclaim.",
         },
     }

@@ -2301,6 +2301,22 @@ check("/_report verdict score ignores low-confidence (non-additive) findings",
           if f.get("additive") and f["confidence"] in ("high", "medium")), 6))
 check("/_report report_version + disk basis stamped",
       _rep["report_version"] == lp.report.REPORT_VERSION and _rep["basis"] == "on-disk-capture")
+_w = _rep["waste"]
+_wt = {t["type"]: t for t in _w["by_type"]}
+check("/_report waste: total == verdict.reclaimable_usd_total (net reclaimable subset)",
+      abs(_w["total_usd"] - _rep["verdict"]["reclaimable_usd_total"]) < 1e-6
+      and _w["pct_of_session"] >= 0)
+check("/_report waste: cold_cache priced MARGINAL (< gross), gross kept in cost_decomposition",
+      "cold_cache" in _wt
+      and _wt["cold_cache"]["usd"] < _rep["cost_decomposition"]["cache_misses"]["usd"]
+      and _rep["cost_decomposition"]["cache_misses"]["usd"] == _bk["cache_write_rewrite"]["usd"])
+check("/_report waste: deadweight tools+skills grouped by type, high confidence",
+      _wt["deadweight_tools"]["confidence"] == "high"
+      and _wt["deadweight_skills"]["confidence"] == "high")
+check("/_report cache_misses finding reclaimable is net (gross_write - read_equiv)",
+      abs(_byc["cache_misses"]["reclaimable_usd"]
+          - (_byc["cache_misses"]["evidence"]["gross_write_usd"]
+             - _byc["cache_misses"]["evidence"]["read_equiv_usd"])) < 1e-6)
 check("/_report cold/unknown session -> note, no crash",
       lp.session_report("sess-does-not-exist")["scope"]["requests"] == 0)
 
