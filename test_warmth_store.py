@@ -2321,6 +2321,30 @@ check("/_report cache_misses finding reclaimable is net (gross_write - read_equi
 check("/_report cold/unknown session -> note, no crash",
       lp.session_report("sess-does-not-exist")["scope"]["requests"] == 0)
 
+# --- /_report?detail=1 series (the /_timeline data) --------------------------
+_repd = lp.session_report("sess-report-1", detail=True)
+_ser = _repd["series"]
+check("/_report detail=1 emits per-request series (4 main-line requests, indexed 1..n)",
+      _ser["count"] == 4 and [r["i"] for r in _ser["requests"]] == [1, 2, 3, 4])
+check("/_report series omitted unless detail=1",
+      "series" not in lp.session_report("sess-report-1"))
+_sp = _ser["spine_totals"]
+check("/_report series spine = three exact buckets read/write/generation",
+      _ser["spine_buckets"] == ["read", "write", "generation"]
+      and all(k in _sp for k in ("read", "write", "generation")))
+check("/_report series INVARIANT: read = cached + uncached reads",
+      abs(_sp["read"] - (_sp["read_cached"] + _sp["read_uncached"])) < 1e-6)
+check("/_report series INVARIANT: read+write+generation == totals.est_usd (all main line)",
+      abs((_sp["read"] + _sp["write"] + _sp["generation"]) - _repd["totals"]["est_usd"]) < 1e-6)
+check("/_report series: turn1+turn4 are the cold WRITES, turns2-3 pure reads",
+      _ser["requests"][0]["write_usd"] > 0 and _ser["requests"][3]["write_usd"] > 0
+      and _ser["requests"][1]["write_usd"] == 0 and _ser["requests"][2]["write_usd"] == 0)
+check("/_report series: per-request total == read+write+generation (each row reconciles)",
+      all(abs(r["total_usd"] - (r["read_usd"] + r["write_usd"] + r["generation_usd"])) < 1e-6
+          for r in _ser["requests"]))
+check("/_report series: content carriage estimate split present (read drill-down)",
+      set(_ser["content_carriage_est"]) == {"preamble", "conversation", "thinking"})
+
 # claudemd/useremail carriage is SUBAGENT-scoped (v4): the [wirescope:omit] lever
 # only shapes spawns, so MAIN-line claudemd is informational (legitimate context,
 # no main-line lever) while a SUBAGENT's inherited claudemd is real reclaimable.

@@ -230,6 +230,19 @@ async def handler(request: Request) -> Response:
         res = report_mod.session_report(sess, detail=detail)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
+    # ---- timeline page: per-request cost evolution, for humans -----------------
+    # GET /_timeline?session=<id> — read-only HTML render of the cost-over-time
+    # dashboard (the visual companion to /_report?detail=1). DISK-based, heavy,
+    # on-demand only (same cost profile as /_report).
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_timeline":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response("missing ?session=", status_code=400,
+                            media_type="text/plain")
+        rep = report_mod.session_report(sess, detail=True)
+        return Response(views_mod._render_timeline_html(sess, rep),
+                        media_type="text/html; charset=utf-8")
+
     # ---- admin page: the same snapshot for humans ------------------------------
     # GET /_admin[?session=<id>][&all=1] — read-only HTML view of /_status.
     if request.method == "GET" and request.url.path.rstrip("/") == "/_admin":

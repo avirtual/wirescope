@@ -769,9 +769,91 @@ def _totals(pairs):
     }
 
 
+# Per-request timeline (detail=1). The cost SPINE is three receipt-exact buckets:
+# a token the model READS (cached at 0.1× or uncached at 1× — same activity, two
+# prices), the WRITE toll to cache it, and GENERATION (output tokens). The
+# content bands are the char-estimate of WHAT is being re-read (same basis as
+# status._composition / _token_decomposition), grouped for the eye.
+_TL_BANDS = [
+    ("preamble", ("system", "claudemd", "useremail", "agents", "skills", "tools")),
+    ("conversation", ("user", "assistant", "tool_calls", "tool_results")),
+    ("thinking", ("thinking",)),
+]
+
+
+def _series(pairs):
+    """Per main-line-request cost timeline, chronological — the data behind the
+    /_timeline charts. Spine ($) is receipt-exact; bands (tokens) are estimate.
+    Main line only: the carriage-growth story is the one stable instance; mixed
+    subagent windows would only add noise (their totals are in cost_decomposition).
+    """
+    reqs = []
+    spine = collections.Counter()
+    content = collections.Counter()        # estimate: carriage $ by content band
+    i = 0
+    for p in pairs:
+        if p["line"] != "main":
+            continue
+        rates = billing_mod._price_for(p["model"])
+        if not rates:
+            continue
+        t = p["tokens"]
+        cr = t.get("cache_read_input_tokens") or 0
+        w5 = t.get("cache_write_5m_tokens") or 0
+        w1 = t.get("cache_write_1h_tokens") or 0
+        flat = t.get("cache_write_flat_tokens") or 0
+        if not w5 and not w1 and flat:
+            w5 = flat
+        inp = t.get("input_tokens") or 0
+        out = t.get("output_tokens") or 0
+        read_cached = _usd(cr, rates["cache_read"])
+        read_uncached = _usd(inp, rates["in"])
+        write_usd = _usd(w5, rates["cache_write_5m"]) + _usd(w1, rates["cache_write_1h"])
+        gen_usd = _usd(out, rates["out"])
+        read_usd = read_cached + read_uncached
+        comp = status_mod._composition(p["req"].get("body"))      # estimate, whole body
+        cats = {c["category"]: c["tokens"] for c in comp["by_category"]} if comp else {}
+        bands = {name: sum(cats.get(k, 0) for k in keys) for name, keys in _TL_BANDS}
+        i += 1
+        reqs.append({
+            "i": i, "ts": p["ts"],
+            "read_usd": round(read_usd, 6),
+            "read_cached_usd": round(read_cached, 6),
+            "read_uncached_usd": round(read_uncached, 6),
+            "write_usd": round(write_usd, 6),
+            "generation_usd": round(gen_usd, 6),
+            "total_usd": round(read_usd + write_usd + gen_usd, 6),
+            "window_tokens": cr + w5 + w1 + inp,
+            "bands": bands,
+        })
+        spine["read"] += read_usd
+        spine["write"] += write_usd
+        spine["generation"] += gen_usd
+        spine["read_cached"] += read_cached
+        spine["read_uncached"] += read_uncached
+        # carriage (read+write) apportioned to content by token share (estimate)
+        tot_tok = sum(bands.values()) or 1
+        carriage = read_usd + write_usd
+        for name, _keys in _TL_BANDS:
+            content[name] += carriage * bands[name] / tot_tok
+    return {
+        "basis": "main-line requests, chronological; spine = receipt-exact $, "
+                 "content = char-estimate token-share of carriage (read+write). "
+                 "ALL billed main-line requests are included — req 1 is typically "
+                 "the ~1.2k-char title/side-call (tiny window, no preamble), so the "
+                 "composition only reaches steady state from the first tool-loaded "
+                 "turn; render accordingly if a clean left edge matters.",
+        "count": len(reqs),
+        "spine_buckets": ["read", "write", "generation"],
+        "spine_totals": {k: round(v, 6) for k, v in spine.items()},
+        "content_carriage_est": {k: round(content[k], 6) for k, _ in _TL_BANDS},
+        "requests": reqs,
+    }
+
+
 def session_report(session, detail=False):
-    """Build the full report_version=1 payload for a session, scanned from disk.
-    `detail` is reserved for v1.1 per-turn series (documented, not yet emitted)."""
+    """Build the full report payload for a session, scanned from disk. When
+    `detail` is set, also emit the per-request `series` (the /_timeline data)."""
     pairs = list(_iter_pairs(session))
     if not pairs:
         return {"report_version": REPORT_VERSION, "session_id": session,
@@ -820,7 +902,7 @@ def session_report(session, detail=False):
     verdict = _verdict(findings, cost["total_usd"], preamble, cost)
     waste = _waste_section(findings, cost["total_usd"])
 
-    return {
+    out = {
         "report_version": REPORT_VERSION,
         "session_id": session,
         "generated_at": __import__("time").time(),
@@ -850,3 +932,6 @@ def session_report(session, detail=False):
                 "GROSS (every dollar paid); waste is what better choices would reclaim.",
         },
     }
+    if detail:
+        out["series"] = _series(pairs)
+    return out

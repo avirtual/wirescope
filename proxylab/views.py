@@ -775,3 +775,153 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
             f'<title>wirescope · {e((s.get("title") or sid)[:60])}</title>'
             f'<style>{_SESSION_CSS}</style></head><body>'
             + head + body + foot + "</body></html>")
+
+
+# --- /_timeline: per-request cost evolution, rendered for humans ---------------
+# The visual companion to /_report?detail=1 (same `series` data). Three exact
+# cost buckets — READ (the model consuming the context window, cached 0.1× or
+# uncached 1×: same activity, two prices), WRITE (the toll to cache so later
+# reads are ~10× cheaper), GENERATION (output tokens) — as a pie + a cumulative
+# line, plus an ESTIMATE drill-down of what content the read pays to re-carry.
+# Self-contained SVG, zero JS, same dark lab-grade aesthetic as /_admin.
+_TL_W, _TL_H, _TL_PAD = 920, 260, 46
+_TL_SPINE = [("read", "#e0794b"), ("write", "#d4b14a"), ("generation", "#46c08a")]
+_TL_CONTENT = [("conversation", "#46c08a"), ("preamble", "#5b8def"),
+               ("thinking", "#b97fe0")]
+
+
+def _tl_x(i, n):
+    return _TL_PAD + (_TL_W - 2 * _TL_PAD) * (i / max(1, n - 1))
+
+
+def _tl_y(v, ymax):
+    return _TL_PAD + (_TL_H - 2 * _TL_PAD) * (1 - (v / ymax if ymax else 0))
+
+
+def _tl_pie(cx, cy, r, slices, title):
+    import math
+    slices = sorted([s for s in slices if s[1] > 0], key=lambda s: s[1], reverse=True)
+    total = sum(s[1] for s in slices) or 1
+    g = [f'<text x="{cx}" y="{cy-r-26}" text-anchor="middle" class="t">'
+         f'{html.escape(title)}</text>']
+    halo = 'style="paint-order:stroke" stroke="#1b1e24" stroke-width="3"'
+    a0 = -math.pi / 2
+    for label, val, color in slices:
+        frac = val / total
+        a1 = a0 + 2 * math.pi * frac
+        x0, y0 = cx + r * math.cos(a0), cy + r * math.sin(a0)
+        x1, y1 = cx + r * math.cos(a1), cy + r * math.sin(a1)
+        large = 1 if frac > 0.5 else 0
+        g.append(f'<path d="M{cx},{cy} L{x0:.1f},{y0:.1f} A{r},{r} 0 {large} 1 '
+                 f'{x1:.1f},{y1:.1f} Z" fill="{color}" stroke="#1b1e24" stroke-width="1.5"/>')
+        if frac >= 0.02:
+            am = (a0 + a1) / 2
+            lx, ly = cx + (r + 16) * math.cos(am), cy + (r + 16) * math.sin(am)
+            anchor = "start" if math.cos(am) >= 0 else "end"
+            g.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" '
+                     f'fill="{color}" font-size="11.5" font-weight="700" {halo}>'
+                     f'{html.escape(label)} {frac*100:.0f}%</text>')
+        a0 = a1
+    g.append(f'<circle cx="{cx}" cy="{cy}" r="{r*0.52:.0f}" fill="#1b1e24"/>'
+             f'<text x="{cx}" y="{cy-2}" text-anchor="middle" fill="#eee" '
+             f'font-size="16" font-weight="700">${total:,.0f}</text>'
+             f'<text x="{cx}" y="{cy+13}" text-anchor="middle" fill="#8a93a0" '
+             f'font-size="10">total</text>')
+    return "".join(g)
+
+
+def _tl_axes(title, ymax, n, yfmt):
+    g = [f'<text x="{_TL_PAD}" y="20" class="t">{html.escape(title)}</text>']
+    for i in range(5):
+        y = _TL_PAD + (_TL_H - 2 * _TL_PAD) * i / 4
+        g.append(f'<line x1="{_TL_PAD}" y1="{y:.1f}" x2="{_TL_W-_TL_PAD}" y2="{y:.1f}" '
+                 f'class="grid"/>')
+        g.append(f'<text x="{_TL_PAD-6}" y="{y+3:.1f}" class="yl">{yfmt(ymax*(1-i/4))}</text>')
+    g.append(f'<text x="{_TL_PAD}" y="{_TL_H-_TL_PAD+18}" class="xl2">req 1</text>'
+             f'<text x="{_TL_W-_TL_PAD}" y="{_TL_H-_TL_PAD+18}" class="xl2">req {n}</text>')
+    return "".join(g)
+
+
+def _render_timeline_html(session, report):
+    """Render report['series'] (from session_report(detail=True)) as the cost-
+    evolution dashboard. `report` is the full /_report payload dict."""
+    e = html.escape
+    series = (report or {}).get("series") or {}
+    reqs = series.get("requests") or []
+    foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
+            f'<a href="/_report?session={e(session)}&detail=1">raw json</a> · '
+            f'<a href="/_session?session={e(session)}">context</a></p>')
+    if not reqs:
+        return ('<!doctype html><html><head><meta charset="utf-8">'
+                f'<title>wirescope · timeline</title><style>{_TL_CSS}</style></head>'
+                f'<body><h1>Cost over time · {e(session)}</h1>'
+                '<p class="dim">No priced main-line requests captured for this '
+                'session yet.</p>' + foot + '</body></html>')
+    n = len(reqs)
+    m = lambda v: f"${v:,.2f}"
+    st = series.get("spine_totals", {})
+    read, write, gen = st.get("read", 0), st.get("write", 0), st.get("generation", 0)
+    cached, uncached = st.get("read_cached", 0), st.get("read_uncached", 0)
+    total = read + write + gen
+    ce = series.get("content_carriage_est", {})
+
+    pie_spine = _tl_pie(250, 158, 104, [(k, st.get(k, 0), c) for k, c in _TL_SPINE],
+                        "Cost by type (exact)")
+    pie_content = _tl_pie(690, 158, 104, [(k, ce.get(k, 0), c) for k, c in _TL_CONTENT],
+                          "What read pays to carry (est.)")
+
+    # cumulative spine lines
+    run = {k: 0.0 for k, _ in _TL_SPINE}
+    cum = []
+    for r in reqs:
+        run["read"] += r["read_usd"]; run["write"] += r["write_usd"]
+        run["generation"] += r["generation_usd"]
+        cum.append(dict(run))
+    cmax = max(max(c.values()) for c in cum) * 1.08 or 1
+    parts, ends = [], []
+    # de-collide end labels: stack them at least 14px apart, top-to-bottom
+    last_pts = sorted(((_tl_y(cum[-1][k], cmax), k, c) for k, c in _TL_SPINE))
+    placed = []
+    for y, k, c in last_pts:
+        yy = y
+        while placed and yy - placed[-1] < 14:
+            yy = placed[-1] + 14
+        placed.append(yy)
+        ends.append((k, c, _tl_y(cum[-1][k], cmax), yy))
+    for k, c in _TL_SPINE:
+        pts = " ".join(f"{_tl_x(i,n):.1f},{_tl_y(cum[i][k],cmax):.1f}" for i in range(n))
+        parts.append(f'<polyline points="{pts}" fill="none" stroke="{c}" stroke-width="2"/>')
+    halo = 'style="paint-order:stroke" stroke="#14161a" stroke-width="3.5"'
+    for k, c, ydot, ylbl in ends:
+        parts.append(
+            f'<circle cx="{_tl_x(n-1,n):.1f}" cy="{ydot:.1f}" r="3" fill="{c}"/>'
+            f'<text x="{_tl_x(n-1,n)-7:.1f}" y="{ylbl+4:.1f}" text-anchor="end" '
+            f'fill="{c}" font-size="11.5" font-weight="700" {halo}>{k} {m(cum[-1][k])}</text>')
+    line = "".join(parts)
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>wirescope · cost over time</title><style>{_TL_CSS}</style></head><body>
+<h1>Where the money went · {e(session)}</h1>
+<div class="sub">{n} main-line requests · total {m(total)} · main line only (subagents in /_report)</div>
+<div class="card"><svg viewBox="0 0 940 320">{pie_spine}{pie_content}</svg>
+<div class="cap"><b>Left (exact):</b> every billed dollar is <b>read</b> (consuming the window — {m(cached)} cached + {m(uncached)} uncached, both reading input), <b>write</b> (the toll to cache so later reads are ~10&times; cheaper), or <b>generation</b> (output tokens). <b>Right (estimate):</b> the read dollars apportioned to the content re-read, by token share.</div></div>
+<div class="card"><svg viewBox="0 0 {_TL_W} {_TL_H}">{_tl_axes("Cumulative cost by type, turn 0 → last", cmax, n, m)}{line}</svg>
+<div class="cap"><b>read</b> bends upward — each turn re-reads a bigger window — while <b>write</b> and <b>generation</b> stay nearly flat. The widening gap is the context-carriage tax growing with session depth.</div></div>
+{foot}</body></html>"""
+
+
+_TL_CSS = """
+  body{background:#14161a;color:#d6d6d6;font:13px/1.5 -apple-system,Segoe UI,sans-serif;margin:0;padding:24px}
+  h1{font-size:16px;font-weight:600;margin:0 0 4px}
+  .sub{color:#8a93a0;margin-bottom:18px}
+  .card{background:#1b1e24;border:1px solid #2a2f38;border-radius:8px;padding:14px 12px;margin:14px 0}
+  svg{width:100%;height:auto}
+  .t{fill:#cfd6df;font-size:13px;font-weight:600}
+  .grid{stroke:#2a2f38;stroke-width:1}
+  .yl{fill:#6b7480;font-size:10px;text-anchor:end}
+  .xl2{fill:#6b7480;font-size:10px;text-anchor:middle}
+  .cap{color:#8a93a0;font-size:12px;margin-top:10px}
+  .cap b{color:#cfd6df;font-weight:600}
+  a{color:#5b8def}
+  .dim{color:#6b7480}
+"""

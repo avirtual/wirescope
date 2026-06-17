@@ -79,6 +79,7 @@ def _identity():
             "context_utilization": True,  # /_context?...&utilization=1 used/deadweight
             "context_skills": True,       # /_context per-skill roster + utilization
             "context_report": True,       # /_report?session= cost/efficiency report
+            "context_timeline": True,     # /_report?...&detail=1 series + /_timeline HTML
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -107,6 +108,7 @@ def _identity():
             "session": "/_session",
             "context": "/_context",
             "report": "/_report",
+            "timeline": "/_timeline",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
     }
