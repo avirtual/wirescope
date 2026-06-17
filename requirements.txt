@@ -2,6 +2,12 @@
 # Everything else it uses is in the standard library.
 # Codex/ChatGPT zstd capture uses stdlib `compression.zstd` (Python 3.14+);
 # on older Pythons that capture path degrades gracefully — no extra dep.
-httpx
-starlette
-uvicorn
+#
+# Pin FLOORS (not exact, not capped): bare names let a fresh resolver pull
+# anything, which is how an unpinned `starlette` landed on 1.x for a consumer
+# and broke the removed on_startup= hook. We use only the bedrock API + the
+# lifespan context manager (Starlette >=0.21), so any modern release — through
+# the 1.x line — works; no upper cap needed.
+httpx>=0.27
+starlette>=0.21
+uvicorn>=0.30

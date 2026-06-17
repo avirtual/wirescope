@@ -2404,6 +2404,13 @@ check("/_report carriage: main deadweight = 2 cold writes (1 establish + 1 miss)
       _rep["cost_decomposition"]["cache_misses"]["preamble_rewrites"] == 1
       and _dwt["reclaimable_usd"] == _dexp)
 
+# regression: the Starlette app must wire startup via the lifespan context
+# manager, NOT the on_startup= constructor hook — on_startup= was removed in the
+# Starlette 1.x line, so an unpinned install silently dropped the hold loop.
+check("server app uses lifespan, not the removed on_startup= hook",
+      lp.app.router.lifespan_context is not None
+      and not getattr(lp.app.router, "on_startup", []))
+
 # regression: capture seq RESETS on a proxy restart, so a session spanning a
 # restart has post-restart turns with LOWER seq than its pre-restart turns.
 # _iter_pairs must order by timestamp, not seq/filename, or the miss detector

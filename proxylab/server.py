@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import collections
+import contextlib
 import hashlib
 import html
 import itertools
@@ -752,8 +753,18 @@ async def handler(request: Request) -> Response:
 # known sessions. Runs at import so the offline tests exercise it too.
 restore_mod._restore_state()
 
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    # the hold-warm driver must live on the event loop (it awaits _warm_session
+    # on the shared _client). Use the lifespan context manager rather than the
+    # on_startup= / on_shutdown= constructor hooks: those were deprecated in
+    # Starlette 0.26 and REMOVED in the 1.x line, so on_startup= breaks (and is
+    # silently dropped) on a freshly-resolved unpinned install. lifespan= has
+    # been supported since 0.13, so this works on both old and new Starlette.
+    await hold_mod._start_hold_loop()
+    yield
+
+
 app = Starlette(routes=[Route("/{path:path}", handler,
                               methods=["GET", "POST", "PUT", "DELETE"])],
-                # the hold-warm driver must live on the event loop (it awaits
-                # _warm_session on the shared _client)
-                on_startup=[hold_mod._start_hold_loop])
+                lifespan=_lifespan)
