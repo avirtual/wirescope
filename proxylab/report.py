@@ -77,14 +77,29 @@ def _line_key(summ):
     return (summ or {}).get("agent_id") or role
 
 
+def _seq_of(stem):
+    """The leading capture seq integer of a stem ('692-clodex-...' -> 692), used
+    only as a sub-second tiebreaker (NOT the primary order — see _iter_pairs)."""
+    head = stem.split("-", 1)[0]
+    return int(head) if head.isdigit() else 0
+
+
 def _iter_pairs(session):
-    """Yield per-request {stem, req, resp, warmth, summ, line, model, ts, billing,
-    tokens, ok} for a session dir, in seq (filename) order. The single disk pass
-    the rest of the report joins against."""
+    """Per-request {stem, req, resp, warmth, summ, line, model, ts, billing,
+    tokens, ok} for a session dir, in **chronological (timestamp) order**. The
+    single disk pass the rest of the report joins against.
+
+    Ordered by `ts`, NOT by the capture seq/filename: seq is a global counter
+    that RESETS to 0 on every proxy restart, so a session that spans a restart
+    (e.g. a deploy mid-session) would otherwise have its post-restart turns sort
+    *before* its pre-restart ones — which scrambles the cache-miss detector's
+    chronological state (established/last_ts) and can hide a real idle-gap miss.
+    Timestamps are restart-stable; seq is only a sub-second tiebreaker."""
     d = core_mod.LOG_DIR / session
     if not d.is_dir():
-        return
-    for rf in sorted(d.glob("*.request.json")):
+        return []
+    out = []
+    for rf in d.glob("*.request.json"):
         req = _load(rf)
         if req is None:
             continue
@@ -93,7 +108,8 @@ def _iter_pairs(session):
         warmth = _load(rf.with_name(stem + ".warmth.json")) or {}
         summ = req.get("summary") or {}
         billing = resp.get("billing") or {}
-        yield {
+        ts = req.get("ts") or warmth.get("ts")
+        out.append({
             "stem": stem,
             "req": req,
             "resp": resp,
@@ -101,11 +117,14 @@ def _iter_pairs(session):
             "summ": summ,
             "line": _line_key(summ),
             "model": billing.get("model") or summ.get("model"),
-            "ts": req.get("ts") or warmth.get("ts"),
+            "ts": ts,
             "billing": billing,
             "tokens": billing.get("tokens") or {},
             "ok": resp.get("status_code") == 200,
-        }
+        })
+    out.sort(key=lambda p: (_epoch(p["ts"]) if _epoch(p["ts"]) is not None else 0.0,
+                            _seq_of(p["stem"])))
+    return out
 
 
 def _usd(tokens, rate):

@@ -2303,6 +2303,47 @@ check("/_report report_version + disk basis stamped",
       _rep["report_version"] == lp.report.REPORT_VERSION and _rep["basis"] == "on-disk-capture")
 check("/_report cold/unknown session -> note, no crash",
       lp.session_report("sess-does-not-exist")["scope"]["requests"] == 0)
+
+# regression: capture seq RESETS on a proxy restart, so a session spanning a
+# restart has post-restart turns with LOWER seq than its pre-restart turns.
+# _iter_pairs must order by timestamp, not seq/filename, or the miss detector
+# runs backwards across the restart and hides the real idle-gap expiry.
+_rs_dir = os.path.join(os.environ["LOG_DIR"], "sess-report-restart")
+os.makedirs(_rs_dir, exist_ok=True)
+
+
+def _rs_turn(seq, ts, tokens, woa):
+    base = os.path.join(_rs_dir, f"{seq:03d}-r")
+    json.dump({"summary": {"role": "parent", "n_tools": 0, "agent_id": None,
+                           "model": "claude-opus-4-8"}, "ts": ts, "body": {}},
+              open(base + ".request.json", "w"))
+    json.dump({"status_code": 200, "role": "parent", "model": "claude-opus-4-8",
+               "billing": {"billable": True, "model": "claude-opus-4-8",
+                           "tokens": tokens, "est_usd": _rep_usd(tokens)},
+               "meta": {"tool_uses": [], "text": "ok"}},
+              open(base + ".response.json", "w"))
+    json.dump({"hash": f"h{seq}", "ttl": 3600, "ts": ts, "warm_on_arrival": woa,
+               "cache_read_input_tokens": tokens.get("cache_read_input_tokens", 0),
+               "segments": {"system": {"hash": "RSEG", "ttl": 3600}}},
+              open(base + ".warmth.json", "w"))
+
+
+_RS0 = 1_700_000_000.0
+# night: high seq (pre-restart). morning: low seq (counter reset), 6h later, cold.
+_rs_turn(700, _RS0, {"input_tokens": 10, "output_tokens": 20,
+                     "cache_read_input_tokens": 0, "cache_write_1h_tokens": 5000}, False)
+_rs_turn(701, _RS0 + 60, {"input_tokens": 5, "output_tokens": 20,
+                          "cache_read_input_tokens": 5000, "cache_write_1h_tokens": 0}, True)
+_rs_turn(2, _RS0 + 6 * 3600, {"input_tokens": 8, "output_tokens": 20,
+                              "cache_read_input_tokens": 0, "cache_write_1h_tokens": 5000}, False)
+_rs_pairs = lp.report._iter_pairs("sess-report-restart")
+check("/_report _iter_pairs orders by timestamp, not seq (restart-stable)",
+      [p["stem"][:3] for p in _rs_pairs] == ["700", "701", "002"])
+_rs = lp.session_report("sess-report-restart")
+_rcm = _rs["cost_decomposition"]["cache_misses"]
+check("/_report catches the overnight idle-gap miss across a restart (not hidden as eviction)",
+      _rcm["count"] == 1 and _rcm["by_cause"].get("idle_gap_gt_ttl") == 1
+      and _rcm["events"][0]["idle_gap_s"] == 6 * 3600 - 60)  # gap from last night turn
 check("/_identity exposes context_report capability + endpoint",
       lp._identity()["capabilities"].get("context_report") is True
       and lp._identity()["endpoints"].get("report") == "/_report")
