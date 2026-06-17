@@ -879,13 +879,16 @@ def _render_timeline_html(session, report):
         cum.append(dict(run))
     cmax = max(max(c.values()) for c in cum) * 1.08 or 1
     parts, ends = [], []
-    # de-collide end labels: stack them at least 14px apart, top-to-bottom
+    # de-collide end labels: stack them at least 14px apart, top-to-bottom.
+    # last_pts is sorted ascending, so each label sits at max(its own y, the
+    # previous label + 14). NOTE: a `while yy - placed[-1] < 14: yy = placed[-1]
+    # + 14` here was an INFINITE LOOP — float rounding makes (x+14)-x evaluate to
+    # 13.999999999999986 < 14 at non-round magnitudes, so the guard never clears
+    # and the event loop pegs at 100% CPU. The branchless max() can't round-trap.
     last_pts = sorted(((_tl_y(cum[-1][k], cmax), k, c) for k, c in _TL_SPINE))
     placed = []
     for y, k, c in last_pts:
-        yy = y
-        while placed and yy - placed[-1] < 14:
-            yy = placed[-1] + 14
+        yy = max(y, placed[-1] + 14) if placed else y
         placed.append(yy)
         ends.append((k, c, _tl_y(cum[-1][k], cmax), yy))
     for k, c in _TL_SPINE:

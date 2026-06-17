@@ -2394,6 +2394,27 @@ check("/_report series: content carriage estimate split present (read drill-down
 check("/_report series INVARIANT: Σ content_carriage_est == spine.read (read-only apportionment)",
       abs(sum(_ser["content_carriage_est"].values()) - _sp["read"]) < 1e-6)
 
+# --- /_timeline render must not infinite-loop on the label de-collide -------------
+# Regression: the end-label stacker used `while yy - placed[-1] < 14: yy =
+# placed[-1] + 14`, which never terminated when two labels collided at a non-round
+# magnitude — float rounding makes (x+14)-x == 13.999999999999986 < 14, pegging the
+# event loop at 100% CPU and wedging the whole proxy (real incident, session
+# f49861d3). These cum totals reproduce it: write(0.61372) & generation(0.573375)
+# map to y within ~6.5px, so the collision branch fires. Run under a watchdog so a
+# regression FAILS instead of hanging the suite (+ blocking release.sh).
+import threading as _thr  # noqa: E402
+_tl_report = {"series": {
+    "requests": [{"read_usd": 0.963639, "write_usd": 0.61372, "generation_usd": 0.573375}],
+    "spine_totals": {"read": 0.963639, "write": 0.61372, "generation": 0.573375,
+                     "read_cached": 0.9, "read_uncached": 0.063639},
+    "content_carriage_est": {"conversation": 0.5, "preamble": 0.3, "thinking": 0.163639}}}
+_tl_box = {}
+def _tl_run():
+    _tl_box["html"] = lp._render_timeline_html("sess-collide", _tl_report)
+_tl_t = _thr.Thread(target=_tl_run, daemon=True); _tl_t.start(); _tl_t.join(timeout=5)
+check("/_timeline render terminates on colliding end-labels (no float infinite loop)",
+      not _tl_t.is_alive() and "<svg" in (_tl_box.get("html") or ""))
+
 # claudemd/useremail carriage is SUBAGENT-scoped (v4): the [wirescope:omit] lever
 # only shapes spawns, so MAIN-line claudemd is informational (legitimate context,
 # no main-line lever) while a SUBAGENT's inherited claudemd is real reclaimable.
