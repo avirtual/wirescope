@@ -2344,13 +2344,15 @@ def _sub_turn(seq, ts, role, agent_id, tokens, woa=True):
               open(base + ".warmth.json", "w"))
 
 
-_REP_COLD = {"input_tokens": 10, "output_tokens": 50,
+_REP_COLD = {"input_tokens": 10, "output_tokens": 50,         # main: 1h override
              "cache_read_input_tokens": 0, "cache_write_1h_tokens": 10000}
+_REP_COLD5 = {"input_tokens": 10, "output_tokens": 50,        # subagent: 5m default
+              "cache_read_input_tokens": 0, "cache_write_5m_tokens": 10000}
 _REP_WARM = {"input_tokens": 5, "output_tokens": 50,
              "cache_read_input_tokens": 10000, "cache_write_1h_tokens": 0}
 _sub_turn(1, _T0, "parent", None, _REP_COLD, woa=False)
 _sub_turn(2, _T0 + 60, "parent", None, _REP_WARM)
-_sub_turn(3, _T0 + 70, "subagent", "sub-1", _REP_COLD, woa=False)
+_sub_turn(3, _T0 + 70, "subagent", "sub-1", _REP_COLD5, woa=False)
 _sub_turn(4, _T0 + 130, "subagent", "sub-1", _REP_WARM)
 
 _srep = lp.session_report("sess-report-sub")
@@ -2379,6 +2381,28 @@ check("/_report v4: waste total still == verdict.reclaimable (sub claudemd in, m
 _mainonly = {t["type"] for t in _rep["waste"]["by_type"]}
 check("/_report v4: main-only session has NO claudemd_carriage/useremail_carriage waste",
       "claudemd_carriage" not in _mainonly and "useremail_carriage" not in _mainonly)
+
+# carriage pricing: write rate is per-LINE (1h main override / 5m subagent default),
+# observed from the billed write tokens; reads = requests - cold_writes.
+_subpairs = lp.report._iter_pairs("sess-report-sub")
+check("/_report carriage: write key is 1h on main, 5m on subagent (observed)",
+      lp.report._line_write_key(_subpairs, "main") == "cache_write_1h"
+      and lp.report._line_write_key(_subpairs, "sub-1") == "cache_write_5m")
+_scl = _sby[("reclaimable_claudemd", "sub-1")]
+_stpr, _sreqs = _scl["reclaimable_tokens_per_request"], _scl["requests"]
+_sexp = round(_stpr * 1 * _REP_RATES["cache_write_5m"] / 1e6
+              + _stpr * max(_sreqs - 1, 0) * _REP_RATES["cache_read"] / 1e6, 6)
+check("/_report carriage: subagent claudemd priced at 5m write + (req-1) reads",
+      _scl["reclaimable_usd"] == _sexp)
+# cold-write scaling: sess-report-1 has 1 preamble idle-gap miss -> 2 cold writes
+# (1 establish + 1 rewrite), at the main 1h rate; the rest are warm reads.
+_dwt = _byc["deadweight_tools"]
+_dtpr, _dreqs = _dwt["reclaimable_tokens_per_request"], _dwt["requests"]
+_dexp = round(_dtpr * 2 * _REP_RATES["cache_write_1h"] / 1e6
+              + _dtpr * max(_dreqs - 2, 0) * _REP_RATES["cache_read"] / 1e6, 6)
+check("/_report carriage: main deadweight = 2 cold writes (1 establish + 1 miss) @1h + reads",
+      _rep["cost_decomposition"]["cache_misses"]["preamble_rewrites"] == 1
+      and _dwt["reclaimable_usd"] == _dexp)
 
 # regression: capture seq RESETS on a proxy restart, so a session spanning a
 # restart has post-restart turns with LOWER seq than its pre-restart turns.

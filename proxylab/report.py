@@ -247,6 +247,7 @@ def _cost_decomposition(pairs):
     by_bucket.sort(key=lambda x: x["usd"], reverse=True)
     miss_summary = {
         "count": len(misses),
+        "preamble_rewrites": sum(1 for m in misses if m["where"] == "preamble"),
         "usd": round(buckets["cache_write_rewrite"], 6),
         "tokens": int(bucket_tokens["cache_write_rewrite"]),
         "by_cause": dict(miss_by_cause),
@@ -330,17 +331,40 @@ def _line_rates(pairs, line):
     return None, None
 
 
-def _reclaimable_carriage_usd(tokens_per_request, requests, rates):
-    """A preamble token that rides the cache is paid as a cache_read on every warm
-    REQUEST (not per user turn — one turn fans out into many requests, each
-    re-sending the prefix), plus one cold write to establish it. Honest
-    reclaimable $ = recurring reads × requests + one 5m write (NOT full input rate
-    — it was never full-priced after the first write)."""
+def _line_write_key(pairs, line):
+    """Which cache-write TTL premium this line actually paid, OBSERVED from the
+    billed write tokens (1h tokens => 1h premium, etc.), falling back to CLI
+    policy when a line wrote nothing yet: the 1h override rides the MAIN agent,
+    subagents stay on the 5m default."""
+    w1 = w5 = 0
+    for p in pairs:
+        if p["line"] != line:
+            continue
+        t = p["tokens"]
+        w1 += t.get("cache_write_1h_tokens") or 0
+        w5 += t.get("cache_write_5m_tokens") or 0
+    if w1 or w5:
+        return "cache_write_1h" if w1 >= w5 else "cache_write_5m"
+    return "cache_write_1h" if line == "main" else "cache_write_5m"
+
+
+def _reclaimable_carriage_usd(tokens_per_request, requests, rates,
+                              cold_writes=1, write_key="cache_write_5m"):
+    """A preamble token that rides the cache is WRITTEN on each cold establishment
+    and READ on every other warm REQUEST (carriage is per-request — one user turn
+    fans out into many, each re-sending the prefix). Honest reclaimable $:
+      writes (cold_writes = 1 initial + N mid-session prefix rewrites) × the TTL
+      premium actually paid (write_key: 1h on the main agent, 5m on subagents)
+      + reads (requests − cold_writes) × the cache_read rate.
+    A cached token is never full-priced after its write, and the establishing
+    request pays the write — not also a read — for those tokens."""
     if not rates or not tokens_per_request:
         return 0.0
-    recurring = _usd(tokens_per_request, rates["cache_read"]) * max(requests, 1)
-    one_write = _usd(tokens_per_request, rates["cache_write_5m"])
-    return round(recurring + one_write, 6)
+    cold_writes = max(cold_writes, 1)
+    reads = max(requests - cold_writes, 0)
+    recurring = _usd(tokens_per_request, rates["cache_read"]) * reads
+    writes = _usd(tokens_per_request, rates[write_key]) * cold_writes
+    return round(recurring + writes, 6)
 
 
 def _tool_result_attribution(pairs):
@@ -408,8 +432,20 @@ def _tool_result_attribution(pairs):
     return by_line, hints
 
 
-def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints):
+def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints, misses=None):
     out = []
+    # cold establishments that re-write the PREAMBLE (where tools/skills/claudemd
+    # live): 1 initial + the mid-session idle-gap/eviction rewrites the cache-miss
+    # detector found. Only the main line is miss-tracked; subagents default to the
+    # one establish. Each cold write re-pays the carriage; the rest are warm reads.
+    main_preamble_cold = 1 + (misses or {}).get("preamble_rewrites", 0)
+
+    def _carriage(tokens_per_request, requests, rates, line):
+        return _reclaimable_carriage_usd(
+            tokens_per_request, requests, rates,
+            cold_writes=(main_preamble_cold if line == "main" else 1),
+            write_key=_line_write_key(pairs, line))
+
     # per-line deadweight tools + skills (high confidence, additive)
     lines = set(util_by_line) | set(skutil_by_line)
     for line in sorted(lines):
@@ -438,7 +474,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                           f"{reqs} requests: " + ", ".join(pp["name"] for pp in dead[:8]),
                 "reclaimable_tokens_per_request": t_roll["deadweight_tokens"],
                 "reclaimable_tokens": t_roll["deadweight_tokens"] * reqs,
-                "reclaimable_usd": _reclaimable_carriage_usd(t_roll["deadweight_tokens"], reqs, rates),
+                "reclaimable_usd": _carriage(t_roll["deadweight_tokens"], reqs, rates, line),
                 "requests": reqs,
                 "evidence": {"loaded": t_roll["loaded"], "used": t_roll["used_distinct"],
                              "evaluable_requests": reqs, "per_tool": evid},
@@ -457,7 +493,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                           f"{reqs} requests: " + ", ".join(pp["name"] for pp in dead[:8]),
                 "reclaimable_tokens_per_request": s_roll["deadweight_tokens"],
                 "reclaimable_tokens": s_roll["deadweight_tokens"] * reqs,
-                "reclaimable_usd": _reclaimable_carriage_usd(s_roll["deadweight_tokens"], reqs, rates),
+                "reclaimable_usd": _carriage(s_roll["deadweight_tokens"], reqs, rates, line),
                 "requests": reqs,
                 "evidence": {"loaded": s_roll["loaded"], "used": s_roll["used_distinct"],
                              "evaluable_requests": reqs},
@@ -503,7 +539,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                     "requests": reqs,
                     "evidence": {"tokens_per_request": tok,
                                  "carriage_usd_if_omittable":
-                                     _reclaimable_carriage_usd(tok, reqs, m_rates)},
+                                     _carriage(tok, reqs, m_rates, "main")},
                     "confidence": "low", "additive": False,
                     "lever": f"n/a on the main line — [wirescope:omit {cat}] applies to "
                              "subagent spawns only",
@@ -534,7 +570,7 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                               "on the spawn prompt.",
                     "reclaimable_tokens_per_request": tok,
                     "reclaimable_tokens": tok * reqs,
-                    "reclaimable_usd": _reclaimable_carriage_usd(tok, reqs, s_rates),
+                    "reclaimable_usd": _carriage(tok, reqs, s_rates, line),
                     "requests": reqs,
                     "evidence": {"tokens_per_request": tok},
                     "confidence": "medium", "additive": True, "lever": lever,
@@ -642,8 +678,10 @@ def _waste_section(findings, total_usd):
         "by_type": by_type,
         "basis": "net reclaimable (the real saving), aggregated by type: cold-cache "
                  "at marginal cost (2× write − 0.1× read you'd pay warm); unused "
-                 "tools/skills/claudemd at carriage (cached-read rate × requests + "
-                 "one write). Subset of cost_decomposition; == verdict.reclaimable_usd_total.",
+                 "tools/skills/claudemd at carriage = cold writes (1 establish + "
+                 "preamble rewrites) × the TTL premium paid (1h main / 5m sub) + "
+                 "(requests − cold writes) cached reads. Subset of cost_decomposition; "
+                 "== verdict.reclaimable_usd_total.",
     }
 
 
@@ -747,7 +785,7 @@ def session_report(session, detail=False):
     cost, misses = _cost_decomposition(pairs)
     token_decomp, td_extra = _token_decomposition(pairs, util, skutil)
     attribution, hints = _tool_result_attribution(pairs)
-    findings = _findings(pairs, util, skutil, td_extra, attribution, hints)
+    findings = _findings(pairs, util, skutil, td_extra, attribution, hints, misses)
 
     # fold the cache-miss localisation into a finding (medium; additive — the $ a
     # keep-warm / hold would reclaim). Priced MARGINAL: a cold prefix is billed as
