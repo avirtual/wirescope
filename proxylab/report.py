@@ -31,7 +31,7 @@ from . import billing as billing_mod
 from . import core as core_mod
 from . import status as status_mod
 
-REPORT_VERSION = 3          # v2: added `waste` section; cache_misses finding
+REPORT_VERSION = 4          # v2: added `waste` section; cache_misses finding
 #                             reclaimable is MARGINAL (net of the warm read), while
 #                             cost_decomposition.cache_misses stays gross.
 #                           v3: carriage multiplier is REQUESTS, not turns (each
@@ -40,6 +40,15 @@ REPORT_VERSION = 3          # v2: added `waste` section; cache_misses finding
 #                             turns_resent -> requests_resent, finding `turns` ->
 #                             `requests`; scope.turns now = user prompts (the human
 #                             "turn"), scope.requests = wire requests (the multiplier).
+#                           v4: claudemd/useremail carriage is SUBAGENT-scoped. The
+#                             [wirescope:omit …] lever only shapes subagent spawns, so
+#                             only a subagent's inherited claudemd/useremail is counted
+#                             as reclaimable waste (category reclaimable_claudemd/
+#                             _useremail, additive). Main-line claudemd/useremail is
+#                             intentional in-use context with no main-line lever -> now
+#                             an informational, NON-additive finding (new category
+#                             main_claudemd_carriage / main_useremail_carriage,
+#                             reclaimable_usd 0, excluded from waste $ and the score).
 
 # Verdict thresholds, driven by reclaimable_pct of HIGH+MEDIUM-confidence
 # findings only (low-conf heuristics inform prose, never the rating — clodex's
@@ -457,26 +466,75 @@ def _findings(pairs, util_by_line, skutil_by_line, td_extra, attribution, hints)
                          "permissions.deny only gates invocation)",
             })
 
-    # claudemd / useremail carriage on the main line (medium: reclaimable via
-    # omit, but we can't PROVE it went unread -> medium, additive).
-    comp = (td_extra or {}).get("comp")
-    if comp:
-        cats = {c["category"]: c["tokens"] for c in comp["by_category"]}
-        rates, _ = _line_rates(pairs, "main")
-        reqs = (util_by_line.get("main") or {}).get("evaluable_turns", 0)
-        for cat, lever in (("claudemd", "[wirescope:omit claudemd] on subagent spawns"),
+    # claudemd / useremail carriage. The [wirescope:omit …] lever applies to
+    # SUBAGENT SPAWNS only — a file-reading subagent rarely needs the project
+    # CLAUDE.md or the user's email, so omitting it there is a real saving. On the
+    # MAIN line these blocks are intentional, in-use context with NO omit lever
+    # (short of removing CLAUDE.md entirely), so we surface them for transparency
+    # but DON'T count them as reclaimable waste — bundling legitimate main-agent
+    # CLAUDE.md usage into "waste" (and recommending a subagent lever when no
+    # subagent ran) is misleading.
+    sub_lines = sorted({p["line"] for p in pairs if p["line"] != "main"})
+
+    # main line: informational only (additive:false -> excluded from waste $/score)
+    main_comp = (td_extra or {}).get("comp")
+    if main_comp:
+        cats = {c["category"]: c["tokens"] for c in main_comp["by_category"]}
+        m_rates, _ = _line_rates(pairs, "main")
+        reqs = ((util_by_line.get("main") or {}).get("evaluable_turns", 0)
+                or sum(1 for p in pairs if p["line"] == "main"))
+        for cat in ("claudemd", "useremail"):
+            tok = cats.get(cat, 0)
+            if tok > 0 and reqs:
+                applies = ("no subagents ran this session" if not sub_lines
+                           else "see the subagent finding for the reclaimable portion")
+                out.append({
+                    "id": f"reclaimable_{cat}", "category": f"main_{cat}_carriage",
+                    "line": "main",
+                    "title": f"{cat} re-sent every request ({tok} tok/request, main line)",
+                    "detail": f"{cat} rides the cached preamble on all {reqs} main-line "
+                              f"requests. On the main agent this is intentional context, "
+                              f"not waste: there is no main-line omit lever, and "
+                              f"[wirescope:omit {cat}] only shapes subagent spawns "
+                              f"({applies}).",
+                    "reclaimable_tokens_per_request": tok,
+                    "reclaimable_tokens": 0,
+                    "reclaimable_usd": 0.0,
+                    "requests": reqs,
+                    "evidence": {"tokens_per_request": tok,
+                                 "carriage_usd_if_omittable":
+                                     _reclaimable_carriage_usd(tok, reqs, m_rates)},
+                    "confidence": "low", "additive": False,
+                    "lever": f"n/a on the main line — [wirescope:omit {cat}] applies to "
+                             "subagent spawns only",
+                })
+
+    # subagent lines: claudemd/useremail carried into a spawn IS reclaimable via omit
+    for line in sub_lines:
+        body = _representative_body(pairs, line)
+        if body is None:
+            continue
+        scomp = status_mod._composition(body)
+        if not scomp:
+            continue
+        cats = {c["category"]: c["tokens"] for c in scomp["by_category"]}
+        s_rates, _ = _line_rates(pairs, line)
+        reqs = ((util_by_line.get(line) or {}).get("evaluable_turns", 0)
+                or sum(1 for p in pairs if p["line"] == line))
+        for cat, lever in (("claudemd", "[wirescope:omit claudemd] on the spawn prompt"),
                            ("useremail", "[wirescope:omit useremail] / WS_OMIT_DEFAULT")):
             tok = cats.get(cat, 0)
             if tok > 0 and reqs:
                 out.append({
-                    "id": f"reclaimable_{cat}", "category": f"reclaimable_{cat}",
-                    "line": "main",
-                    "title": f"{cat} re-sent every request ({tok} tok/request)",
-                    "detail": f"{cat} rides the cached preamble on all {reqs} requests; "
-                              "a file-reading subagent rarely needs it.",
+                    "id": f"reclaimable_{cat}:{line}", "category": f"reclaimable_{cat}",
+                    "line": line,
+                    "title": f"{cat} carried into subagent ({tok} tok/request)",
+                    "detail": f"{cat} rides this subagent's cached preamble on all {reqs} "
+                              "requests; a file-reading subagent rarely needs it — omit it "
+                              "on the spawn prompt.",
                     "reclaimable_tokens_per_request": tok,
                     "reclaimable_tokens": tok * reqs,
-                    "reclaimable_usd": _reclaimable_carriage_usd(tok, reqs, rates),
+                    "reclaimable_usd": _reclaimable_carriage_usd(tok, reqs, s_rates),
                     "requests": reqs,
                     "evidence": {"tokens_per_request": tok},
                     "confidence": "medium", "additive": True, "lever": lever,

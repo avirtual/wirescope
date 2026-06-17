@@ -2321,6 +2321,65 @@ check("/_report cache_misses finding reclaimable is net (gross_write - read_equi
 check("/_report cold/unknown session -> note, no crash",
       lp.session_report("sess-does-not-exist")["scope"]["requests"] == 0)
 
+# claudemd/useremail carriage is SUBAGENT-scoped (v4): the [wirescope:omit] lever
+# only shapes spawns, so MAIN-line claudemd is informational (legitimate context,
+# no main-line lever) while a SUBAGENT's inherited claudemd is real reclaimable.
+_sub_dir = os.path.join(os.environ["LOG_DIR"], "sess-report-sub")
+os.makedirs(_sub_dir, exist_ok=True)
+
+
+def _sub_turn(seq, ts, role, agent_id, tokens, woa=True):
+    base = os.path.join(_sub_dir, f"{seq:03d}-r")
+    json.dump({"summary": {"role": role, "n_tools": 3, "agent_id": agent_id,
+                           "model": "claude-opus-4-8"}, "ts": ts, "body": _REP_BODY},
+              open(base + ".request.json", "w"))
+    json.dump({"status_code": 200, "role": role, "model": "claude-opus-4-8",
+               "billing": {"billable": True, "model": "claude-opus-4-8",
+                           "tokens": tokens, "est_usd": _rep_usd(tokens)},
+               "meta": {"tool_uses": ["Read"], "text": "ok"}},
+              open(base + ".response.json", "w"))
+    json.dump({"hash": f"hs{seq}", "ttl": 3600, "ts": ts, "warm_on_arrival": woa,
+               "cache_read_input_tokens": tokens.get("cache_read_input_tokens", 0),
+               "segments": {"system": {"hash": "SEG", "ttl": 3600}}},
+              open(base + ".warmth.json", "w"))
+
+
+_REP_COLD = {"input_tokens": 10, "output_tokens": 50,
+             "cache_read_input_tokens": 0, "cache_write_1h_tokens": 10000}
+_REP_WARM = {"input_tokens": 5, "output_tokens": 50,
+             "cache_read_input_tokens": 10000, "cache_write_1h_tokens": 0}
+_sub_turn(1, _T0, "parent", None, _REP_COLD, woa=False)
+_sub_turn(2, _T0 + 60, "parent", None, _REP_WARM)
+_sub_turn(3, _T0 + 70, "subagent", "sub-1", _REP_COLD, woa=False)
+_sub_turn(4, _T0 + 130, "subagent", "sub-1", _REP_WARM)
+
+_srep = lp.session_report("sess-report-sub")
+_sby = {(f["category"], f["line"]): f for f in _srep["findings"]}
+check("/_report v4: MAIN-line claudemd carriage is informational (non-additive, $0)",
+      ("main_claudemd_carriage", "main") in _sby
+      and _sby[("main_claudemd_carriage", "main")]["additive"] is False
+      and _sby[("main_claudemd_carriage", "main")]["reclaimable_usd"] == 0.0
+      and "subagent spawns only" in _sby[("main_claudemd_carriage", "main")]["lever"])
+check("/_report v4: SUBAGENT claudemd carriage IS reclaimable (additive, spawn lever)",
+      ("reclaimable_claudemd", "sub-1") in _sby
+      and _sby[("reclaimable_claudemd", "sub-1")]["additive"] is True
+      and _sby[("reclaimable_claudemd", "sub-1")]["confidence"] == "medium"
+      and "spawn prompt" in _sby[("reclaimable_claudemd", "sub-1")]["lever"]
+      and _sby[("reclaimable_claudemd", "sub-1")]["reclaimable_usd"] > 0)
+check("/_report v4: NO additive reclaimable_claudemd on the main line",
+      ("reclaimable_claudemd", "main") not in _sby)
+_swt = {t["type"]: t for t in _srep["waste"]["by_type"]}
+check("/_report v4: waste claudemd_carriage comes ONLY from the subagent line",
+      "claudemd_carriage" in _swt and _swt["claudemd_carriage"]["items"] == 1
+      and _swt["claudemd_carriage"]["usd"] > 0)
+check("/_report v4: waste total still == verdict.reclaimable (sub claudemd in, main out)",
+      abs(_srep["waste"]["total_usd"] - _srep["verdict"]["reclaimable_usd_total"]) < 1e-6)
+
+# a MAIN-ONLY session never bundles claudemd into waste (the original bug report)
+_mainonly = {t["type"] for t in _rep["waste"]["by_type"]}
+check("/_report v4: main-only session has NO claudemd_carriage/useremail_carriage waste",
+      "claudemd_carriage" not in _mainonly and "useremail_carriage" not in _mainonly)
+
 # regression: capture seq RESETS on a proxy restart, so a session spanning a
 # restart has post-restart turns with LOWER seq than its pre-restart turns.
 # _iter_pairs must order by timestamp, not seq/filename, or the miss detector
