@@ -430,6 +430,7 @@ async def handler(request: Request) -> Response:
     role, model = "unknown", None
     session_id = account_uuid = None
     title_call = False
+    side_call = False
     obj = None      # stays None on an unparseable body -> every transform/gate is
                     # skipped and the ORIGINAL bytes forward verbatim (fail-open:
                     # a parse failure must degrade to passthrough, never to a 500)
@@ -593,6 +594,11 @@ async def handler(request: Request) -> Response:
         # harvest the session title the CLI generates anyway.
         if upstream_path.split("?")[0].endswith("/v1/messages"):
             title_call = meta_mod._is_title_call(obj)
+            # side_call = any transient non-agent request sharing the session_id:
+            # the title generator OR a health/quota probe. Both must stay out of
+            # the durable identity/replay/view/turn-count state; only the TRUE
+            # title call additionally harvests its answer as the session title.
+            side_call = title_call or meta_mod._is_probe_call(obj)
             # subagents (Task-spawned) share the parent's session_id; pass role
             # so a sub turn is logged distinctly and never overwrites the parent
             # agent's identity/model on the /_status row. The agent-id header
@@ -600,12 +606,12 @@ async def handler(request: Request) -> Response:
             # read once above the transform chain and reused here.
             meta_mod._capture_session_meta(session_id, obj, model,
                                            agent=(agent if m else None),
-                                           role=role, title_call=title_call,
+                                           role=role, side_call=side_call,
                                            agent_id=agent_id,
                                            display_name=ws_display_name)
             # heaviness snapshot from the model-visible history (main line
             # only: a subagent's small history must not clobber the parent's)
-            if session_id and not title_call and role in ("parent", "unknown"):
+            if session_id and not side_call and role in ("parent", "unknown"):
                 meta_mod._CONTEXT_STATS[session_id] = {**meta_mod._turn_stats(obj),
                                               "ts": time.time()}
     except Exception as e:
@@ -681,12 +687,12 @@ async def handler(request: Request) -> Response:
     fwd_headers["accept-encoding"] = "identity"  # force uncompressed so we can read the SSE
     # Stash this (post-transform) request so POST /_ping?session= can replay it.
     # Only the MAIN LINE (parent agent) is the session's durable, pingable
-    # request: a subagent or title side-call shares the session_id but is
-    # transient — it must not replace what /_ping replays nor re-anchor the
+    # request: a subagent, title side-call, or quota probe shares the session_id
+    # but is transient — it must not replace what /_ping replays nor re-anchor the
     # keep-warm hold (else we'd keep a finished subagent's context warm instead
-    # of the main agent's).
+    # of the main agent's, or pin a one-token probe as the replayable body).
     if upstream_path.split("?")[0].endswith("/v1/messages"):
-        if not title_call and not writer_mod._is_subagent_role(role):
+        if not side_call and not writer_mod._is_subagent_role(role):
             pinger_mod._cache_last_request(session_id, obj, fwd_headers, upstream_path,
                                 account_uuid)
             if "hold_echo" not in record:      # the arming turn itself isn't
@@ -748,7 +754,7 @@ async def handler(request: Request) -> Response:
                 receipts_mod.anthropic(
                     blob, n=n, ts=ts, agent=agent, role=role, model=model,
                     session_id=session_id, session_key=session_key, obj=obj,
-                    title_call=title_call, is_messages=is_messages,
+                    title_call=title_call, side_call=side_call, is_messages=is_messages,
                     routed=(m is not None), out_dir=out_dir, stem=stem,
                     status_code=up.status_code, resp_headers=dict(up.headers),
                     tee_text=(sub_tee.text if sub_tee is not None else None),

@@ -1305,6 +1305,53 @@ check("main-agent turn (has tools) is NOT a title call", lp._is_title_call(
      "system": [{"type": "text", "text": "Generate a concise, sentence-case title"}],
      "messages": []}) is False)
 
+# --- probe (quota/health) side-call detection -------------------------------------
+# An editor's startup "quota" ping: 1 bare user message, no system, no tools,
+# max_tokens:1. Must be recognized so it never owns the durable session state.
+check("quota probe detected", lp._is_probe_call(
+    {"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]}) is True)
+check("probe with empty system/tools still a probe", lp._is_probe_call(
+    {"system": [], "tools": [], "max_tokens": 4,
+     "messages": [{"role": "user", "content": "ping"}]}) is True)
+check("real agent turn (system+tools) is NOT a probe", lp._is_probe_call(
+    {"system": [{"type": "text", "text": "You are Claude Code"}],
+     "tools": [{"name": "Bash"}], "max_tokens": 8000,
+     "messages": [{"role": "user", "content": "2+2"}]}) is False)
+check("large max_tokens is NOT a probe", lp._is_probe_call(
+    {"max_tokens": 1000, "messages": [{"role": "user", "content": "hi"}]}) is False)
+check("no max_tokens is NOT a probe (e.g. a count_tokens-shaped body)",
+      lp._is_probe_call({"messages": [{"role": "user", "content": "x"}]}) is False)
+check("multi-message body is NOT a probe", lp._is_probe_call(
+    {"max_tokens": 1, "messages": [{"role": "user", "content": "a"},
+                                   {"role": "assistant", "content": "b"}]}) is False)
+
+# --- a probe must not resurrect an ended session nor clobber its identity ----------
+# The post-restart "odd page": SessionEnd stamps _ENDED, then the editor's quota
+# probe arrives on the same session_id. With side_call=True it stays transient.
+psid_probe = "9c0ffee0-0000-1111-2222-333333333333"
+lp._capture_session_meta(psid_probe,
+                         {"system": [{"type": "text", "text": "You are Claude Code"}],
+                          "messages": [{"role": "user", "content": "real work"}]},
+                         "claude-opus-4-8", role="parent")
+lp._WRITE_Q.join()
+lp._ENDED[psid_probe] = {"ts": time.time(), "reason": "clear"}
+lp._capture_session_meta(psid_probe,
+                         {"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]},
+                         "claude-haiku-4-5", role="unknown", side_call=True)
+lp._WRITE_Q.join()
+st_probe = lp._status_snapshot(session=psid_probe)["sessions"][0]
+check("probe does NOT resurrect an ended session",
+      psid_probe in lp._ENDED)
+check("probe does NOT overwrite the session's model (stays opus, not haiku)",
+      st_probe["model"] == "claude-opus-4-8")
+# a real turn on the same ended session DOES resume + own identity
+lp._capture_session_meta(psid_probe,
+                         {"system": [{"type": "text", "text": "You are Claude Code"}],
+                          "messages": [{"role": "user", "content": "back to work"}]},
+                         "claude-opus-4-8", role="parent")
+lp._WRITE_Q.join()
+check("a real turn clears the ended marker (resume)", psid_probe not in lp._ENDED)
+
 # --- restart-amnesia (item h): holds survive a restart ----------------------------
 import asyncio  # noqa: E402
 

@@ -227,6 +227,26 @@ def _is_title_call(obj):
     return any(t.startswith(_TITLE_SYS_PREFIX) for t in texts)
 
 
+# A health/availability PROBE (seen in the wild: an editor firing a one-token
+# "quota" call on startup): a bare user message with NO system prompt, NO tools,
+# and a tiny max_tokens. It shares the session_id but is NOT an agent turn — like
+# the title side-call it must not own identity, become the replayable last
+# request, clobber the context snapshot, re-anchor the hold, or resurrect an
+# ended session. A genuine agent turn always ships a system prompt + tools and a
+# large max_tokens, so the conjunction is unambiguous (and unlike the title call
+# there is no title to harvest from a 1-token answer — keep it OUT of that path).
+_PROBE_MAX_TOKENS = 16
+
+def _is_probe_call(obj):
+    if obj.get("tools") or obj.get("system"):
+        return False
+    mt = obj.get("max_tokens")
+    if not isinstance(mt, int) or mt > _PROBE_MAX_TOKENS:
+        return False
+    msgs = obj.get("messages")
+    return isinstance(msgs, list) and len(msgs) <= 1
+
+
 # In-memory per-session subagent activity (Task-spawned subs share the parent's
 # session_id). Keyed sid -> {role -> {model, requests, last_seen}} so /_status //
 # _admin can show the main agent AND every subagent under it WITHOUT either
@@ -319,19 +339,25 @@ def _subagent_request_objs(session_id):
 
 
 def _capture_session_meta(session_id, obj, model, agent=None, role=None,
-                          title_call=False, agent_id=None, display_name=None):
+                          side_call=False, agent_id=None, display_name=None):
     """Per-request meta hook (handler, post-parse). The MAIN LINE (the parent
-    agent, role parent/unknown, not a title side-call) owns the durable identity
-    row: it bumps last_seen + model and hunts the cwd. A SUBAGENT turn (Plan/
-    general-purpose/verification/custom — same session_id on the wire) or a title
-    side-call must NOT overwrite the parent's model/identity; we only bump
-    last_seen (the session is alive) and, for a real subagent, log its activity
-    so /_status can show it distinctly. `agent` = the /agent/<name>/ route;
-    `agent_id` = the x-claude-code-agent-id header (per-instance subagent key)."""
+    agent, role parent/unknown, not a title/probe side-call) owns the durable
+    identity row: it bumps last_seen + model and hunts the cwd. A SUBAGENT turn
+    (Plan/general-purpose/verification/custom — same session_id on the wire) or a
+    side-call (title generator, health/quota probe) must NOT overwrite the
+    parent's model/identity; we only bump last_seen (the session is alive) and,
+    for a real subagent, log its activity so /_status can show it distinctly.
+    `agent` = the /agent/<name>/ route; `agent_id` = the x-claude-code-agent-id
+    header (per-instance subagent key)."""
     if not session_id:
         return
-    pinger_mod._clear_session_ended(session_id)    # live turn on an ended session = resume
-    if title_call or writer_mod._is_subagent_role(role):
+    # A real turn (main line OR subagent) on an ended session = resume; a bare
+    # side-call (e.g. a startup quota probe) must NOT resurrect it — that was the
+    # post-restart "odd page": the SessionEnd hook stamped ended, then the probe
+    # both un-ended it and clobbered the durable view with its 1-message body.
+    if not side_call:
+        pinger_mod._clear_session_ended(session_id)
+    if side_call or writer_mod._is_subagent_role(role):
         if writer_mod._is_subagent_role(role):
             _note_subagent(session_id, role, model, obj=obj, agent_id=agent_id,
                            display_name=display_name)

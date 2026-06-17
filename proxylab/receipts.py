@@ -42,12 +42,18 @@ def _stash_view_state(session_id, *, text, truncated, stop_reason, bill):
 
 def anthropic(blob, *, n, ts, agent, role, model, session_id, session_key,
               obj, title_call, is_messages, routed, out_dir, stem,
-              status_code, resp_headers, tee_text=None, response_injection=None):
+              status_code, resp_headers, tee_text=None, response_injection=None,
+              side_call=None):
     """Finalize an anthropic-wire response (messages OR count_tokens).
     `routed` = /agent/<name>/ traffic (the only kind subscribers receive);
     `tee_text` = the subscriber tee's full reassembled turn text, when one ran
     (meta's own text is capped); `resp_headers` = upstream response headers
-    (lowercased keys), never the request's."""
+    (lowercased keys), never the request's. `side_call` = title OR probe (the
+    transient non-agent class); `title_call` is the title generator alone (its
+    answer is the session title). side_call gates view-state/turn-count; only
+    title_call harvests a title — a probe's 1-token answer must never become one."""
+    # back-compat: callers that pass only title_call get the old behavior
+    side_call = title_call if side_call is None else side_call
     if is_messages:
         usage = billing_mod._parse_usage_from_sse(blob)
         meta = billing_mod._parse_response_meta(blob)
@@ -59,7 +65,7 @@ def anthropic(blob, *, n, ts, agent, role, model, session_id, session_key,
                         model_resolved=meta.get("resolved_model") or model,
                         usage_final=meta.get("usage_final"),
                         usage_start=meta.get("usage_start"))
-        if session_id and not title_call and role in ("parent", "unknown"):
+        if session_id and not side_call and role in ("parent", "unknown"):
             _stash_view_state(
                 session_id, text=meta.get("text"),
                 truncated=len(meta.get("text") or "") >= billing_mod._META_TEXT_CAP,
@@ -86,7 +92,7 @@ def anthropic(blob, *, n, ts, agent, role, model, session_id, session_key,
             # (refusal/max_tokens still END a turn; tool_use is a
             # mid-turn hop). Side-calls + subagents don't count.
             "is_turn": bool(
-                is_messages and not title_call
+                is_messages and not side_call
                 and role in ("parent", "unknown")
                 and meta.get("stop_reason") not in (None, "tool_use"))}
     cum = billing_mod._accumulate(bill, session_key, stop)
@@ -112,7 +118,7 @@ def anthropic(blob, *, n, ts, agent, role, model, session_id, session_key,
             meta=meta, bill=bill, stop=stop,
             status_code=status_code,
             text=(tee_text if tee_text is not None else meta.get("text")),
-            role=role, title_call=title_call,
+            role=role, title_call=side_call,
             session_totals=billing_mod._SESSION_TOTALS.get(session_key),
             context=(meta_mod._CONTEXT_STATS.get(session_id)
                      if session_id else None))
