@@ -2773,8 +2773,9 @@ def _sea_msgs():
 
 
 _so = {"messages": _sea_msgs()}
-_sr = lp.transforms._strip_prior_edit_acks(_so)
-check("strip_prior_edit_acks: collapses the prior-turn ack",
+# busted_from=0 simulates the thinking-strip having busted from the top.
+_sr = lp.transforms._strip_prior_edit_acks(_so, busted_from=0)
+check("strip_prior_edit_acks: collapses the prior-turn ack (riding a bust)",
       _sr and _sr.get("stripped") is True and _sr["collapsed_edit_acks"] == 1)
 check("strip_prior_edit_acks: prior ack body becomes 'ok'",
       _so["messages"][2]["content"][0]["content"] == "ok")
@@ -2783,7 +2784,18 @@ check("strip_prior_edit_acks: byte-stable envelope (tool_use_id kept)",
 check("strip_prior_edit_acks: CURRENT-turn ack is never touched",
       _so["messages"][6]["content"][0]["content"].startswith("The file /y.py"))
 check("strip_prior_edit_acks: idempotent re-run -> None (already collapsed)",
-      lp.transforms._strip_prior_edit_acks(_so) is None)
+      lp.transforms._strip_prior_edit_acks(_so, busted_from=0) is None)
+
+# ECONOMIC GATE: no thinking bust to ride (busted_from=None) -> collapse NOTHING
+_gate = {"messages": _sea_msgs()}
+check("strip_prior_edit_acks: busted_from=None (no thinking strip) -> None",
+      lp.transforms._strip_prior_edit_acks(_gate, busted_from=None) is None
+      and _gate["messages"][2]["content"][0]["content"].startswith("The file /x.py"))
+# REGION: an ack UPSTREAM of the bust point is left alone (would originate a bust)
+_reg = {"messages": _sea_msgs()}
+check("strip_prior_edit_acks: ack before busted_from is not collapsed",
+      lp.transforms._strip_prior_edit_acks(_reg, busted_from=3) is None
+      and _reg["messages"][2]["content"][0]["content"].startswith("The file /x.py"))
 
 # failed edit keeps its diagnostic text
 _fail = {"messages": [
@@ -2796,7 +2808,7 @@ _fail = {"messages": [
     {"role": "user", "content": "next"},
 ]}
 check("strip_prior_edit_acks: failed edit (is_error) is kept verbatim",
-      lp.transforms._strip_prior_edit_acks(_fail) is None
+      lp.transforms._strip_prior_edit_acks(_fail, busted_from=0) is None
       and _fail["messages"][2]["content"][0]["content"].startswith("Error:"))
 
 # a non-edit tool_result that happens to contain the phrase is NOT collapsed
@@ -2811,7 +2823,7 @@ _bash = {"messages": [
     {"role": "user", "content": "next"},
 ]}
 check("strip_prior_edit_acks: non-edit result with the phrase is left alone",
-      lp.transforms._strip_prior_edit_acks(_bash) is None)
+      lp.transforms._strip_prior_edit_acks(_bash, busted_from=0) is None)
 
 # Write's distinct "File created successfully at:" form also collapses
 _wr = {"messages": [
@@ -2822,7 +2834,7 @@ _wr = {"messages": [
         {"type": "tool_result", "tool_use_id": "w1", "content": _NEW % "/n", "is_error": False}]},
     {"role": "user", "content": "next"},
 ]}
-_wrr = lp.transforms._strip_prior_edit_acks(_wr)
+_wrr = lp.transforms._strip_prior_edit_acks(_wr, busted_from=0)
 check("strip_prior_edit_acks: Write 'File created…' ack collapses",
       _wrr and _wrr["collapsed_edit_acks"] == 1
       and _wr["messages"][2]["content"][0]["content"] == "ok")
@@ -2830,12 +2842,26 @@ check("strip_prior_edit_acks: Write 'File created…' ack collapses",
 # guards: disabled flag, and no-prior-turn -> None
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = False
 check("strip_prior_edit_acks: disabled flag -> None",
-      lp.transforms._strip_prior_edit_acks({"messages": _sea_msgs()}) is None)
+      lp.transforms._strip_prior_edit_acks({"messages": _sea_msgs()}, busted_from=0) is None)
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
 check("strip_prior_edit_acks: no prior turn before current -> None",
       lp.transforms._strip_prior_edit_acks({"messages": [
           {"role": "user", "content": "only turn"},
-          {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]}) is None)
+          {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]},
+          busted_from=0) is None)
+# thinking-strip reports earliest_idx so the server can pass it as busted_from
+_ti = {"messages": [
+    {"role": "user", "content": "q"},
+    {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "x" * 80, "signature": "s"},
+        {"type": "text", "text": "a"}]},
+    {"role": "user", "content": "now"}]}
+_tsave2 = lp.transforms.STRIP_PRIOR_THINKING
+lp.transforms.STRIP_PRIOR_THINKING = True
+_tr = lp.transforms._strip_prior_thinking(_ti)
+check("strip_prior_thinking: reports earliest_idx for the ack free-rider gate",
+      _tr and _tr.get("earliest_idx") == 1)
+lp.transforms.STRIP_PRIOR_THINKING = _tsave2
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
 
 print()

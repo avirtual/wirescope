@@ -1206,21 +1206,28 @@ READ_CLEARED_MARKER = "[Old tool result content cleared]"
 # Tool names whose results we treat as "Read" across wire dialects.
 _READ_TOOL_NAMES = frozenset({"Read", "FileRead", "FileReadTool"})
 
-# COLLAPSE PRIOR-TURN EDIT/WRITE SUCCESS ACKS — the cleanest strip of all. An
-# Edit/Write tool_result on success is fixed boilerplate (~155 ch) carrying ONE
-# bit, "it succeeded", plus a "(file state is current… no need to Read it back)"
-# nudge. That nudge is LIVE in the current turn (steers the model off a redundant
-# re-Read) but pure ballast in every COMPLETED prior turn, where it re-ships
-# unchanged every turn (corpus: ~9 such acks per edit-heavy turn, 3.2M tok of
-# recurring carriage). We collapse prior acks to "ok" — the success bit survives
-# (the file path is redundant: it's in the paired Edit tool_use). DEDUCTIVELY
-# SAFE: no reuse bet, no reconstruction, no anchor. Two guards keep it honest:
-#  (1) is_error FAILURES keep their text verbatim (real diagnostic the model needs);
-#  (2) we collapse ONLY a result whose tool_use was an edit tool AND whose body
-#      matches a known ack fragment — a future CLI wording change just stops
-#      matching (safe no-op), never a false strip. Class+position only -> the
-#      stripped prefix stays byte-stable as the boundary advances, exactly like
-#      the read/thinking strips (same one-time bust, perpetual cheaper reads).
+# COLLAPSE PRIOR-TURN EDIT/WRITE SUCCESS ACKS. An Edit/Write tool_result on
+# success is fixed boilerplate (~155 ch) carrying ONE bit, "it succeeded", plus a
+# "(file state is current… no need to Read it back)" nudge. That nudge is LIVE in
+# the current turn but pure ballast in every COMPLETED prior turn. Collapsing it
+# to "ok" reclaims the success bit (the file path is redundant — it's in the
+# paired Edit tool_use). The content removal is deductively safe (no reuse bet, no
+# reconstruction, no anchor), with two guards: (1) is_error FAILURES keep their
+# text verbatim; (2) collapse ONLY a result whose tool_use was an edit tool AND
+# whose body matches a known ack fragment (a wording change is a safe no-op).
+#
+# BUT the ECONOMICS are not free-standing. Collapsing an ack changes the message
+# prefix at its position -> BUSTS the cache from there -> the whole downstream
+# suffix re-writes at write-premium ONCE. That bust is ~$1 on a big window to
+# reclaim only ~1.4k tok/turn of ack carriage -> breakeven ~1400 turns: a LOSS if
+# the ack strip ORIGINATES the bust. It only pays as a FREE-RIDER: collapse acks
+# ONLY inside a region the thinking-strip ALREADY busted this turn (at/after its
+# earliest stripped index). There the suffix re-writes anyway, so the marginal
+# invalidation is ZERO and the reclaim (smaller rewrite now + cheaper reads
+# forever) is pure gain. So this is GATED on _strip_prior_thinking having fired,
+# and confined to its busted region — never invalidates the current-turn cache on
+# its own. (Measured live: on a thinking-OFF session it wrongly busted 174k to
+# save ~1.4k — the exact loss this gate prevents.)
 STRIP_PRIOR_EDIT_ACKS = os.environ.get("STRIP_PRIOR_EDIT_ACKS", "0") not in ("0", "no", "off", "false")
 EDIT_ACK_MARKER = "ok"
 # Tool names whose results are Edit/Write success acks across wire dialects.
@@ -1420,6 +1427,8 @@ def _strip_prior_thinking(obj, agent_id=None):
                 "prior_thinking_chars": prior_think, "prior_body_chars": prior_body,
                 "boundary_idx": last_user, "total_messages": len(msgs)}
     removed = stripped_chars = touched_msgs = 0
+    earliest = None                       # first message index busted -> the
+                                          # already-invalidated region edit-acks ride
     for i, m in enumerate(msgs):
         if i >= last_user or m.get("role") != "assistant":
             continue
@@ -1438,10 +1447,13 @@ def _strip_prior_thinking(obj, agent_id=None):
             removed += msg_removed
             stripped_chars += msg_chars
             touched_msgs += 1
+            if earliest is None:
+                earliest = i
     if not removed:
         return None
     return {"stripped": True, "removed_thinking_blocks": removed, "touched_messages": touched_msgs,
             "stripped_chars": stripped_chars, "body_thinking_ratio": ratio,
+            "earliest_idx": earliest,     # edit-ack strip rides this bust point
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
 def _read_result_ids(msgs):
@@ -1529,15 +1541,20 @@ def _edit_result_ids(msgs):
     return ids
 
 
-def _strip_prior_edit_acks(obj, agent_id=None):
-    """Collapse Edit/Write SUCCESS acks in COMPLETED prior turns (strictly before
-    the last real user boundary) to "ok". The current turn is untouched (its ack
-    still carries the live "no need to Read it back" nudge). A result is collapsed
-    only when ALL hold: its tool_use was an edit tool, is_error is falsy, and the
-    string body matches a known ack fragment. Byte-stable envelope (tool_use_id +
-    type kept). Gated by STRIP_PRIOR_EDIT_ACKS. Returns a log dict or None
-    (disabled / no prior history / nothing to collapse)."""
+def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
+    """Collapse Edit/Write SUCCESS acks to "ok" in the region the thinking-strip
+    ALREADY busted this turn — message indices in [busted_from, last_user). The
+    current turn is untouched (its ack keeps the live "no need to Read it back"
+    nudge). A result is collapsed only when ALL hold: its tool_use was an edit
+    tool, is_error is falsy, the string body matches a known ack fragment, and it
+    sits in the busted region. ECONOMIC GATE: `busted_from` is the thinking-strip's
+    earliest stripped index; when None (thinking didn't fire / declined) we collapse
+    NOTHING — originating a fresh bust to reclaim ~1.4k tok/turn is a ~1400-turn
+    loss. Byte-stable envelope (tool_use_id + type kept). Gated by
+    STRIP_PRIOR_EDIT_ACKS. Returns a log dict or None."""
     if not isinstance(obj, dict) or not STRIP_PRIOR_EDIT_ACKS:
+        return None
+    if busted_from is None:               # no already-busted region to ride -> skip
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
@@ -1550,8 +1567,8 @@ def _strip_prior_edit_acks(obj, agent_id=None):
         return None
     collapsed = stripped_chars = touched_msgs = 0
     for i, m in enumerate(msgs):
-        if i >= last_user or m.get("role") != "user":
-            continue
+        if i < busted_from or i >= last_user or m.get("role") != "user":
+            continue                      # only the thinking-busted prior region
         c = m.get("content")
         if not isinstance(c, list):
             continue
@@ -1581,6 +1598,7 @@ def _strip_prior_edit_acks(obj, agent_id=None):
         return None
     return {"stripped": True, "collapsed_edit_acks": collapsed,
             "touched_messages": touched_msgs, "stripped_chars": stripped_chars,
+            "rode_bust_from": busted_from,  # free-rode the thinking-strip bust here
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
 

@@ -613,10 +613,13 @@ async def handler(request: Request) -> Response:
                 if spr.get("cleared_read_results"):
                     changed = True
             # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
-            # in completed prior turns with "ok"; current turn keeps its live
-            # "no need to Read it back" nudge. Failures kept verbatim. Byte-stable
-            # like the read/thinking strips. Deductively safe (boilerplate, one bit).
-            sea = transforms_mod._strip_prior_edit_acks(obj, agent_id=agent_id)
+            # with "ok" — but ONLY inside the region the thinking-strip just busted
+            # (free-rider). Originating its own bust to reclaim ~1.4k tok/turn is a
+            # ~1400-turn loss, so when thinking didn't strip (spt None/declined) we
+            # pass busted_from=None and it collapses nothing. Current turn untouched.
+            busted_from = spt.get("earliest_idx") if (spt and spt.get("stripped")) else None
+            sea = transforms_mod._strip_prior_edit_acks(
+                obj, agent_id=agent_id, busted_from=busted_from)
             if sea:
                 record["strip_prior_edit_acks"] = sea
                 if sea.get("collapsed_edit_acks"):
