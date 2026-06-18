@@ -2548,6 +2548,12 @@ check("/_report catches the overnight idle-gap miss across a restart (not hidden
 check("/_identity exposes context_report capability + endpoint",
       lp._identity()["capabilities"].get("context_report") is True
       and lp._identity()["endpoints"].get("report") == "/_report")
+_ident = lp._identity()
+check("/_identity exposes strip_thinking capability + /_strip endpoint",
+      _ident["capabilities"].get("strip_thinking", {}).get("available") is True
+      and "default" in _ident["capabilities"]["strip_thinking"]
+      and _ident["endpoints"].get("strip") == "/_strip"
+      and _ident["capabilities"]["wirescope"].get("strip_thinking") is True)
 
 # --- STRIP_PRIOR_THINKING: prior-turn thinking strip + monster guard ----------
 import copy as _copy

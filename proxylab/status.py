@@ -80,6 +80,14 @@ def _identity():
             "context_skills": True,       # /_context per-skill roster + utilization
             "context_report": True,       # /_report?session= cost/efficiency report
             "context_timeline": True,     # /_report?...&detail=1 series + /_timeline HTML
+            # prior-turn thinking strip: per-session consumer opt-in via /_strip
+            # or [wirescope:strip-thinking on]. `default` = the global flag (what
+            # `effective` is when no per-session override is set). When the proxy
+            # ships globally off (the consumer-opt-in stance), default is false but
+            # the capability is True (the lever exists) — gate on this, not version.
+            "strip_thinking": {"available": True,
+                               "default": transforms_mod.STRIP_PRIOR_THINKING,
+                               "max_body_ratio": transforms_mod.STRIP_THINK_MAX_BODY_RATIO},
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
@@ -94,7 +102,10 @@ def _identity():
                           # tool-roster trim: `tools` (allowlist), `strip-tools`
                           # (denylist), `keep-tools` (override); gated by
                           # WS_STRIP_TOOLS, same spawn/body/sticky plumbing.
-                          "strip_tools": transforms_mod.WS_STRIP_TOOLS},
+                          "strip_tools": transforms_mod.WS_STRIP_TOOLS,
+                          # `[wirescope:strip-thinking on|off]` per-session opt-in
+                          # (twin of the /_strip endpoint); always parsed.
+                          "strip_thinking": True},
         },
         "endpoints": {
             "identity": "/_identity",
@@ -109,6 +120,7 @@ def _identity():
             "context": "/_context",
             "report": "/_report",
             "timeline": "/_timeline",
+            "strip": "/_strip",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
     }
