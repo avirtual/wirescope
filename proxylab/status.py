@@ -526,8 +526,12 @@ def _composition(obj, total_tokens=None):
                 else:
                     chars["assistant" if role == "assistant" else "user"] += len(text)
             elif bt in ("thinking", "redacted_thinking"):
-                chars["thinking"] += len(b.get("thinking") or b.get("data")
-                                         or json.dumps(b, ensure_ascii=False))
+                # signature + redacted data ship on the wire (and a strip removes
+                # them) -> count them, so this agrees with _strip_thinking_panel.
+                body = (b.get("thinking") or "") + (b.get("data") or "")
+                sig = b.get("signature") or ""
+                chars["thinking"] += (len(body) + len(sig) if (body or sig)
+                                      else len(json.dumps(b, ensure_ascii=False)))
             elif bt == "tool_use":
                 chars["tool_calls"] += len(json.dumps(b, ensure_ascii=False))
             elif bt == "tool_result":
@@ -544,15 +548,57 @@ def _composition(obj, total_tokens=None):
         return None
     if total_tokens and total_tokens > 0:
         basis, total = "receipt", total_tokens
-        cats = [{"category": k, "tokens": round(v * total_tokens / raw_total)}
-                for k, v in raw.items()]
+        scale = total_tokens / raw_total
+        cats = [{"category": k, "tokens": round(v * scale)} for k, v in raw.items()]
     else:
-        basis, total = "estimate", raw_total
+        basis, total, scale = "estimate", raw_total, 1.0
         cats = [{"category": k, "tokens": v} for k, v in raw.items()]
     for c in cats:
         c["pct"] = round(100.0 * c["tokens"] / total, 1) if total else 0.0
     cats.sort(key=lambda x: x["tokens"], reverse=True)
-    return {"total_tokens": total, "basis": basis, "by_category": cats}
+    out = {"total_tokens": total, "basis": basis, "by_category": cats}
+    spt = _strip_thinking_panel(obj, scale, total)
+    if spt:
+        out["strip_prior_thinking"] = spt
+    return out
+
+
+def _strip_thinking_panel(obj, scale, total):
+    """Decision panel for STRIP_PRIOR_THINKING: how much of the window is
+    PRIOR-turn thinking (the strippable, reclaimable slice) vs current-turn
+    thinking (signed, untouchable), the body/thinking ratio the monster guard
+    gates on, the live would-strip verdict, and the per-turn read reclaim. Reuses
+    the transform's own helpers so `would_strip`/`body_thinking_ratio` match the
+    real gate exactly (no drift). None when there is no prior thinking to strip."""
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    last_user = max((i for i, m in enumerate(msgs)
+                     if transforms_mod._is_real_user_turn(m)), default=-1)
+    if last_user <= 0:
+        return None
+    prior = msgs[:last_user]
+    pt_ch = sum(transforms_mod._msg_thinking_chars(m) for m in prior
+                if isinstance(m, dict) and m.get("role") == "assistant")
+    if not pt_ch:
+        return None
+    pb_ch = sum(transforms_mod._msg_nonthinking_chars(m) for m in prior
+                if isinstance(m, dict))
+    cur_ch = sum(transforms_mod._msg_thinking_chars(m) for m in msgs[last_user:]
+                 if isinstance(m, dict) and m.get("role") == "assistant")
+    ratio = round(pb_ch / pt_ch, 2)
+    mbr = transforms_mod.STRIP_THINK_MAX_BODY_RATIO
+    prior_tok = round((pt_ch // _CHARS_PER_TOK) * scale)
+    p = billing_mod._price_for(obj.get("model"))
+    est_usd = round(prior_tok / 1e6 * p["cache_read"], 4) if p else None
+    return {"prior_thinking_tokens": prior_tok,
+            "current_thinking_tokens": round((cur_ch // _CHARS_PER_TOK) * scale),
+            "prior_body_tokens": round((pb_ch // _CHARS_PER_TOK) * scale),
+            "body_thinking_ratio": ratio, "max_body_ratio": mbr,
+            "would_strip": (mbr <= 0 or ratio <= mbr),
+            "pct_of_window": round(100.0 * prior_tok / total, 1) if total else 0.0,
+            "read_reclaim_tokens_per_turn": prior_tok,
+            "est_read_reclaim_usd_per_turn": est_usd}
 
 
 def _utilization(session):

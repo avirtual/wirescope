@@ -551,6 +551,15 @@ async def handler(request: Request) -> Response:
                 record["strip_compact_cache"] = scc
                 if scc.get("removed_message_markers"):
                     changed = True
+            # STRIP PRIOR-TURN THINKING (experimental): drop thinking blocks from
+            # completed prior turns; current turn untouched. Busts message cache
+            # from the strip point (recouped by cheaper reads). Monster guard may
+            # decline (stripped:False) -> recorded for observability, no mutation.
+            spt = transforms_mod._strip_prior_thinking(obj)
+            if spt:
+                record["strip_prior_thinking"] = spt
+                if spt.get("removed_thinking_blocks"):
+                    changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the
             # model speaks the ack; this request becomes the replayable,

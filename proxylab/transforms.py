@@ -1162,6 +1162,135 @@ def _strip_compact_cache(obj):
             "removed_message_markers": len(removed), "removed": removed,
             "kept_system_markers": sys_markers}
 
+
+# ---- STRIP PRIOR-TURN THINKING (experimental, off by default) -------------
+# Remove `thinking`/`redacted_thinking` blocks from COMPLETED prior turns —
+# every assistant message BEFORE the last real user-turn boundary. The CURRENT
+# turn (everything at/after the last user TEXT message, including an in-flight
+# tool-use loop) is left untouched: the API requires the signed thinking chain
+# within the active tool cycle, but completed prior turns may legally omit it
+# (the conclusion survives in the kept `text`/`tool_use` blocks). Wholesale
+# REMOVAL (not in-place mutation) leaves no signature to verify, so it's clean.
+# This changes the message prefix -> BUSTS the message cache from the first
+# strip point (one-time per-turn re-cache, recouped by the perpetual cheaper
+# reads). MONSTER GUARD: tool-output-dominated histories (body >> thinking) are
+# the only money-losers — there the re-cache toll on the busted body outweighs
+# the thinking-read reclaim. We skip those via a body/thinking ratio gate
+# (STRIP_THINK_MAX_BODY_RATIO). Validated on captured opus sessions: large
+# winners sit at body/thinking <= ~1; the single losing session sat at ~7.
+STRIP_PRIOR_THINKING = os.environ.get("STRIP_PRIOR_THINKING", "0") not in ("0", "no", "off", "false")
+# Skip stripping when prior body/thinking exceeds this. 0 / negative disables
+# the gate (always strip).
+try:
+    STRIP_THINK_MAX_BODY_RATIO = float(os.environ.get("STRIP_THINK_MAX_BODY_RATIO", "4.0"))
+except ValueError:
+    STRIP_THINK_MAX_BODY_RATIO = 4.0
+
+
+def _is_real_user_turn(m):
+    """A genuine user-turn boundary: role=user carrying actual text (NOT a
+    message that is solely tool_result blocks — that's mid-turn tool-loop
+    plumbing, part of the CURRENT turn)."""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return False
+    c = m.get("content")
+    if isinstance(c, str):
+        return bool(c.strip())
+    if isinstance(c, list):
+        return any(isinstance(b, dict) and b.get("type") == "text" for b in c)
+    return False
+
+
+def _msg_thinking_chars(m):
+    """Thinking-block chars (text/redacted-data + signature) in a message — the
+    full wire footprint a strip removes."""
+    c = m.get("content")
+    t = 0
+    if isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"):
+                t += (len(b.get("thinking") or "") + len(b.get("data") or "")
+                      + len(b.get("signature") or ""))
+    return t
+
+
+def _msg_nonthinking_chars(m):
+    """Surviving 'body' chars: text + tool_use input + tool_result content —
+    everything a strip leaves behind (and that a bust would re-cache)."""
+    c = m.get("content")
+    if isinstance(c, str):
+        return len(c)
+    t = 0
+    if isinstance(c, list):
+        for b in c:
+            if not isinstance(b, dict):
+                continue
+            ty = b.get("type")
+            if ty in ("thinking", "redacted_thinking"):
+                continue
+            if ty == "text":
+                t += len(b.get("text") or "")
+            elif ty == "tool_use":
+                try:
+                    t += len(json.dumps(b.get("input") or {}))
+                except (TypeError, ValueError):
+                    pass
+            elif ty == "tool_result":
+                cc = b.get("content")
+                t += len(cc) if isinstance(cc, str) else len(json.dumps(cc, default=str))
+    return t
+
+
+def _strip_prior_thinking(obj):
+    """Drop thinking blocks from assistant messages in COMPLETED prior turns
+    (strictly before the last real user-turn boundary), unless the monster guard
+    declines. Returns a log dict (`stripped` True/False) or None (disabled / no
+    prior history / no prior thinking)."""
+    if not STRIP_PRIOR_THINKING or not isinstance(obj, dict):
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
+    if last_user <= 0:
+        return None                       # no prior turn before the current one
+    prior = msgs[:last_user]
+    prior_think = sum(_msg_thinking_chars(m) for m in prior if m.get("role") == "assistant")
+    if not prior_think:
+        return None                       # no prior thinking to strip
+    prior_body = sum(_msg_nonthinking_chars(m) for m in prior)
+    ratio = round(prior_body / prior_think, 2)
+    if STRIP_THINK_MAX_BODY_RATIO > 0 and ratio > STRIP_THINK_MAX_BODY_RATIO:
+        # MONSTER GUARD: tool-output-dominated history -> skip (re-cache loses).
+        return {"stripped": False, "skipped_reason": "body_thinking_ratio",
+                "body_thinking_ratio": ratio, "max_body_ratio": STRIP_THINK_MAX_BODY_RATIO,
+                "prior_thinking_chars": prior_think, "prior_body_chars": prior_body,
+                "boundary_idx": last_user, "total_messages": len(msgs)}
+    removed = stripped_chars = touched_msgs = 0
+    for i, m in enumerate(msgs):
+        if i >= last_user or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        kept, msg_removed, msg_chars = [], 0, 0
+        for blk in c:
+            if isinstance(blk, dict) and blk.get("type") in ("thinking", "redacted_thinking"):
+                msg_chars += len(blk.get("thinking") or "") + len(blk.get("signature") or "")
+                msg_removed += 1
+                continue
+            kept.append(blk)
+        if msg_removed and kept:          # never leave an empty content array (would 400)
+            m["content"] = kept
+            removed += msg_removed
+            stripped_chars += msg_chars
+            touched_msgs += 1
+    if not removed:
+        return None
+    return {"stripped": True, "removed_thinking_blocks": removed, "touched_messages": touched_msgs,
+            "stripped_chars": stripped_chars, "body_thinking_ratio": ratio,
+            "boundary_idx": last_user, "total_messages": len(msgs)}
+
 def _patch_tool_descriptions(obj):
     """Append the shortcircuit protocol to each terminal tool's description in
     the request's tools[] (idempotent + cache-stable). Returns the list of tool

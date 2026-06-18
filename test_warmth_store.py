@@ -2549,6 +2549,105 @@ check("/_identity exposes context_report capability + endpoint",
       lp._identity()["capabilities"].get("context_report") is True
       and lp._identity()["endpoints"].get("report") == "/_report")
 
+# --- STRIP_PRIOR_THINKING: prior-turn thinking strip + monster guard ----------
+import copy as _copy
+_spt_save = (lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO)
+lp.transforms.STRIP_PRIOR_THINKING = True
+lp.transforms.STRIP_THINK_MAX_BODY_RATIO = 4.0
+
+
+def _spt_msgs():
+    # turn 1: user -> assistant(thinking+text); turn 2 (current): user -> assistant(thinking+text)
+    return [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "a fairly long block of prior reasoning ...",
+             "signature": "sig1"},
+            {"type": "text", "text": "ok"}]},
+        {"role": "user", "content": "second question"},      # last real user turn (current)
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "CURRENT turn thinking — must survive"},
+            {"type": "text", "text": "answer"}]},
+    ]
+
+_o = {"messages": _spt_msgs()}
+_r = lp.transforms._strip_prior_thinking(_o)
+check("strip_prior_thinking: strips the prior turn's thinking",
+      _r and _r.get("stripped") is True and _r["removed_thinking_blocks"] == 1)
+check("strip_prior_thinking: prior assistant text survives the strip",
+      [b.get("type") for b in _o["messages"][1]["content"]] == ["text"])
+check("strip_prior_thinking: CURRENT-turn thinking is never touched",
+      any(b.get("type") == "thinking" for b in _o["messages"][3]["content"]))
+
+# monster guard: body dwarfs thinking -> skip (no mutation)
+_mon = {"messages": [
+    {"role": "user", "content": "q"},
+    {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "tiny"},
+        {"type": "tool_use", "input": {"x": "y"}}]},
+    {"role": "user", "content": [{"type": "tool_result",
+        "content": "HUGE TOOL OUTPUT " * 200}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+    {"role": "user", "content": "next real turn"},
+    {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "current"}, {"type": "text", "text": "a"}]},
+]}
+_mr = lp.transforms._strip_prior_thinking(_mon)
+check("strip_prior_thinking: monster guard skips body-dominated history",
+      _mr and _mr.get("stripped") is False
+      and _mr.get("skipped_reason") == "body_thinking_ratio"
+      and _mr["body_thinking_ratio"] > 4.0)
+check("strip_prior_thinking: skipped monster is NOT mutated",
+      any(b.get("type") == "thinking" for b in _mon["messages"][1]["content"]))
+
+# gate disabled (ratio<=0) -> strips even the monster
+lp.transforms.STRIP_THINK_MAX_BODY_RATIO = 0.0
+_mon2 = _copy.deepcopy(_mon)
+_mr2 = lp.transforms._strip_prior_thinking(_mon2)
+check("strip_prior_thinking: gate disabled strips regardless of ratio",
+      _mr2 and _mr2.get("stripped") is True
+      and not any(b.get("type") == "thinking" for b in _mon2["messages"][1]["content"]))
+lp.transforms.STRIP_THINK_MAX_BODY_RATIO = 4.0
+
+# no prior history (only the current turn) -> None
+check("strip_prior_thinking: no prior turn -> None",
+      lp.transforms._strip_prior_thinking(
+          {"messages": [{"role": "user", "content": "only turn"},
+                        {"role": "assistant", "content": [
+                            {"type": "thinking", "thinking": "t"},
+                            {"type": "text", "text": "a"}]}]}) is None)
+
+# tool_result-only user message is NOT a real user turn (mid-loop plumbing)
+check("strip_prior_thinking: tool_result-only msg is not a user-turn boundary",
+      lp.transforms._is_real_user_turn(
+          {"role": "user", "content": [{"type": "tool_result", "content": "r"}]}) is False
+      and lp.transforms._is_real_user_turn(
+          {"role": "user", "content": [{"type": "text", "text": "hi"}]}) is True)
+
+# /_context decision panel: prior thinking split + ratio + verdict (no flag dep)
+_pan = lp._composition({"model": "claude-opus-4-8", "messages": _spt_msgs()})
+_pp = _pan.get("strip_prior_thinking")
+check("composition: strip_prior_thinking panel surfaces prior thinking + verdict",
+      _pp and _pp["prior_thinking_tokens"] > 0 and _pp["current_thinking_tokens"] > 0
+      and _pp["would_strip"] is True and _pp["body_thinking_ratio"] <= 4.0
+      and _pp["est_read_reclaim_usd_per_turn"] is not None)
+check("composition: panel verdict flips to skip on body-dominated history",
+      (lambda p: p and p["would_strip"] is False and p["body_thinking_ratio"] > 4.0)(
+          lp._composition(_copy.deepcopy(_mon)).get("strip_prior_thinking")))
+check("composition: no panel when there is no prior thinking",
+      "strip_prior_thinking" not in lp._composition(
+          {"model": "claude-opus-4-8",
+           "messages": [{"role": "user", "content": "only turn"},
+                        {"role": "assistant", "content": [
+                            {"type": "thinking", "thinking": "t"},
+                            {"type": "text", "text": "a"}]}]}))
+
+# disabled flag -> always None
+lp.transforms.STRIP_PRIOR_THINKING = False
+check("strip_prior_thinking: disabled flag -> None",
+      lp.transforms._strip_prior_thinking({"messages": _spt_msgs()}) is None)
+lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO = _spt_save
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
