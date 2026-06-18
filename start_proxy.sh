@@ -70,6 +70,10 @@ fi
 export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
 export WARMTH_BLOCK_COLD_PING="${WARMTH_BLOCK_COLD_PING-1}"
 export WARMTH_LOG_FILE="${WARMTH_LOG_FILE-1}"
+# Collapse prior-turn Edit/Write success acks to "ok" (current turn kept). Pure
+# boilerplate, one bit preserved, failures untouched — deductively safe, so ON by
+# canonical-script default (code default stays OFF for library embeddings/tests).
+export STRIP_PRIOR_EDIT_ACKS="${STRIP_PRIOR_EDIT_ACKS-1}"
 # NOTE: STRIP_PRIOR_THINKING ships globally OFF (code + script). It's a
 # CONSUMER-opt-in optimization: an app (clodex) turns it on PER SESSION via the
 # `[wirescope:strip-thinking on]` directive or POST /_strip — stock proxy stays

@@ -604,6 +604,23 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_thinking"] = spt
                 if spt.get("removed_thinking_blocks"):
                     changed = True
+            # STRIP PRIOR-TURN READS (experimental, scratch-port A/B; OFF on
+            # :7800): replace prior Read tool_result bodies with the CLI's
+            # cleared-marker. Class+position, byte-stable like the thinking strip.
+            spr = transforms_mod._strip_prior_reads(obj, agent_id=agent_id)
+            if spr:
+                record["strip_prior_reads"] = spr
+                if spr.get("cleared_read_results"):
+                    changed = True
+            # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
+            # in completed prior turns with "ok"; current turn keeps its live
+            # "no need to Read it back" nudge. Failures kept verbatim. Byte-stable
+            # like the read/thinking strips. Deductively safe (boilerplate, one bit).
+            sea = transforms_mod._strip_prior_edit_acks(obj, agent_id=agent_id)
+            if sea:
+                record["strip_prior_edit_acks"] = sea
+                if sea.get("collapsed_edit_acks"):
+                    changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the
             # model speaks the ack; this request becomes the replayable,

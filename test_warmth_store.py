@@ -2742,6 +2742,102 @@ check("strip override: _ws_forget deletes the persisted row too",
 lp.transforms._STRIP_OVERRIDE.clear()
 lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO = _spt_save
 
+# --- STRIP_PRIOR_EDIT_ACKS: collapse prior Edit/Write success boilerplate ------
+_sea_save = lp.transforms.STRIP_PRIOR_EDIT_ACKS
+lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
+_UPD = ("The file %s has been updated successfully. (file state is current in "
+        "your context — no need to Read it back)")
+_NEW = ("File created successfully at: %s (file state is current in your "
+        "context — no need to Read it back)")
+
+
+def _sea_msgs():
+    # prior turn: Edit(e1) -> ack; current turn: Edit(e2) -> ack (must survive)
+    return [
+        {"role": "user", "content": "do an edit"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "e1", "name": "Edit",
+             "input": {"file_path": "/x.py", "old_string": "a", "new_string": "b"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "e1",
+             "content": _UPD % "/x.py", "is_error": False}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "edited"}]},
+        {"role": "user", "content": "now do another"},        # last real user boundary
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "e2", "name": "Edit",
+             "input": {"file_path": "/y.py", "old_string": "c", "new_string": "d"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "e2",
+             "content": _UPD % "/y.py", "is_error": False}]},
+    ]
+
+
+_so = {"messages": _sea_msgs()}
+_sr = lp.transforms._strip_prior_edit_acks(_so)
+check("strip_prior_edit_acks: collapses the prior-turn ack",
+      _sr and _sr.get("stripped") is True and _sr["collapsed_edit_acks"] == 1)
+check("strip_prior_edit_acks: prior ack body becomes 'ok'",
+      _so["messages"][2]["content"][0]["content"] == "ok")
+check("strip_prior_edit_acks: byte-stable envelope (tool_use_id kept)",
+      _so["messages"][2]["content"][0]["tool_use_id"] == "e1")
+check("strip_prior_edit_acks: CURRENT-turn ack is never touched",
+      _so["messages"][6]["content"][0]["content"].startswith("The file /y.py"))
+check("strip_prior_edit_acks: idempotent re-run -> None (already collapsed)",
+      lp.transforms._strip_prior_edit_acks(_so) is None)
+
+# failed edit keeps its diagnostic text
+_fail = {"messages": [
+    {"role": "user", "content": "edit"},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "f1", "name": "Edit", "input": {"file_path": "/z"}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "f1",
+         "content": "Error: old_string not found in /z", "is_error": True}]},
+    {"role": "user", "content": "next"},
+]}
+check("strip_prior_edit_acks: failed edit (is_error) is kept verbatim",
+      lp.transforms._strip_prior_edit_acks(_fail) is None
+      and _fail["messages"][2]["content"][0]["content"].startswith("Error:"))
+
+# a non-edit tool_result that happens to contain the phrase is NOT collapsed
+# (collapse requires the result's tool_use to be an edit tool, paired by id)
+_bash = {"messages": [
+    {"role": "user", "content": "run"},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "echo hi"}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "b1",
+         "content": "log: record has been updated successfully", "is_error": False}]},
+    {"role": "user", "content": "next"},
+]}
+check("strip_prior_edit_acks: non-edit result with the phrase is left alone",
+      lp.transforms._strip_prior_edit_acks(_bash) is None)
+
+# Write's distinct "File created successfully at:" form also collapses
+_wr = {"messages": [
+    {"role": "user", "content": "write"},
+    {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": "/n"}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "w1", "content": _NEW % "/n", "is_error": False}]},
+    {"role": "user", "content": "next"},
+]}
+_wrr = lp.transforms._strip_prior_edit_acks(_wr)
+check("strip_prior_edit_acks: Write 'File created…' ack collapses",
+      _wrr and _wrr["collapsed_edit_acks"] == 1
+      and _wr["messages"][2]["content"][0]["content"] == "ok")
+
+# guards: disabled flag, and no-prior-turn -> None
+lp.transforms.STRIP_PRIOR_EDIT_ACKS = False
+check("strip_prior_edit_acks: disabled flag -> None",
+      lp.transforms._strip_prior_edit_acks({"messages": _sea_msgs()}) is None)
+lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
+check("strip_prior_edit_acks: no prior turn before current -> None",
+      lp.transforms._strip_prior_edit_acks({"messages": [
+          {"role": "user", "content": "only turn"},
+          {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]}) is None)
+lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
