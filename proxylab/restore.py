@@ -187,6 +187,25 @@ def _restore_ended():
         return 0
 
 
+def _restore_strip_overrides():
+    """Reload per-session strip overrides BEFORE the first post-restart turn, so
+    an opted-in session keeps stripping (and its warm prefix stays consistent)
+    instead of involuntarily flipping OFF and forcing a full-window re-write.
+    The anti-flap fix — our control state must be as durable as the cache."""
+    try:
+        from proxylab import transforms as transforms_mod
+        con = store_mod.db()
+        with store_mod.LOCK:
+            rows = con.execute("SELECT session_id, enabled FROM strip_override "
+                               "WHERE owner=?", (store_mod.OWNER,)).fetchall()
+        for sid, enabled in rows:
+            transforms_mod._STRIP_OVERRIDE[sid] = bool(enabled)
+        return len(rows)
+    except Exception as e:
+        print(f"[restore] strip_overrides failed: {e}", flush=True)
+        return 0
+
+
 def _restore_state():
     now = time.time()
     _RESTORED["holds"] = _restore_holds(now)
@@ -194,8 +213,10 @@ def _restore_state():
     _RESTORED["totals"], _RESTORED["session_totals"] = _restore_totals()
     _RESTORED["cwd_done"] = _restore_cwd_done()
     _RESTORED["ended"] = _restore_ended()
+    _RESTORED["strip_overrides"] = _restore_strip_overrides()
     print(f"[restore] holds={_RESTORED['holds']} "
           f"last_requests={_RESTORED['last_requests']} (auth-less until live "
           f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
           f"session_totals={_RESTORED['session_totals']} "
-          f"cwd_known={_RESTORED['cwd_done']}", flush=True)
+          f"cwd_known={_RESTORED['cwd_done']} "
+          f"strip_overrides={_RESTORED['strip_overrides']}", flush=True)

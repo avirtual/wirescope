@@ -555,6 +555,14 @@ async def handler(request: Request) -> Response:
                 record["ws_tools"] = wst
                 if wst.get("removed"):
                     changed = True
+            # WIRESCOPE [wirescope:strip-thinking ...]: resolve the strip decision
+            # into the sticky per-session store NOW, BEFORE the directive-strip
+            # below removes the line from the wire — otherwise a directive placed
+            # in the (append-)system region is consumed before _strip_prior_thinking
+            # (further down the chain) can read it, and turn 1 silently never
+            # strips. Idempotent; endpoint-set overrides are untouched (no directive
+            # -> no-op). Persists the directive opt-in so it survives restarts too.
+            transforms_mod._strip_thinking_enabled(obj, agent_id=agent_id)
             # WIRESCOPE: capture the display name BEFORE removing the directives,
             # then strip every [wirescope:...] line from system so the model never
             # sees our control lines (and they cost no prefix tokens). Strip is

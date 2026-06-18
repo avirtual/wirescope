@@ -2677,6 +2677,18 @@ lp.transforms.STRIP_PRIOR_THINKING = True
 check("strip override: directive 'off' declines even with global ON",
       lp.transforms._strip_prior_thinking(_spt_dir_obj("off", sid="sess-strip-off")) is None)
 lp.transforms.STRIP_PRIOR_THINKING = False
+# SERVER-ORDER integration: the directive-strip runs BEFORE _strip_prior_thinking
+# in the real chain, so a directive in the system region must be resolved into the
+# sticky store FIRST (the early _strip_thinking_enabled call) or turn 1 silently
+# never strips. Simulate the real order: resolve -> strip directives -> act.
+_so_obj = _spt_dir_obj("on", sid="sess-server-order")
+lp.transforms._strip_thinking_enabled(_so_obj)            # early resolve (server)
+lp.transforms._ws_strip_directives(_so_obj)               # directive removed from wire
+check("strip override: system directive survives the directive-strip (server order)",
+      "[wirescope:" not in lp.writer._sys_text(_so_obj)    # model never sees it
+      and (lambda r: r and r.get("stripped") is True)(
+          lp.transforms._strip_prior_thinking(_so_obj)))   # but turn 1 still strips
+lp.transforms._strip_thinking_set_override("sess-server-order", None)
 # endpoint setter: on / clear
 lp.transforms._strip_thinking_set_override("sess-ep", True)
 check("strip override: endpoint setter on -> strips with global OFF",
@@ -2702,6 +2714,31 @@ check("strip override: resolver maps on/off/bare/last-wins",
       and lp.transforms._ws_resolve_strip_thinking([("omit", "x")]) is None
       and lp.transforms._ws_resolve_strip_thinking(
           [("strip-thinking", "on"), ("strip-thinking", "off")]) is False)
+# PERSISTENCE / anti-flap: an override survives an in-memory wipe via SQLite
+# reload (a restart must not silently flip strip state against a warm cache).
+lp.transforms._strip_thinking_set_override("sess-persist", True)
+_persist_row = lp.store.db().execute(
+    "SELECT enabled FROM strip_override WHERE owner=? AND session_id=?",
+    (lp.store.OWNER, "sess-persist")).fetchone()
+check("strip override: endpoint setter write-throughs to SQLite",
+      _persist_row is not None and _persist_row[0] == 1)
+lp.transforms._STRIP_OVERRIDE.clear()                       # simulate a restart
+_n_reload = lp.restore._restore_strip_overrides()
+check("strip override: survives a restart (reload restores the dict)",
+      lp.transforms._STRIP_OVERRIDE.get("sess-persist") is True)
+# clearing the override deletes the persisted row (no stale resurrection)
+lp.transforms._strip_thinking_set_override("sess-persist", None)
+check("strip override: clearing deletes the persisted row",
+      lp.store.db().execute(
+          "SELECT 1 FROM strip_override WHERE owner=? AND session_id=?",
+          (lp.store.OWNER, "sess-persist")).fetchone() is None)
+# _ws_forget also drops the persisted row (sweep hygiene)
+lp.transforms._strip_thinking_set_override("sess-forget2", True)
+lp.transforms._ws_forget("sess-forget2")
+check("strip override: _ws_forget deletes the persisted row too",
+      lp.store.db().execute(
+          "SELECT 1 FROM strip_override WHERE owner=? AND session_id=?",
+          (lp.store.OWNER, "sess-forget2")).fetchone() is None)
 lp.transforms._STRIP_OVERRIDE.clear()
 lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO = _spt_save
 

@@ -20,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from proxylab import store as store_mod
 from proxylab import warmth as warmth_mod
 from proxylab import writer as writer_mod
 
@@ -687,7 +688,8 @@ def _ws_forget(session_id):
     (called by the pinger sweep alongside the other per-session instance state).
     No-op if absent."""
     _WS_SPAWN_MEMORY.pop(session_id, None)
-    _STRIP_OVERRIDE.pop(session_id, None)
+    if _STRIP_OVERRIDE.pop(session_id, None) is not None:
+        _delete_strip_override(session_id)
 
 
 def _ws_merged_pairs(obj, agent_id=None):
@@ -1200,6 +1202,48 @@ except ValueError:
 # the endpoint re-asserts after a restart). session_id -> bool.
 _STRIP_OVERRIDE = {}
 
+# PERSISTENCE (restart-amnesia / anti-flap): the per-session strip decision is
+# mirrored to SQLite so a proxy restart RELOADS it BEFORE the first post-restart
+# turn — otherwise the in-memory override is dropped, strip silently flips OFF,
+# and the next request mismatches the still-warm stripped prefix -> a full-window
+# premium re-write (measured: the single biggest cost driver — 95k–261k tok per
+# involuntary flip). The cache only stays cheap if our control state is as durable
+# as the cache it must agree with. Pure intent, nothing secret (same rationale as
+# hold_state). Owner-scoped; reload lives in restore._restore_strip_overrides.
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS strip_override ("
+    "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+    "enabled INTEGER NOT NULL, set_at REAL NOT NULL, "
+    "PRIMARY KEY (owner, session_id))")
+
+
+def _persist_strip_override(session_id, enabled):
+    """Mirror a strip override to SQLite so a restart can't drop it (which would
+    flip strip state against a warm cache and force a full re-write). A store
+    failure degrades to the old in-memory-only behavior."""
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            con.execute(
+                "INSERT INTO strip_override(owner, session_id, enabled, set_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(owner, session_id) DO UPDATE SET "
+                "enabled=excluded.enabled, set_at=excluded.set_at",
+                (store_mod.OWNER, session_id, 1 if enabled else 0, time.time()))
+            con.commit()
+    except Exception as e:
+        print(f"[strip] persist failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _delete_strip_override(session_id):
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            con.execute("DELETE FROM strip_override WHERE owner=? AND session_id=?",
+                        (store_mod.OWNER, session_id))
+            con.commit()
+    except Exception as e:
+        print(f"[strip] row delete failed for {session_id[:12]}…: {e}", flush=True)
+
 
 def _ws_resolve_strip_thinking(pairs):
     """Last `strip-thinking <on|off>` directive in the merged pair stream wins ->
@@ -1224,8 +1268,10 @@ def _strip_thinking_set_override(session_id, on):
         return None
     if on is None:
         _STRIP_OVERRIDE.pop(session_id, None)
+        _delete_strip_override(session_id)
         return None
     _STRIP_OVERRIDE[session_id] = bool(on)
+    _persist_strip_override(session_id, bool(on))
     return _STRIP_OVERRIDE[session_id]
 
 
@@ -1239,8 +1285,10 @@ def _strip_thinking_enabled(obj, agent_id=None):
     if isinstance(obj, dict):
         pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
         directive = _ws_resolve_strip_thinking(pairs)
-        if sid and directive is not None:
-            _STRIP_OVERRIDE[sid] = directive
+        # Persist a directive-driven opt-in too, but only on CHANGE (this runs
+        # every request) so we don't hammer the store with no-op writes.
+        if sid and directive is not None and _STRIP_OVERRIDE.get(sid) is not directive:
+            _strip_thinking_set_override(sid, directive)
     if sid is not None and sid in _STRIP_OVERRIDE:
         return _STRIP_OVERRIDE[sid]
     return STRIP_PRIOR_THINKING
