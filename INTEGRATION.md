@@ -33,7 +33,7 @@ Before you integrate, probe the proxy ROOT and check the product marker:
       "capabilities": { "passthrough": false, "subscribers": true,
                         "warmth": true, "ping": true,
                         "hold": true, "stats": true, "session_view": true,
-                        "codex": true,
+                        "codex": true, "codex_websocket": true,
                         "wirescope": { "agent_name": true, "omit": true,
                                        "replace": true, "keep": true,
                                        "spawn": true, "strip_tools": true,
@@ -56,6 +56,12 @@ Launch each session through:
 
     ANTHROPIC_BASE_URL=http://127.0.0.1:7800/agent/<name>/anthropic   # claude
     # codex: model-provider base_url http://127.0.0.1:7800/agent/<name>/openai
+
+Codex traffic supports both the HTTP/SSE `/responses` path and Codex's
+WebSocket-first `/responses` transport when `capabilities.codex_websocket` is
+true. The WebSocket path is a raw tunnel with lightweight frame capture and
+receipt finalization on `response.completed`; set `CODEX_WEBSOCKET=0` only as
+an emergency fallback for older Codex clients that still retry HTTP/SSE.
 
 Pick a prefix per app (`wb-alice`, `clodex-bob`).
 Plain traffic with no `/agent/` prefix is observed but **never** pushed to subscribers and is not your addressable namespace.

@@ -46,9 +46,10 @@ from proxylab import billing as billing_mod
 #   * stub GET /v1/models (the backend has no platform model-list endpoint)
 #   * treat POST /responses as SSE no matter the content-type (success
 #     responses can arrive with NO content-type header at all)
-# Codex 0.139+ tries a WebSocket to /responses first; we don't speak WS, codex
-# retries ~5x (~3-8s) then falls back to HTTP POST — long-standing codex bug,
-# nothing to fix proxy-side (a WS passthrough is the eventual cure).
+# Codex 0.139+ tries a WebSocket to /responses first; 0.141+ appears to require
+# that path and no longer reliably falls back to HTTP POST. Keep an emergency
+# CODEX_WEBSOCKET=0 kill switch, but default to the WS route when the dependency
+# is present.
 _ROUTE_OPENAI = re.compile(r"^/agent/(?P<name>[A-Za-z0-9_.-]+)/openai(?P<rest>/.*)?$")
 UPSTREAM_OPENAI = os.environ.get("UPSTREAM_OPENAI",
                                  "https://chatgpt.com/backend-api/codex")
@@ -61,11 +62,23 @@ CODEX_MODELS_STUB = [m for m in os.environ.get(
 _CODEX_STATS = {"requests": 0, "responses": 0, "input_tokens": 0,
                 "cached_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0,
                 "errors": 0}
+CODEX_WEBSOCKET = os.environ.get("CODEX_WEBSOCKET", "1").lower() not in (
+    "0", "no", "off", "false")
 
 try:                                    # stdlib since 3.14
     from compression import zstd as _zstd
 except Exception:                       # pragma: no cover — py<3.14
     _zstd = None
+
+
+def _websocket_available():
+    if not CODEX_WEBSOCKET:
+        return False
+    try:
+        import websockets  # noqa: F401
+        return True
+    except Exception:
+        return False
 
 
 def _content_decode(raw, encoding):

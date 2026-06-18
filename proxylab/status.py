@@ -80,7 +80,8 @@ def _identity():
             "context_skills": True,       # /_context per-skill roster + utilization
             "context_report": True,       # /_report?session= cost/efficiency report
             "context_timeline": True,     # /_report?...&detail=1 series + /_timeline HTML
-            "codex": True,                # /agent/<name>/openai routing
+            "codex": True,                # /agent/<name>/openai HTTP routing
+            "codex_websocket": codex_mod._websocket_available(),
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
             # whether spawn-position (messages[0] head) directives are read at

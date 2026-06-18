@@ -1802,6 +1802,37 @@ check("codex stats surfaced in /_status",
       lp._status_snapshot()["proxy"].get("codex", {}).get("requests") == 0
       and "upstream_openai" in lp._status_snapshot()["proxy"])
 
+check("openai websocket URL helper converts HTTP(S) upstreams",
+      lp.server._upstream_websocket_url("https://chatgpt.com/backend-api/codex",
+                                        "/responses")
+      == "wss://chatgpt.com/backend-api/codex/responses"
+      and lp.server._upstream_websocket_url("http://127.0.0.1:9000/base",
+                                            "/v1/responses")
+      == "ws://127.0.0.1:9000/base/v1/responses")
+_ws_hdrs = lp.server._websocket_forward_headers({
+    "host": "127.0.0.1:7800", "connection": "Upgrade",
+    "upgrade": "websocket", "sec-websocket-key": "secret",
+    "authorization": "Bearer x", "session-id": "s1",
+    "user-agent": "codex-test"})
+check("websocket forward headers strip handshake headers, keep auth/session",
+      "host" not in _ws_hdrs and "sec-websocket-key" not in _ws_hdrs
+      and _ws_hdrs["authorization"] == "Bearer x"
+      and _ws_hdrs["session-id"] == "s1"
+      and _ws_hdrs["user-agent"] == "codex-test")
+check("websocket close helper never forwards reserved diagnostic codes",
+      lp.server._websocket_sendable_close_code(1000, fallback=1001) == 1000
+      and lp.server._websocket_sendable_close_code(1014, fallback=1011) == 1014
+      and lp.server._websocket_sendable_close_code(4000, fallback=1001) == 4000
+      and lp.server._websocket_sendable_close_code(1005, fallback=1001) == 1001
+      and lp.server._websocket_sendable_close_code(1006, fallback=1001) == 1001
+      and lp.server._websocket_sendable_close_code(1015, fallback=1011) == 1011)
+check("websocket close reason is capped at the wire limit",
+      len(lp.server._websocket_close_reason("å" * 80).encode("utf-8")) <= 123)
+check("codex websocket support is on by default for 0.141+ clients",
+      lp.codex_mod.CODEX_WEBSOCKET is True
+      and any(r.__class__.__name__ == "WebSocketRoute" for r in lp.app.routes)
+      and lp.status._identity()["capabilities"]["codex_websocket"] is True)
+
 # --- codex /_session view: entry cached for the VIEW, never for replay --------
 _cbody = {"model": "gpt-5.4", "instructions": "# Personality\nYou are codex.",
           "prompt_cache_key": "pck-1",

@@ -37,13 +37,13 @@ elif [ -x ".venv/bin/python" ]; then
 else
   PY="python3"
 fi
-if ! "$PY" -c 'import uvicorn' >/dev/null 2>&1; then
+if ! "$PY" -c 'import uvicorn, websockets' >/dev/null 2>&1; then
   if [ -x ./setup.sh ]; then
     echo "dependencies missing — bootstrapping a local venv via ./setup.sh ..."
     ./setup.sh
     PY=".venv/bin/python"
   else
-    echo "ERROR: uvicorn isn't available to '$PY'. Run ./setup.sh (recommended) or" >&2
+    echo "ERROR: uvicorn/websockets aren't available to '$PY'. Run ./setup.sh (recommended) or" >&2
     echo "  pip install -r requirements.txt into your environment." >&2
     exit 1
   fi

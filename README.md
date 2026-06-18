@@ -109,7 +109,7 @@ If you're building a tool that wants the proxy's data (cost, warmth, refusals, a
 - **[`WIRESCOPE.md`](./WIRESCOPE.md)** — the directive grammar: omit / replace / keep / tools / agent-name, placement, precedence, and cache semantics.
 - **[`SUBSCRIBERS.md`](./SUBSCRIBERS.md)** — the push-feed deep-dive: register an endpoint and receive `text.delta` / `turn.completed` / `session.ended` events.
 
-Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`) with `GET /_identity` → `{ "product": "wirescope", ... }`. Capabilities (including the live `wirescope` directive set) are advertised there for feature-detection.
+Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`) with `GET /_identity` → `{ "product": "wirescope", ... }`. Capabilities (including the live `wirescope` directive set and Codex WebSocket support) are advertised there for feature-detection.
 
 ### Endpoint surface (all localhost, read-only unless noted)
 
