@@ -397,6 +397,42 @@ async def handler(request: Request) -> Response:
               f"retained={res['retained']} (sweeper reaps later)", flush=True)
         return Response(json.dumps(res), media_type="application/json")
 
+    # ---- per-session strip-prior-thinking toggle (consumer opt-in) ------------
+    # GET  /_strip?session=<id>            -> current effective override (read-only)
+    # POST /_strip?session=<id>&on=1       -> turn prior-thinking stripping ON
+    # POST /_strip?session=<id>&on=0       -> turn it OFF (force, even if global on)
+    # POST /_strip?session=<id>&action=clear -> drop the override (fall back global)
+    # The programmatic twin of the `[wirescope:strip-thinking on]` directive, so a
+    # consumer (clodex) can flip an agent from its UI without a forwarded turn.
+    # Body convention: HTTP status = request validity, outcome in the JSON.
+    if request.url.path.rstrip("/") == "/_strip":
+        q = request.query_params
+        sess = q.get("session")
+        if not sess:
+            return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
+                            status_code=400, media_type="application/json")
+        if request.method == "GET":
+            cur = transforms_mod._STRIP_OVERRIDE.get(sess)
+            return Response(json.dumps(
+                {"ok": True, "session": sess, "override": cur,
+                 "global_default": transforms_mod.STRIP_PRIOR_THINKING,
+                 "effective": cur if cur is not None else transforms_mod.STRIP_PRIOR_THINKING}),
+                media_type="application/json")
+        action = (q.get("action") or "").lower()
+        on_raw = q.get("on")
+        if action == "clear" or on_raw in ("clear", "none"):
+            new = transforms_mod._strip_thinking_set_override(sess, None)
+        else:
+            on = (on_raw in ("1", "yes", "on", "true")) if on_raw is not None else True
+            new = transforms_mod._strip_thinking_set_override(sess, on)
+        print(f"[strip] session={sess[:12]}… override={new} "
+              f"(global={transforms_mod.STRIP_PRIOR_THINKING})", flush=True)
+        return Response(json.dumps(
+            {"ok": True, "session": sess, "override": new,
+             "global_default": transforms_mod.STRIP_PRIOR_THINKING,
+             "effective": new if new is not None else transforms_mod.STRIP_PRIOR_THINKING}),
+            media_type="application/json")
+
     # ---- subscriber registry: app-agnostic push feed (see SUBSCRIBERS.md) -----
     # GET/POST/DELETE /_subscribe — consumers register an endpoint + agent globs
     # and receive text.delta / turn.completed / session.ended for their sessions.
@@ -555,7 +591,7 @@ async def handler(request: Request) -> Response:
             # completed prior turns; current turn untouched. Busts message cache
             # from the strip point (recouped by cheaper reads). Monster guard may
             # decline (stripped:False) -> recorded for observability, no mutation.
-            spt = transforms_mod._strip_prior_thinking(obj)
+            spt = transforms_mod._strip_prior_thinking(obj, agent_id=agent_id)
             if spt:
                 record["strip_prior_thinking"] = spt
                 if spt.get("removed_thinking_blocks"):

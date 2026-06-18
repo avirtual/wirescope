@@ -683,9 +683,11 @@ _WS_SPAWN_MEMORY = {}
 
 
 def _ws_forget(session_id):
-    """Drop the sticky spawn memory for a session (called by the pinger sweep
-    alongside the other per-session instance state). No-op if absent."""
+    """Drop the sticky spawn memory + strip-thinking override for a session
+    (called by the pinger sweep alongside the other per-session instance state).
+    No-op if absent."""
     _WS_SPAWN_MEMORY.pop(session_id, None)
+    _STRIP_OVERRIDE.pop(session_id, None)
 
 
 def _ws_merged_pairs(obj, agent_id=None):
@@ -1186,6 +1188,63 @@ try:
 except ValueError:
     STRIP_THINK_MAX_BODY_RATIO = 4.0
 
+# PER-SESSION OVERRIDE of the global STRIP_PRIOR_THINKING flag, so a CONSUMER app
+# (clodex) can opt INDIVIDUAL agents in (or out) while the proxy ships the flag
+# globally OFF — the "marketing trick": stock proxy is conservative, the app
+# turns the optimization on per session. Set via the `[wirescope:strip-thinking
+# on|off]` directive (rides the same per-agent body/spawn channel as omit/tools)
+# OR the POST /_strip endpoint. STICKY per session_id: once a directive is seen
+# we remember it so it persists across the session's later (directive-less) turns.
+# transforms OWNS + mutates this; the pinger sweep drops it via _ws_forget. In
+# memory only (a directive-driven override self-heals on the next directive turn;
+# the endpoint re-asserts after a restart). session_id -> bool.
+_STRIP_OVERRIDE = {}
+
+
+def _ws_resolve_strip_thinking(pairs):
+    """Last `strip-thinking <on|off>` directive in the merged pair stream wins ->
+    True / False, or None if none present (bare directive = on). Vocabulary lives
+    here next to the section/tool resolvers."""
+    val = None
+    for name, value in pairs:
+        if name == "strip-thinking":
+            v = (value or "").strip().lower()
+            if v in ("", "on", "1", "true", "yes"):
+                val = True
+            elif v in ("off", "0", "false", "no"):
+                val = False
+    return val
+
+
+def _strip_thinking_set_override(session_id, on):
+    """Endpoint/programmatic setter for the per-session override (on=True/False,
+    or None to clear -> fall back to the global flag). Returns the effective
+    stored value (None when cleared)."""
+    if not session_id:
+        return None
+    if on is None:
+        _STRIP_OVERRIDE.pop(session_id, None)
+        return None
+    _STRIP_OVERRIDE[session_id] = bool(on)
+    return _STRIP_OVERRIDE[session_id]
+
+
+def _strip_thinking_enabled(obj, agent_id=None):
+    """Resolve whether prior-thinking stripping is ON for THIS request: a
+    `[wirescope:strip-thinking ...]` directive (body+spawn, sticky per session) or
+    a /_strip endpoint override takes precedence; otherwise the global flag. A
+    seen directive updates the sticky store. Reads body+spawn pairs directly (not
+    the sticky-spawn machinery) so it never perturbs _WS_SPAWN_MEMORY."""
+    sid = (writer_mod._session_ids(obj) or [None])[0] if isinstance(obj, dict) else None
+    if isinstance(obj, dict):
+        pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
+        directive = _ws_resolve_strip_thinking(pairs)
+        if sid and directive is not None:
+            _STRIP_OVERRIDE[sid] = directive
+    if sid is not None and sid in _STRIP_OVERRIDE:
+        return _STRIP_OVERRIDE[sid]
+    return STRIP_PRIOR_THINKING
+
 
 def _is_real_user_turn(m):
     """A genuine user-turn boundary: role=user carrying actual text (NOT a
@@ -1241,12 +1300,13 @@ def _msg_nonthinking_chars(m):
     return t
 
 
-def _strip_prior_thinking(obj):
+def _strip_prior_thinking(obj, agent_id=None):
     """Drop thinking blocks from assistant messages in COMPLETED prior turns
     (strictly before the last real user-turn boundary), unless the monster guard
-    declines. Returns a log dict (`stripped` True/False) or None (disabled / no
-    prior history / no prior thinking)."""
-    if not STRIP_PRIOR_THINKING or not isinstance(obj, dict):
+    declines. Gated by the PER-SESSION decision (directive/endpoint override else
+    the global flag — see _strip_thinking_enabled). Returns a log dict (`stripped`
+    True/False) or None (disabled / no prior history / no prior thinking)."""
+    if not isinstance(obj, dict) or not _strip_thinking_enabled(obj, agent_id):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:

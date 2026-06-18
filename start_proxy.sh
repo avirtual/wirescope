@@ -70,11 +70,10 @@ fi
 export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
 export WARMTH_BLOCK_COLD_PING="${WARMTH_BLOCK_COLD_PING-1}"
 export WARMTH_LOG_FILE="${WARMTH_LOG_FILE-1}"
-# Strip PRIOR-turn thinking from forwarded requests (current turn untouched);
-# monster-guarded by STRIP_THINK_MAX_BODY_RATIO (code default 4.0). Reclaims the
-# re-read carriage of completed-turn reasoning. Code default OFF; canonical proxy
-# on. Override with STRIP_PRIOR_THINKING=0 (or raise/lower the ratio gate).
-export STRIP_PRIOR_THINKING="${STRIP_PRIOR_THINKING-1}"
+# NOTE: STRIP_PRIOR_THINKING ships globally OFF (code + script). It's a
+# CONSUMER-opt-in optimization: an app (clodex) turns it on PER SESSION via the
+# `[wirescope:strip-thinking on]` directive or POST /_strip — stock proxy stays
+# conservative. Set STRIP_PRIOR_THINKING=1 here only to force it on globally.
 # Wirescope discoverability defaults: a fresh clone gets the spawner grammar hint
 # and the userEmail omit floor on, no release.env needed (code default stays OFF
 # so library embeddings/tests are unaffected — this is the canonical-proxy stance,

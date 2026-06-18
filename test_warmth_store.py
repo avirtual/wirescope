@@ -2646,6 +2646,57 @@ check("composition: no panel when there is no prior thinking",
 lp.transforms.STRIP_PRIOR_THINKING = False
 check("strip_prior_thinking: disabled flag -> None",
       lp.transforms._strip_prior_thinking({"messages": _spt_msgs()}) is None)
+
+# --- PER-SESSION override: directive + endpoint (consumer opt-in) -------------
+# Global OFF; a [wirescope:strip-thinking on] directive opts THIS session in.
+lp.transforms.STRIP_PRIOR_THINKING = False
+lp.transforms._STRIP_OVERRIDE.clear()
+def _spt_dir_obj(directive=None, sid="sess-strip-dir"):
+    sys_txt = "AGENT PROMPT"
+    if directive is not None:
+        sys_txt += f"\n[wirescope:strip-thinking {directive}]"
+    return {"model": "claude-opus-4-8",
+            "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "system": [{"type": "text", "text": sys_txt}],
+            "messages": _spt_msgs()}
+check("strip override: directive 'on' strips even with global OFF",
+      (lambda r: r and r.get("stripped") is True)(
+          lp.transforms._strip_prior_thinking(_spt_dir_obj("on"))))
+# stickiness: a later directive-LESS turn of the same session still strips
+check("strip override: sticky — directive-less follow-up turn still strips",
+      (lambda r: r and r.get("stripped") is True)(
+          lp.transforms._strip_prior_thinking(_spt_dir_obj(None))))
+# explicit 'off' directive forces OFF even if global were ON
+lp.transforms.STRIP_PRIOR_THINKING = True
+check("strip override: directive 'off' declines even with global ON",
+      lp.transforms._strip_prior_thinking(_spt_dir_obj("off", sid="sess-strip-off")) is None)
+lp.transforms.STRIP_PRIOR_THINKING = False
+# endpoint setter: on / clear
+lp.transforms._strip_thinking_set_override("sess-ep", True)
+check("strip override: endpoint setter on -> strips with global OFF",
+      (lambda r: r and r.get("stripped") is True)(
+          lp.transforms._strip_prior_thinking(
+              {"model": "claude-opus-4-8", "metadata": {"user_id": json.dumps({"session_id": "sess-ep"})},
+               "messages": _spt_msgs()})))
+check("strip override: clearing the override falls back to global (OFF -> None)",
+      lp.transforms._strip_thinking_set_override("sess-ep", None) is None
+      and lp.transforms._strip_prior_thinking(
+          {"model": "claude-opus-4-8", "metadata": {"user_id": json.dumps({"session_id": "sess-ep"})},
+           "messages": _spt_msgs()}) is None)
+# _ws_forget drops the override
+lp.transforms._strip_thinking_set_override("sess-forget", True)
+lp.transforms._ws_forget("sess-forget")
+check("strip override: _ws_forget drops the per-session override",
+      "sess-forget" not in lp.transforms._STRIP_OVERRIDE)
+# resolver vocabulary
+check("strip override: resolver maps on/off/bare/last-wins",
+      lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "on")]) is True
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "off")]) is False
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "")]) is True
+      and lp.transforms._ws_resolve_strip_thinking([("omit", "x")]) is None
+      and lp.transforms._ws_resolve_strip_thinking(
+          [("strip-thinking", "on"), ("strip-thinking", "off")]) is False)
+lp.transforms._STRIP_OVERRIDE.clear()
 lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO = _spt_save
 
 print()
