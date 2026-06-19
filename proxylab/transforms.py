@@ -1428,6 +1428,19 @@ def _strip_thinking_guard_decision(obj, sid, ratio, earliest):
     if sid is not None and sid in _STRIP_GUARD_LATCH:
         latched = _STRIP_GUARD_LATCH[sid]
         return latched, ("latched_strip" if latched else "latched_no_strip")
+    # EXPLICIT PER-SESSION OVERRIDE = deliberate intent -> establish the latch NOW,
+    # even on a warm prefix. An override is a sticky human/consumer choice; it does
+    # NOT flap turn-to-turn like the automatic global ratio decision the cold-gate
+    # guards, so honoring it immediately is safe and is exactly what the consumer
+    # asked for. This is also the ONLY path that catches a session ALREADY at a
+    # strip level before a latch existed (a deploy/restart reload, or a consumer
+    # that asserts the level idempotently) — there's no "change" event to ride, so
+    # without this it would decline warm_no_latch forever (the bug bogdan hit on a
+    # warm L2 session post-v0.6.1). If we reach here the effective level is >=1, and
+    # since an override is present that override is >=1 -> strip.
+    if sid is not None and sid in _STRIP_OVERRIDE:
+        _strip_guard_set_latch(sid, True)
+        return True, "override_latch_strip"
     warm = _incoming_thinking_prefix_warm(obj, earliest)
     if warm is None:            # ledger can't judge -> conservative: don't strip, don't latch
         return False, "warmth_unknown"

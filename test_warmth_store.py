@@ -2885,7 +2885,20 @@ check("strip flip: explicit disable latches no-strip",
 lp.transforms._strip_thinking_set_override("sess-flip", None)  # clear -> drop latch
 check("strip flip: clear drops the guard latch (cold-gate re-decides fresh)",
       "sess-flip" not in lp.transforms._STRIP_GUARD_LATCH)
+# ALREADY-SET override (no change event, warm prefix) still latches: the guard
+# treats a present override as deliberate intent and establishes strip on sight,
+# so a session set to L2 before the latch existed (deploy/restart reload, or an
+# idempotently-asserted level) strips instead of declining warm_no_latch forever.
 lp.transforms._STRIP_OVERRIDE.clear()
+lp.transforms._STRIP_GUARD_LATCH.clear()
+lp.transforms._STRIP_OVERRIDE["sess-ov"] = 2          # present, but NO latch, NO change
+_ovdec, _ovreason = lp.transforms._strip_thinking_guard_decision(
+    {"messages": [{"role": "user", "content": "x"}]}, "sess-ov", 1.0, 0)
+check("guard: present override establishes latch=strip on sight (covers already-set warm)",
+      _ovdec is True and _ovreason == "override_latch_strip"
+      and lp.transforms._STRIP_GUARD_LATCH.get("sess-ov") is True)
+lp.transforms._STRIP_OVERRIDE.clear()
+lp.transforms._STRIP_GUARD_LATCH.clear()
 # --- L2 strip level: L2 = L1 + the shady bust-riders -------------------------
 # level 2 sets thinking ON (L1) AND opens the L2 gate; persists + reloads as 2.
 lp.transforms._strip_thinking_set_override("sess-l2", 2)
