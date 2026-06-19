@@ -330,44 +330,55 @@ async def websocket_handler(websocket: WebSocket):
         return
 
     await websocket.accept(subprotocol=getattr(up, "subprotocol", None))
-    model_seen = {"value": None}
-    upstream_text_frames = []
-    receipt_done = {"value": False}
     client_gone = {"value": False}
+    # PER-TURN capture state. Codex 0.141 multiplexes the WHOLE conversation over
+    # ONE long-lived WS connection (a response.create / response.completed pair per
+    # turn), so capture MUST be per-RESPONSE, not once-per-connection — the original
+    # latched on the first turn (model_seen / receipt_done set once) and silently
+    # dropped every turn after it, leaving an active session looking uncaptured.
+    # Each response.create opens a fresh turn (own seq+stem, own frame buffer); each
+    # terminal event finalizes THAT turn and resets for the next. The connection
+    # stem/n stay reserved for the handshake .request.json + transport.json.
+    turn = {"n": None, "stem": None, "model": None, "frames": [], "open": False,
+            "count": 0}
 
     def maybe_record_request_obj(data):
-        if model_seen["value"] is not None:
-            return
         try:
             obj = json.loads(data)
         except Exception:
             return
         if not isinstance(obj, dict) or obj.get("type") != "response.create":
             return
-        model_seen["value"] = obj.get("model")
+        turn["n"] = next(core_mod._counter)
+        turn["stem"] = f"{turn['n']:03d}-{agent}-codex-ws-{time.strftime('%H%M%S')}"
+        turn["model"] = obj.get("model")
+        turn["frames"] = []
+        turn["open"] = True
+        turn["count"] += 1
         _record_openai_context(obj, session_id=session_id, base_path=base_path,
                                upstream_path=upstream_path, agent=agent,
-                               model=model_seen["value"])
-        writer_mod._enqueue_json(out_dir / f"{stem}.request.body.json", obj)
+                               model=turn["model"])
+        writer_mod._enqueue_json(out_dir / f"{turn['stem']}.request.body.json", obj)
 
     def maybe_finalize_ws_receipt(data):
-        if receipt_done["value"]:
+        if not turn["open"]:
             return
         try:
             obj = json.loads(data)
         except Exception:
             return
-        if obj.get("type") not in ("response.completed", "response.incomplete",
-                                   "response.failed", "error"):
+        if not isinstance(obj, dict) or obj.get("type") not in (
+                "response.completed", "response.incomplete",
+                "response.failed", "error"):
             return
-        receipt_done["value"] = True
-        blob = "".join(f"data: {frame}\n\n" for frame in upstream_text_frames)
+        blob = "".join(f"data: {frame}\n\n" for frame in turn["frames"])
         raw = blob.encode("utf-8")
-        writer_mod._enqueue_bytes(out_dir / f"{stem}.response.sse", raw)
+        writer_mod._enqueue_bytes(out_dir / f"{turn['stem']}.response.sse", raw)
         receipts_mod.openai(
-            raw, n=n, ts=ts, agent=agent, model=model_seen["value"],
+            raw, n=turn["n"], ts=ts, agent=agent, model=turn["model"],
             session_id=session_id, session_key=session_key,
-            out_dir=out_dir, stem=stem, status_code=200, resp_headers={})
+            out_dir=out_dir, stem=turn["stem"], status_code=200, resp_headers={})
+        turn["open"] = False
 
     async def client_to_upstream():
         try:
@@ -408,7 +419,8 @@ async def websocket_handler(websocket: WebSocket):
         try:
             async for data in up:
                 if isinstance(data, str):
-                    upstream_text_frames.append(data)
+                    if turn["open"]:
+                        turn["frames"].append(data)
                     frames.append({"dir": "upstream", "type": "text",
                                    "bytes": len(data.encode("utf-8")),
                                    "preview": data[:1000]})
@@ -457,7 +469,8 @@ async def websocket_handler(websocket: WebSocket):
                       "transport": "websocket", "endpoint": base_path,
                       "upstream_url": upstream_url, "status": "closed",
                       "close": close_status, "n_frames": len(frames),
-                      "receipt_done": receipt_done["value"]})
+                      "turns_captured": turn["count"],
+                      "turn_open_at_close": turn["open"]})
         if frames:
             writer_mod._enqueue_json(out_dir / f"{stem}.frames.json",
                          {"seq": n, "agent": agent, "provider": "openai",
