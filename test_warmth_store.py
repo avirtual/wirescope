@@ -730,6 +730,16 @@ check("directives parse only from system body, never message content (no forging
       == "realname")
 check("[wirescope:agent-name] retired the legacy [agent: NAME] form (no longer parsed)",
       lp._subagent_marker_name({"system": [{"type": "text", "text": "[agent: legacy]"}]}) is None)
+# An unsubstituted template PLACEHOLDER (<label>/<name>) is dropped, not shown:
+# spawners that copy `[wirescope:agent-name <label>]` verbatim must fall back to
+# role/id naming, never display the literal "<label>" in admin.
+check("[wirescope:agent-name] rejects unsubstituted <placeholder>, keeps real names",
+      lp._subagent_marker_name({"system": [{"type": "text",
+          "text": "[wirescope:agent-name <label>]"}]}) is None
+      and lp._subagent_marker_name({"system": [{"type": "text",
+          "text": "[wirescope:agent-name <name>]"}]}) is None
+      and lp._subagent_marker_name({"system": [{"type": "text",
+          "text": "[wirescope:agent-name John]"}]}) == "John")
 nsid = "5fb9eba7-eeee-ffff-0000-111111111111"
 lp._capture_session_meta(nsid,
     {"system": [{"type": "text", "text": _cbh + "[wirescope:agent-name probe-delta]\nYou are probe-delta"}],

@@ -382,9 +382,20 @@ def _ws_spawn_directives(obj):
 def _subagent_marker_name(obj):
     """The author-declared display label from `[wirescope:agent-name <label>]`,
     or None. A spawn-position directive overrides a body one (precedence spawn >
-    body). Display-grade only (no gate reads it); len-capped at 64."""
+    body). Display-grade only (no gate reads it); len-capped at 64.
+
+    Rejects an unsubstituted template PLACEHOLDER — a value wrapped in angle
+    brackets like `<label>`/`<name>` — which a spawner emits when it copies the
+    directive template verbatim without filling in a real name. Such a value is
+    never a real label, so we drop it and fall back to the normal role/id
+    naming rather than displaying the literal `<label>` in the admin view."""
     name = (_ws_spawn_directives(obj).get("agent-name")
             or _ws_directives(obj).get("agent-name"))
+    if not name:
+        return None
+    name = name.strip()
+    if name.startswith("<") and name.endswith(">"):   # unsubstituted placeholder
+        return None
     return name[:64] if name else None
 
 
