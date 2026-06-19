@@ -85,9 +85,17 @@ def _identity():
             # `effective` is when no per-session override is set). When the proxy
             # ships globally off (the consumer-opt-in stance), default is false but
             # the capability is True (the lever exists) — gate on this, not version.
+            # L2 is NOT a separate capability: it's level 2 of THIS mechanism.
+            # L1 = prior-turn thinking only; L2 = L1 PLUS the bust-riding
+            # tool-result strips (edit-ack collapse + failed-call stubbing), which
+            # only fire on L1's cache bust (so L2 strictly contains L1). Gate L2 on
+            # `max_level >= 2`, NOT a `strip_stale_tool_results` key (there is none).
+            # Set per session via /_strip?level=2 or [wirescope:strip-thinking l2].
             "strip_thinking": {"available": True,
                                "default": transforms_mod.STRIP_PRIOR_THINKING,
-                               "max_body_ratio": transforms_mod.STRIP_THINK_MAX_BODY_RATIO},
+                               "max_body_ratio": transforms_mod.STRIP_THINK_MAX_BODY_RATIO,
+                               "levels": [0, 1, 2], "max_level": 2,
+                               "default_level": transforms_mod._global_strip_level()},
             "codex": True,                # /agent/<name>/openai routing
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
