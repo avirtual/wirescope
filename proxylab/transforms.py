@@ -1203,22 +1203,6 @@ except ValueError:
 #   per-session it's set by `[wirescope:strip-thinking l2]` / `/_strip?level=2`.
 STRIP_L2 = os.environ.get("STRIP_L2", "0") not in ("0", "no", "off", "false")
 
-# EXPERIMENTAL (scratch-port A/B): merciless class-strip of prior-turn Read
-# results — replace each Read tool_result body in COMPLETED prior turns with the
-# CLI's own cleared-marker, keeping the envelope + tool_use_id (byte-stable,
-# model already interprets the marker). Class+position only (every prior Read),
-# never relational — so the stripped prefix is byte-stable as the boundary
-# advances, exactly like _strip_prior_thinking. NOTE: the CLI does NOT natively
-# dedup Reads, so this is an open target; but if a session uses the cache_edits
-# / clear_tool_uses betas (out-of-band tool_use_id references), rewriting result
-# content in-band would break those — keep this OFF on :7800, scratch-port only.
-STRIP_PRIOR_READS = os.environ.get("STRIP_PRIOR_READS", "0") not in ("0", "no", "off", "false")
-# The literal the CLI uses for time-based microcompact (so the model reads an
-# identical, familiar marker). Source: microCompact.ts TIME_BASED_MC_CLEARED_MESSAGE.
-READ_CLEARED_MARKER = "[Old tool result content cleared]"
-# Tool names whose results we treat as "Read" across wire dialects.
-_READ_TOOL_NAMES = frozenset({"Read", "FileRead", "FileReadTool"})
-
 # COLLAPSE PRIOR-TURN EDIT/WRITE SUCCESS ACKS. An Edit/Write tool_result on
 # success is fixed boilerplate (~155 ch) carrying ONE bit, "it succeeded", plus a
 # "(file state is current… no need to Read it back)" nudge. That nudge is LIVE in
@@ -1664,73 +1648,6 @@ def _strip_prior_thinking(obj, agent_id=None):
             "guard_latch": _STRIP_GUARD_LATCH.get(sid), "guard_reason": decision_reason,
             "earliest_idx": earliest,     # edit-ack strip rides this bust point
             "boundary_idx": last_user, "total_messages": len(msgs)}
-
-def _read_result_ids(msgs):
-    """tool_use_ids whose assistant tool_use was a Read (any wire dialect) —
-    so we can identify which user-side tool_result blocks are Read results."""
-    ids = set()
-    for m in msgs:
-        if m.get("role") != "assistant":
-            continue
-        c = m.get("content")
-        if not isinstance(c, list):
-            continue
-        for b in c:
-            if (isinstance(b, dict) and b.get("type") == "tool_use"
-                    and b.get("name") in _READ_TOOL_NAMES):
-                ids.add(b.get("id"))
-    return ids
-
-
-def _strip_prior_reads(obj, agent_id=None):
-    """EXPERIMENTAL merciless class-strip: replace every Read tool_result body in
-    COMPLETED prior turns (strictly before the last real user boundary) with the
-    CLI's cleared-marker. Envelope + tool_use_id preserved (cache-byte-stable,
-    model interprets the marker natively). Class+position only — never relational
-    — so the stripped prefix stays byte-stable as the boundary advances. Gated by
-    the global STRIP_PRIOR_READS flag (scratch-port A/B; OFF on :7800). Returns a
-    log dict or None (disabled / no prior history / nothing to strip)."""
-    if not isinstance(obj, dict) or not STRIP_PRIOR_READS:
-        return None
-    msgs = obj.get("messages")
-    if not isinstance(msgs, list) or not msgs:
-        return None
-    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
-    if last_user <= 0:
-        return None
-    read_ids = _read_result_ids(msgs)
-    if not read_ids:
-        return None
-    cleared = stripped_chars = touched_msgs = 0
-    for i, m in enumerate(msgs):
-        if i >= last_user or m.get("role") != "user":
-            continue
-        c = m.get("content")
-        if not isinstance(c, list):
-            continue
-        touched = False
-        for blk in c:
-            if not (isinstance(blk, dict) and blk.get("type") == "tool_result"
-                    and blk.get("tool_use_id") in read_ids):
-                continue
-            body = blk.get("content")
-            if body == READ_CLEARED_MARKER:        # idempotent: already cleared
-                continue
-            n = len(body) if isinstance(body, str) else len(json.dumps(body, default=str))
-            if n <= len(READ_CLEARED_MARKER):       # nothing to reclaim
-                continue
-            blk["content"] = READ_CLEARED_MARKER
-            stripped_chars += n - len(READ_CLEARED_MARKER)
-            cleared += 1
-            touched = True
-        if touched:
-            touched_msgs += 1
-    if not cleared:
-        return None
-    return {"stripped": True, "cleared_read_results": cleared,
-            "touched_messages": touched_msgs, "stripped_chars": stripped_chars,
-            "boundary_idx": last_user, "total_messages": len(msgs)}
-
 
 def _edit_result_ids(msgs):
     """tool_use_ids whose assistant tool_use was an Edit/Write tool (any wire

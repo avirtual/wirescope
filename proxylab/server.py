@@ -615,14 +615,6 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_thinking"] = spt
                 if spt.get("removed_thinking_blocks"):
                     changed = True
-            # STRIP PRIOR-TURN READS (experimental, scratch-port A/B; OFF on
-            # :7800): replace prior Read tool_result bodies with the CLI's
-            # cleared-marker. Class+position, byte-stable like the thinking strip.
-            spr = transforms_mod._strip_prior_reads(obj, agent_id=agent_id)
-            if spr:
-                record["strip_prior_reads"] = spr
-                if spr.get("cleared_read_results"):
-                    changed = True
             # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
             # with "ok" — but ONLY inside the region the thinking-strip just busted
             # (free-rider). Originating its own bust to reclaim ~1.4k tok/turn is a
