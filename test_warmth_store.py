@@ -2843,6 +2843,29 @@ _l1obj = {"metadata": {"user_id": json.dumps({"session_id": "sess-l1"})},
 check("strip level: L1 -> thinking enabled but L2 gate CLOSED",
       lp.transforms._strip_thinking_enabled(_l1obj) is True
       and lp.transforms._strip_l2_enabled(_l1obj) is False)
+# L2 enables ALL the shady session-level strips, incl. the merciless prior-Read
+# clear (standalone, not a bust-rider) — verified with the global scratch flag OFF.
+_saved_reads = lp.transforms.STRIP_PRIOR_READS
+lp.transforms.STRIP_PRIOR_READS = False
+def _reads_obj(sid):
+    return json.loads(json.dumps({"metadata": {"user_id": json.dumps({"session_id": sid})},
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "r1",
+                "name": "Read", "input": {"file_path": "/a"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1",
+                "content": "F" * 500}]},
+            {"role": "user", "content": [{"type": "text", "text": "next"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}]}))
+lp.transforms._strip_thinking_set_override("sess-l2reads", 2)
+_rd = lp.transforms._strip_prior_reads(_reads_obj("sess-l2reads"))
+check("strip level: L2 also enables the merciless prior-Read clear (global flag OFF)",
+      _rd is not None and _rd.get("cleared_read_results") == 1)
+lp.transforms._strip_thinking_set_override("sess-l2reads", 1)
+check("strip level: L1 does NOT enable the prior-Read clear (reads is L2-only)",
+      lp.transforms._strip_prior_reads(_reads_obj("sess-l2reads")) is None)
+lp.transforms._strip_thinking_set_override("sess-l2reads", None)
+lp.transforms.STRIP_PRIOR_READS = _saved_reads
 lp.transforms._STRIP_OVERRIDE.clear()
 _n_reload2 = lp.restore._restore_strip_overrides()
 check("strip level: L2 level survives a restart (reloads as int 2)",

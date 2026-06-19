@@ -1194,12 +1194,13 @@ except ValueError:
 
 # STRIP LEVELS (per-session, consumer-tiered — mirrors clodex's Off / L1 / L2):
 #   0 = off, 1 = L1 (prior-turn thinking only — the conservative, defensible tier
-#   clodex already opts sessions into), 2 = L2 = L1 PLUS the shadier bust-RIDING
-#   strips (failed-call stubbing + edit-ack collapse). L2 strictly contains L1:
-#   the riders gate on busted_from (the thinking-strip's bust), so they are no-ops
-#   unless L1 actually stripped this turn — "L2 is L1 + some more" is the literal
-#   runtime dependency, which is why a LEVEL (not two independent bools) is the
-#   right model. STRIP_L2 is the deployment default-level knob (implies thinking);
+#   clodex already opts sessions into), 2 = L2 = L1 PLUS ALL the shadier prior-turn
+#   content strips: failed-call stubbing + edit-ack collapse (both free-ride the
+#   thinking bust) AND the merciless prior-Read clear (standalone). L2 strictly
+#   contains L1 — the bust-riders are no-ops unless L1 actually stripped this turn,
+#   so "L2 is L1 + some more" is the literal runtime dependency, which is why a
+#   LEVEL (not independent bools) is the right model. STRIP_L2 is the deployment
+#   default-level knob (implies thinking);
 #   per-session it's set by `[wirescope:strip-thinking l2]` / `/_strip?level=2`.
 STRIP_L2 = os.environ.get("STRIP_L2", "0") not in ("0", "no", "off", "false")
 
@@ -1688,9 +1689,13 @@ def _strip_prior_reads(obj, agent_id=None):
     CLI's cleared-marker. Envelope + tool_use_id preserved (cache-byte-stable,
     model interprets the marker natively). Class+position only — never relational
     — so the stripped prefix stays byte-stable as the boundary advances. Gated by
-    the global STRIP_PRIOR_READS flag (scratch-port A/B; OFF on :7800). Returns a
-    log dict or None (disabled / no prior history / nothing to strip)."""
-    if not isinstance(obj, dict) or not STRIP_PRIOR_READS:
+    the per-session L2 level (or the STRIP_PRIOR_READS scratch-A/B flag). Unlike
+    the edit-ack/tool-error riders this does NOT free-ride busted_from — it's a
+    standalone class-strip that can originate its own bust; under L2 that's moot
+    since L1 (thinking) is also on, and the read-content reclaim is large enough
+    to justify a bust on its own anyway. Returns a log dict or None (disabled /
+    no prior history / nothing to strip)."""
+    if not isinstance(obj, dict) or not (STRIP_PRIOR_READS or _strip_l2_enabled(obj, agent_id)):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
