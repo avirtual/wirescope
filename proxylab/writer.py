@@ -221,20 +221,24 @@ def _forget_session_fp(session_id):
     _SESSION_MAIN_FP.pop(session_id, None)
 
 
-def _genuine_subagent(obj):
-    """True only if this turn is a REAL subagent — header-flagged cc_is_subagent
-    AND its content fingerprint diverges from the session's established main line.
-    A parent turn that leaked the subagent flag + a stale agent-id carries the MAIN
-    fingerprint (body-derived, never stale), so it reads NOT-genuine here and is
-    kept off the subagent buckets — fail closed to the main line (reviewer +
-    claude-code's converging call). PURE READ: never mutates _SESSION_MAIN_FP (the
-    main path does, via _note_main_fingerprint), so transform-chain / classifier
-    callers can't corrupt the reference with a title side-call.
+def _genuine_subagent(obj, agent_id=None):
+    """True only if this turn is a REAL subagent. SIGNAL (either suffices):
+      - the CLI's header-flagged `cc_is_subagent=true` (its own Task/Agent subs), OR
+      - a present `x-claude-code-agent-id` (the only signal carried by
+        proxy/teammate-spawned agents — e.g. `opsguru2@session-…` — which are
+        top-level CLI processes and so never set cc_is_subagent; same gap in
+        clodex and bare CLI).
+    In BOTH cases the FINGERPRINT BACKSTOP must clear it: a parent turn that
+    leaked the flag + a recycled agent-id carries the MAIN line's body-derived
+    fingerprint, so it reads NOT-genuine and stays on the main line — fail closed.
+    PURE READ: never mutates _SESSION_MAIN_FP (the main path does, via
+    _note_main_fingerprint), so transform-chain / classifier callers can't corrupt
+    the reference with a title side-call.
     CAVEAT: fork-path subagents (subagent_type omitted) clone the parent's first
     message and thus its fingerprint -> read as main here. Safe under-attribution
     (a fork's turns roll into the parent view, never corrupting a real sub bucket);
     normal Task subs have their own first message -> own fingerprint."""
-    if not _billing_is_subagent(obj):
+    if not (_billing_is_subagent(obj) or agent_id):
         return False
     sid = (_session_ids(obj) or [None])[0]
     main_fp = _SESSION_MAIN_FP.get(sid) if sid else None
@@ -384,9 +388,13 @@ def _subagent_marker_name(obj):
     return name[:64] if name else None
 
 
-def _classify_role(obj):
-    """Infer the agent role from the system-prompt signature, with the billing
-    header's cc_is_subagent flag as the authoritative subagent backstop."""
+def _classify_role(obj, agent_id=None):
+    """Infer the agent role from the system-prompt signature, with the wire's
+    subagent signals (cc_is_subagent flag OR the x-claude-code-agent-id header,
+    passed in by the caller) as the authoritative backstop. `agent_id` lets us
+    file proxy/teammate-spawned agents (which never set cc_is_subagent) as
+    subagents instead of silently absorbing their turns into the parent's main
+    line (which also wrongly flips the session's TTL to the subagent 5m)."""
     s = _sys_text(obj)
     if "software architect and planning" in s:
         return "Plan"
@@ -394,12 +402,13 @@ def _classify_role(obj):
         return "verification"
     if "agent for Claude Code" in s or "Searching for code" in s:
         return "general-purpose"
-    # Any remaining subagent (custom .claude/agents agent, or a builtin whose
-    # signature drifted) is flagged on the wire — keep it OFF the durable main
-    # line even though its prose may say "Claude Code". Use the fingerprint-backed
-    # check (not the raw flag) so a leaked parent turn (stale agent-id) is NOT
-    # mistaken for a subagent and is correctly classified parent below.
-    if _genuine_subagent(obj):
+    # Any remaining subagent (custom .claude/agents agent, a proxy/teammate-spawned
+    # agent carrying only an agent-id, or a builtin whose signature drifted) is
+    # flagged on the wire — keep it OFF the durable main line even though its prose
+    # may say "Claude Code". Use the fingerprint-backed check (not the raw signals)
+    # so a leaked parent turn (stale agent-id) is NOT mistaken for a subagent and
+    # is correctly classified parent below.
+    if _genuine_subagent(obj, agent_id=agent_id):
         return "subagent"
     if "Claude Code" in s:
         return "parent"

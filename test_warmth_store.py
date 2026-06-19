@@ -1192,6 +1192,30 @@ check("sticky: agent-id reuse across lineages fails closed (fingerprint mismatch
       and "MARKER-CLAUDEMD" in _g3["messages"][0]["content"][0]["text"])
 lp.transforms.WS_OMIT = False
 lp.transforms._WS_SPAWN_MEMORY.clear()
+
+# --- agent-id trigger: proxy/teammate-spawned subagents (no cc_is_subagent) -----
+# Wire-confirmed (logs_main f9f79cbb, 2026-06-19): an `opsguru2@session-…` agent
+# carries ONLY the x-claude-code-agent-id header, never cc_is_subagent (it's a
+# top-level CLI process). The classifier must file it as a subagent via the
+# agent-id — else its turns are absorbed into the parent main line AND flip the
+# session TTL to the subagent 5m. Same fingerprint backstop guards a leaked id.
+lp.writer._SESSION_MAIN_FP.clear()
+_AIDMAIN = "x-anthropic-billing-header: cc_version=2.1.183.f10; cc_entrypoint=cli;"   # no sub flag
+_AIDSUB  = "x-anthropic-billing-header: cc_version=2.1.183.551; cc_entrypoint=cli;"   # no flag, diff fp
+lp.writer._note_main_fingerprint("sess-aid", _fp_obj(_AIDMAIN, sid="sess-aid"))
+check("agent-id: a turn with ONLY an agent-id (no cc flag) + diverging fp is a genuine subagent",
+      lp.writer._genuine_subagent(_fp_obj(_AIDSUB, sid="sess-aid"),
+                                  agent_id="opsguru2@session-x") is True)
+check("agent-id: classify files it as 'subagent' (was wrongly absorbed as parent/unknown)",
+      lp.writer._classify_role(_fp_obj(_AIDSUB, sid="sess-aid"),
+                               agent_id="opsguru2@session-x") == "subagent")
+check("agent-id: a turn with NO agent-id and NO cc flag stays main line (regression)",
+      lp.writer._genuine_subagent(_fp_obj(_AIDMAIN, sid="sess-aid")) is False
+      and lp.writer._classify_role(_fp_obj(_AIDMAIN, sid="sess-aid")) == "parent")
+check("agent-id: leaked parent (agent-id present but fp==main) still classifies 'parent'",
+      lp.writer._classify_role(_fp_obj(_AIDMAIN, sid="sess-aid"),
+                               agent_id="opsguru2@session-x") == "parent")
+lp.writer._SESSION_MAIN_FP.clear()
 lp.writer._SESSION_MAIN_FP.clear()
 
 # --- wirescope: spawner discovery hint (WS_SPAWNER_HINT, opt-in, model-visible) --

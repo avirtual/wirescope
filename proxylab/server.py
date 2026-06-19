@@ -639,7 +639,7 @@ async def handler(request: Request) -> Response:
                           f" (forwarding; model echoes the ack)", flush=True)
             if changed:
                 raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        role = writer_mod._classify_role(obj)
+        role = writer_mod._classify_role(obj, agent_id=agent_id)
         model = obj.get("model")
         session_id, account_uuid, device_id = writer_mod._session_ids(obj)
         sysf = obj.get("system")
