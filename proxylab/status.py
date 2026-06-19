@@ -96,7 +96,8 @@ def _identity():
                                "max_body_ratio": transforms_mod.STRIP_THINK_MAX_BODY_RATIO,
                                "levels": [0, 1, 2], "max_level": 2,
                                "default_level": transforms_mod._global_strip_level()},
-            "codex": True,                # /agent/<name>/openai routing
+            "codex": True,                # /agent/<name>/openai HTTP routing
+            "codex_websocket": codex_mod._websocket_available(),
             # wirescope directives (WIRESCOPE.md): agent-name always honored,
             # omit/replace gated by WS_OMIT, keep always honored; `spawn` =
             # whether spawn-position (messages[0] head) directives are read at

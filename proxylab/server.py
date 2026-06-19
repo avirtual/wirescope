@@ -19,7 +19,8 @@ import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 
 from proxylab import billing as billing_mod
 from proxylab import canary as canary_mod
@@ -37,6 +38,42 @@ from proxylab import transforms as transforms_mod
 from proxylab import views as views_mod
 from proxylab import warmth as warmth_mod
 from proxylab import writer as writer_mod
+
+def _record_openai_context(obj, *, session_id, base_path, upstream_path,
+                           agent, model):
+    """Record Codex request metadata used by /_status, /_admin, and /_session.
+
+    Shared by the HTTP/SSE and WebSocket transports so the provider-specific
+    session behavior stays identical whichever wire Codex chooses.
+    """
+    if not (session_id and isinstance(obj, dict)
+            and base_path.rstrip("/").endswith(("/responses",
+                                                "/chat/completions"))):
+        return
+    pinger_mod._clear_session_ended(session_id)   # live turn = resume
+    # /_session context view (NOT replayable — pinger declines openai)
+    pinger_mod._cache_last_request_openai(session_id, obj, upstream_path)
+    fields = {"model": model, "agent": agent}
+    try:
+        inp = obj.get("input") or []
+        texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
+                 for c in (it.get("content") or [])
+                 if isinstance(c, dict)]
+        joined = "\n".join(texts)
+        mcwd = re.search(r"<cwd>([^<]+)</cwd>", joined)
+        if mcwd:
+            fields["cwd"] = mcwd.group(1)
+        prompts = [tx for it in inp if isinstance(it, dict)
+                   and it.get("role") == "user"
+                   for c in (it.get("content") or []) if isinstance(c, dict)
+                   for tx in [c.get("text") or ""]
+                   if tx and not tx.lstrip().startswith("<")]
+        if prompts:
+            fields["title"] = prompts[0].strip().splitlines()[0][:80]
+    except Exception:
+        pass
+    writer_mod._enqueue_meta(session_id, **fields)
+
 
 async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
     """The /agent/<name>/openai/... path: forward to UPSTREAM_OPENAI with the
@@ -87,33 +124,9 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
             "prompt_cache_key": obj.get("prompt_cache_key"),
             "store": obj.get("store"), "stream": obj.get("stream"),
         }
-        # session identity for /_status//_admin: model + cwd (from the
-        # environment_context input item) + first-prompt head as the title
-        # (codex has no title side-call)
-        if session_id and base_path.rstrip("/").endswith(("/responses",
-                                                          "/chat/completions")):
-            pinger_mod._clear_session_ended(session_id)   # live turn = resume
-            # /_session context view (NOT replayable — pinger declines openai)
-            pinger_mod._cache_last_request_openai(session_id, obj, upstream_path)
-            fields = {"model": model, "agent": agent}
-            try:
-                texts = [c.get("text") or "" for it in inp if isinstance(it, dict)
-                         for c in (it.get("content") or [])
-                         if isinstance(c, dict)]
-                joined = "\n".join(texts)
-                mcwd = re.search(r"<cwd>([^<]+)</cwd>", joined)
-                if mcwd:
-                    fields["cwd"] = mcwd.group(1)
-                prompts = [tx for it in inp if isinstance(it, dict)
-                           and it.get("role") == "user"
-                           for c in (it.get("content") or []) if isinstance(c, dict)
-                           for tx in [c.get("text") or ""]
-                           if tx and not tx.lstrip().startswith("<")]
-                if prompts:
-                    fields["title"] = prompts[0].strip().splitlines()[0][:80]
-            except Exception:
-                pass
-            writer_mod._enqueue_meta(session_id, **fields)
+        _record_openai_context(obj, session_id=session_id, base_path=base_path,
+                               upstream_path=upstream_path, agent=agent,
+                               model=model)
     elif raw:
         record["body_raw"] = body_bytes.decode("utf-8", "replace")[:4000]
     writer_mod._enqueue_json(out_dir / f"{stem}.request.json", record)
@@ -182,6 +195,273 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
     return StreamingResponse(body_iter(), status_code=up.status_code,
                              headers=resp_headers,
                              media_type=up.headers.get("content-type"))
+
+
+def _upstream_websocket_url(base_url, upstream_path):
+    """Convert an HTTP(S) upstream base + path to a WS(S) endpoint."""
+    if base_url.startswith("https://"):
+        return "wss://" + base_url[len("https://"):].rstrip("/") + upstream_path
+    if base_url.startswith("http://"):
+        return "ws://" + base_url[len("http://"):].rstrip("/") + upstream_path
+    return base_url.rstrip("/") + upstream_path
+
+
+def _websocket_forward_headers(headers):
+    """Headers safe to pass as additional headers on a fresh WS handshake."""
+    blocked = set(core_mod._HOP) | {
+        "accept-encoding", "connection", "host", "sec-websocket-accept",
+        "sec-websocket-extensions", "sec-websocket-key", "sec-websocket-protocol",
+        "sec-websocket-version", "upgrade",
+    }
+    return {k: v for k, v in headers.items() if k.lower() not in blocked}
+
+
+def _websocket_sendable_close_code(code, fallback=1000):
+    """Return a WebSocket close code legal to send on the wire.
+
+    ASGI/websockets can report synthetic close codes such as 1005/1006/1015.
+    Those are diagnostic values only; sending them in a close frame raises
+    ProtocolError and turns an otherwise successful tunnel into a noisy relay
+    failure.
+    """
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return fallback
+    if code in {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011,
+                1012, 1013, 1014}:
+        return code
+    if 3000 <= code <= 4999:
+        return code
+    return fallback
+
+
+def _websocket_close_reason(reason, fallback=""):
+    """Return a close reason that fits the 123-byte WebSocket limit."""
+    reason = fallback if reason is None else str(reason)
+    raw = reason.encode("utf-8")
+    if len(raw) <= 123:
+        return reason
+    return raw[:123].decode("utf-8", "ignore")
+
+
+async def _websockets_connect(url, headers, subprotocols=None, user_agent=None):
+    """websockets.connect compatibility shim across 10.x-15.x keyword names."""
+    try:
+        import websockets
+    except Exception as e:  # pragma: no cover - dependency/runtime guard
+        raise RuntimeError(
+            "WebSocket proxy support requires the 'websockets' package; "
+            "install from requirements.txt"
+        ) from e
+    kwargs = {"subprotocols": subprotocols or None, "open_timeout": 5,
+              "ping_interval": None}
+    if user_agent is not None:
+        kwargs["user_agent_header"] = user_agent
+    try:
+        return await websockets.connect(url, additional_headers=headers, **kwargs)
+    except TypeError:
+        kwargs.pop("user_agent_header", None)  # websockets<14 used extra_headers only
+        return await websockets.connect(url, extra_headers=headers, **kwargs)
+
+
+async def websocket_handler(websocket: WebSocket):
+    """Tunnel Codex /responses WebSockets to the OpenAI/ChatGPT upstream.
+
+    HTTP/SSE remains the canonical captured path. This WS path is deliberately a
+    transparent tunnel with lightweight frame capture so Codex clients that try
+    WS first do not fall through as HTTP GET /responses and produce noisy 405s.
+    """
+    path = websocket.url.path
+    mo = codex_mod._ROUTE_OPENAI.match(path)
+    if not mo:
+        await websocket.close(code=1008)
+        return
+
+    n = next(core_mod._counter)
+    ts = time.strftime("%H%M%S")
+    agent = mo.group("name")
+    upstream_path = mo.group("rest") or "/"
+    if websocket.url.query:
+        upstream_path += "?" + websocket.url.query
+    base_path = upstream_path.split("?")[0]
+    chatgpt_mode = codex_mod._is_chatgpt_backend(codex_mod.UPSTREAM_OPENAI)
+    codex_mod._CODEX_STATS["requests"] += 1
+
+    session_id = (websocket.headers.get("session-id")
+                  or websocket.headers.get("thread-id"))
+    session_key = session_id or writer_mod.NO_SESSION
+    out_dir = core_mod.LOG_DIR / session_key
+    stem = f"{n:03d}-{agent}-codex-ws-{ts}"
+    client = websocket.client
+    record = {"seq": n, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "agent": agent, "provider": "openai", "transport": "websocket",
+              "method": "WEBSOCKET", "path": upstream_path,
+              "client": {"host": client.host, "port": client.port} if client else None,
+              "request_headers": core_mod._safe_headers(websocket.headers)}
+    writer_mod._enqueue_json(out_dir / f"{stem}.request.json", record)
+
+    fwd_headers = _websocket_forward_headers(websocket.headers)
+    user_agent = fwd_headers.pop("user-agent", None)
+    requested_subprotocols = [p.strip() for p in
+                              (websocket.headers.get("sec-websocket-protocol") or "").split(",")
+                              if p.strip()]
+    up_path = upstream_path
+    if chatgpt_mode:
+        up_path, fwd_headers = codex_mod._rewrite_chatgpt_request(up_path, fwd_headers)
+    upstream_url = _upstream_websocket_url(codex_mod.UPSTREAM_OPENAI, up_path)
+
+    frames = []
+    close_status = {"client": None, "upstream": None, "error": None}
+
+    try:
+        up = await _websockets_connect(upstream_url, fwd_headers,
+                                       subprotocols=requested_subprotocols,
+                                       user_agent=user_agent)
+    except Exception as e:
+        codex_mod._CODEX_STATS["errors"] += 1
+        close_status["error"] = f"connect: {type(e).__name__}: {e}"
+        writer_mod._enqueue_json(out_dir / f"{stem}.transport.json",
+                     {"seq": n, "agent": agent, "provider": "openai",
+                      "transport": "websocket", "endpoint": base_path,
+                      "status": "connect_failed", "upstream_url": upstream_url,
+                      "error": close_status["error"]})
+        await websocket.close(code=1011)
+        return
+
+    await websocket.accept(subprotocol=getattr(up, "subprotocol", None))
+    model_seen = {"value": None}
+    upstream_text_frames = []
+    receipt_done = {"value": False}
+    client_gone = {"value": False}
+
+    def maybe_record_request_obj(data):
+        if model_seen["value"] is not None:
+            return
+        try:
+            obj = json.loads(data)
+        except Exception:
+            return
+        if not isinstance(obj, dict) or obj.get("type") != "response.create":
+            return
+        model_seen["value"] = obj.get("model")
+        _record_openai_context(obj, session_id=session_id, base_path=base_path,
+                               upstream_path=upstream_path, agent=agent,
+                               model=model_seen["value"])
+        writer_mod._enqueue_json(out_dir / f"{stem}.request.body.json", obj)
+
+    def maybe_finalize_ws_receipt(data):
+        if receipt_done["value"]:
+            return
+        try:
+            obj = json.loads(data)
+        except Exception:
+            return
+        if obj.get("type") not in ("response.completed", "response.incomplete",
+                                   "response.failed", "error"):
+            return
+        receipt_done["value"] = True
+        blob = "".join(f"data: {frame}\n\n" for frame in upstream_text_frames)
+        raw = blob.encode("utf-8")
+        writer_mod._enqueue_bytes(out_dir / f"{stem}.response.sse", raw)
+        receipts_mod.openai(
+            raw, n=n, ts=ts, agent=agent, model=model_seen["value"],
+            session_id=session_id, session_key=session_key,
+            out_dir=out_dir, stem=stem, status_code=200, resp_headers={})
+
+    async def client_to_upstream():
+        try:
+            while True:
+                msg = await websocket.receive()
+                typ = msg.get("type")
+                if typ == "websocket.disconnect":
+                    client_gone["value"] = True
+                    close_status["client"] = {"code": msg.get("code"),
+                                               "reason": msg.get("reason")}
+                    await up.close(
+                        code=_websocket_sendable_close_code(msg.get("code"),
+                                                            fallback=1001),
+                        reason=_websocket_close_reason(
+                            msg.get("reason"), fallback="client disconnected"),
+                    )
+                    break
+                if "text" in msg:
+                    data = msg["text"]
+                    maybe_record_request_obj(data)
+                    frames.append({"dir": "client", "type": "text",
+                                   "bytes": len(data.encode("utf-8")),
+                                   "preview": data[:1000]})
+                    await up.send(data)
+                elif "bytes" in msg:
+                    data = msg["bytes"]
+                    frames.append({"dir": "client", "type": "bytes",
+                                   "bytes": len(data),
+                                   "preview_hex": data[:128].hex()})
+                    await up.send(data)
+        except Exception as e:
+            if not client_gone["value"]:
+                close_status["error"] = close_status["error"] or f"client_to_upstream: {type(e).__name__}: {e}"
+            with contextlib.suppress(Exception):
+                await up.close(code=1011, reason="client relay failed")
+
+    async def upstream_to_client():
+        try:
+            async for data in up:
+                if isinstance(data, str):
+                    upstream_text_frames.append(data)
+                    frames.append({"dir": "upstream", "type": "text",
+                                   "bytes": len(data.encode("utf-8")),
+                                   "preview": data[:1000]})
+                    await websocket.send_text(data)
+                    maybe_finalize_ws_receipt(data)
+                else:
+                    frames.append({"dir": "upstream", "type": "bytes",
+                                   "bytes": len(data),
+                                   "preview_hex": data[:128].hex()})
+                    await websocket.send_bytes(data)
+        except Exception as e:
+            if not client_gone["value"]:
+                close_status["error"] = close_status["error"] or f"upstream_to_client: {type(e).__name__}: {e}"
+        finally:
+            close_status["upstream"] = {"code": getattr(up, "close_code", None),
+                                         "reason": getattr(up, "close_reason", None)}
+            if not client_gone["value"]:
+                with contextlib.suppress(Exception):
+                    await websocket.close(
+                        code=_websocket_sendable_close_code(
+                            getattr(up, "close_code", None), fallback=1011),
+                        reason=_websocket_close_reason(
+                            getattr(up, "close_reason", None),
+                            fallback="upstream closed"),
+                    )
+
+    try:
+        tasks = [asyncio.create_task(client_to_upstream()),
+                 asyncio.create_task(upstream_to_client())]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for task in done:
+            task.result()
+    except Exception as e:
+        codex_mod._CODEX_STATS["errors"] += 1
+        close_status["error"] = close_status["error"] or f"relay: {type(e).__name__}: {e}"
+    finally:
+        with contextlib.suppress(Exception):
+            await up.close()
+        writer_mod._enqueue_json(out_dir / f"{stem}.transport.json",
+                     {"seq": n, "agent": agent, "provider": "openai",
+                      "transport": "websocket", "endpoint": base_path,
+                      "upstream_url": upstream_url, "status": "closed",
+                      "close": close_status, "n_frames": len(frames),
+                      "receipt_done": receipt_done["value"]})
+        if frames:
+            writer_mod._enqueue_json(out_dir / f"{stem}.frames.json",
+                         {"seq": n, "agent": agent, "provider": "openai",
+                          "transport": "websocket", "frames": frames})
 
 
 async def handler(request: Request) -> Response:
@@ -872,6 +1152,9 @@ async def _lifespan(app):
     yield
 
 
-app = Starlette(routes=[Route("/{path:path}", handler,
-                              methods=["GET", "POST", "PUT", "DELETE"])],
-                lifespan=_lifespan)
+_routes = [Route("/{path:path}", handler,
+                 methods=["GET", "POST", "PUT", "DELETE"])]
+if codex_mod._websocket_available():
+    _routes.append(WebSocketRoute("/{path:path}", websocket_handler))
+
+app = Starlette(routes=_routes, lifespan=_lifespan)
