@@ -28,6 +28,7 @@ import datetime
 import json
 
 from . import billing as billing_mod
+from . import codex as codex_mod
 from . import core as core_mod
 from . import status as status_mod
 
@@ -142,6 +143,91 @@ def _iter_pairs(session):
     out.sort(key=lambda p: (_epoch(p["ts"]) if _epoch(p["ts"]) is not None else 0.0,
                             _seq_of(p["stem"])))
     return out
+
+
+def _codex_framing_key(item):
+    """Dedup key for codex's machine-framing input items — the `developer`
+    permissions block and the `<environment_context>` user message that codex
+    re-sends verbatim on every fresh WS connection for a session. The stitched
+    transcript shows them ONCE. Returns None for a substantive (prompt/output)
+    item, which is never deduped."""
+    if not (isinstance(item, dict) and item.get("type") == "message"):
+        return None
+    role = item.get("role")
+    joined = "".join(c.get("text") or "" for c in (item.get("content") or [])
+                     if isinstance(c, dict))
+    if role == "developer" or joined.lstrip().startswith("<"):
+        return (role, joined)
+    return None
+
+
+def codex_ws_transcript(session):
+    """Stitch a codex-over-WebSocket session's PER-TURN capture files into ONE
+    synthetic Responses-API body for /_session (the codex-WS transcript
+    reconstructor).
+
+    Codex 0.141 multiplexes the whole conversation over a single long-lived WS
+    and chains turns SERVER-side (previous_response_id / prompt_cache_key), so
+    each `response.create` request ships only the NEW delta — no single request
+    holds the full thread. /_session renders the last request, which on this
+    wire is just the final delta ("only the last chunk"). This rebuilds the
+    whole timeline from disk: in seq order, each turn contributes its input
+    delta items, then the assistant output items parsed from that turn's
+    `.response.sse` (the prior turn's tool calls naturally return as the next
+    turn's `function_call_output` input items, so plain concatenation reads as
+    the conversation).
+
+    Returns an entry dict shaped like the in-memory openai last-request
+    ({"obj","ts","turns","transport"}) so _render_session_openai_body renders it
+    unchanged; None when the session has no codex-ws turns on disk (caller then
+    falls back to the normal last-request entry). Disk-heavy (reads every
+    `.response.sse`) → on-demand /_session only, like the rest of this module."""
+    d = core_mod.LOG_DIR / session
+    if not d.is_dir():
+        return None
+    bodies = sorted(d.glob("*codex-ws*.request.body.json"),
+                    key=lambda f: _seq_of(f.name))
+    if not bodies:
+        return None
+    stitched = []
+    seen_framing = set()
+    last_obj = None
+    last_ts = None
+    turns = 0
+    for bf in bodies:
+        obj = _load(bf)
+        if not isinstance(obj, dict):
+            continue
+        last_obj = obj
+        turns += 1
+        for it in (obj.get("input") or []):
+            if not isinstance(it, dict):
+                continue
+            key = _codex_framing_key(it)
+            if key is not None:
+                if key in seen_framing:
+                    continue
+                seen_framing.add(key)
+            stitched.append(it)
+        stem = bf.name[: -len(".request.body.json")]
+        sse = d / (stem + ".response.sse")
+        if sse.is_file():
+            try:
+                stitched.extend(codex_mod._output_items_from_sse(sse.read_bytes()))
+            except Exception:
+                pass
+        # codex response.json carries no top-level ts → use the capture file's
+        # mtime (when the turn was written) for the "captured N ago" header.
+        try:
+            last_ts = bf.stat().st_mtime
+        except OSError:
+            pass
+    if last_obj is None:
+        return None
+    synthetic = dict(last_obj)          # carry the last turn's instructions/tools
+    synthetic["input"] = stitched
+    return {"obj": synthetic, "ts": last_ts, "turns": turns,
+            "transport": "websocket-reconstructed", "needs_auth": False}
 
 
 def _usd(tokens, rate):

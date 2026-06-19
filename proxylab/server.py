@@ -578,10 +578,17 @@ async def handler(request: Request) -> Response:
             entry = pinger_mod._LAST_REQUEST.get(sess)
         if entry is None:
             entry = views_mod._load_last_request_row(sess)
-        return Response(views_mod._render_session_html(sess, entry,
-                                             status_mod._status_snapshot(session=sess),
-                                             resp=meta_mod._LAST_RESPONSE.get(sess),
-                                             usage=meta_mod._LAST_USAGE.get(sess)),
+        # Codex over WebSocket is a DELTA protocol: each turn's request carries
+        # only the new delta (turns chain server-side), so the in-memory/SQLite
+        # last-request entry is just the final chunk. Rebuild the whole thread
+        # from the per-turn capture files. The reconstruction stitches the final
+        # answer in as its last item, so don't also render the standalone resp.
+        recon = report_mod.codex_ws_transcript(sess)
+        return Response(views_mod._render_session_html(
+                            sess, recon or entry,
+                            status_mod._status_snapshot(session=sess),
+                            resp=None if recon else meta_mod._LAST_RESPONSE.get(sess),
+                            usage=meta_mod._LAST_USAGE.get(sess)),
                         media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---

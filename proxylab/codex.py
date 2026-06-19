@@ -179,6 +179,38 @@ def _sse_text_delta(obj, wire):
     return None
 
 
+def _output_items_from_sse(blob):
+    """Ordered list of COMPLETED assistant output items (message / reasoning /
+    function_call) from a captured Responses-API SSE stream — the assistant side
+    of one codex turn, for the codex-WS transcript reconstructor (report.py).
+
+    Each `response.output_item.done` event carries the FULL item, so we take
+    those and ignore the incremental deltas. Returns [] on a non-SSE/error body
+    (4xx errors come back unframed) — the reconstructor just shows no output for
+    that turn rather than failing."""
+    items = []
+    if isinstance(blob, (bytes, bytearray)):
+        s = blob.decode("utf-8", "replace")
+    else:
+        s = blob or ""
+    if "data:" not in s:
+        return items
+    for frame in re.split(r"\r?\n\r?\n", s):
+        data_lines = [ln[5:].lstrip() for ln in frame.split("\n")
+                      if ln.startswith("data:")]
+        if not data_lines:
+            continue
+        try:
+            obj = json.loads("\n".join(data_lines))
+        except Exception:
+            continue
+        if obj.get("type") == "response.output_item.done":
+            it = obj.get("item")
+            if isinstance(it, dict):
+                items.append(it)
+    return items
+
+
 def _parse_openai_response(blob):
     """Usage/meta out of a captured Responses-API SSE stream (or a plain JSON
     error body — 4xx come back unframed). response.completed carries the FULL

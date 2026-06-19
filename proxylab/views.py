@@ -406,8 +406,11 @@ def _render_session_openai_body(entry, resp=None):
     i_ch = len(json.dumps(inp)) if inp else 0
     n_turns = sum(1 for it in inp if codex_mod._is_prompt_item_openai(it))
     pck = obj.get("prompt_cache_key") or ""
+    recon = (f'<span class="badge on">&#9881; reconstructed · '
+             f'{entry.get("turns") or "?"} WS turns</span>'
+             if entry.get("transport") == "websocket-reconstructed" else "")
     bar = (f'<p class="kv"><span>captured <b>{e(_fmt_ago(entry.get("ts")))}</b> '
-           f'<span class="badge on">openai wire</span></span>'
+           f'<span class="badge on">openai wire</span>{recon}</span>'
            f'<span>tools <b>{len(tools)}</b> &approx;{e(_fmt_tok(t_ch // 4))} tok</span>'
            f'<span>instructions <b>{len(instr):,}</b> ch</span>'
            f'<span>input <b>{len(inp)}</b> items &approx;{e(_fmt_tok(i_ch // 4))} tok</span>'
