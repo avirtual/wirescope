@@ -1482,16 +1482,32 @@ def _strip_thinking_set_override(session_id, level):
     """Endpoint/programmatic setter for the per-session override LEVEL: an int
     0/1/2 (or True/False = 1/0 for the legacy `on=` API), or None to clear ->
     fall back to the global default. Returns the effective stored value (None when
-    cleared). Level is clamped to 0..2."""
+    cleared). Level is clamped to 0..2.
+
+    DELIBERATE-FLIP -> ESTABLISH THE GUARD LATCH NOW. An explicit per-session
+    level CHANGE (this endpoint / a directive) is the "flip once on purpose" case
+    the cold-gate was NEVER meant to block: cold-gating exists to stop the
+    AUTOMATIC ratio decision from surprise-busting a warm prefix, not to veto user
+    intent. So on a genuine change we set the guard latch immediately (enable>=1 ->
+    strip; disable 0 -> no-strip) so the new level takes effect on the very next
+    turn even on a WARM prefix — eating the one-time re-cache the user asked for,
+    instead of silently no-op'ing until the cache happens to go cold. A clear drops
+    the latch too, so the global-default cold-gated decision re-decides fresh. The
+    automatic/global path never routes through here, so its cold-gate is untouched."""
     if not session_id:
         return None
     if level is None:
         _STRIP_OVERRIDE.pop(session_id, None)
         _delete_strip_override(session_id)
+        _STRIP_GUARD_LATCH.pop(session_id, None)
+        _delete_strip_guard_latch(session_id)
         return None
+    prev = _STRIP_OVERRIDE.get(session_id)
     lvl = max(0, min(2, int(level)))     # True->1, False->0 via int()
     _STRIP_OVERRIDE[session_id] = lvl
     _persist_strip_override(session_id, lvl)
+    if prev != lvl:                      # genuine deliberate change -> latch now
+        _strip_guard_set_latch(session_id, lvl >= 1)
     return lvl
 
 

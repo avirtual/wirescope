@@ -2867,6 +2867,24 @@ check("strip override: _ws_forget deletes the persisted row too",
       lp.store.db().execute(
           "SELECT 1 FROM strip_override WHERE owner=? AND session_id=?",
           (lp.store.OWNER, "sess-forget2")).fetchone() is None)
+# DELIBERATE-FLIP latch: an explicit per-session level change establishes the
+# guard latch IMMEDIATELY (so a warm session strips on the next turn instead of
+# no-op'ing until it goes cold). enable>=1 -> latch strip; disable 0 -> no-strip;
+# clear -> drop the latch. Re-asserting the SAME level must NOT re-latch.
+lp.transforms._STRIP_GUARD_LATCH.clear()
+lp.transforms._strip_thinking_set_override("sess-flip", 2)
+check("strip flip: explicit enable establishes guard latch=strip immediately",
+      lp.transforms._STRIP_GUARD_LATCH.get("sess-flip") is True)
+lp.transforms._STRIP_GUARD_LATCH["sess-flip"] = "sentinel"   # detect a re-latch
+lp.transforms._strip_thinking_set_override("sess-flip", 2)   # same level -> no-op
+check("strip flip: re-asserting the same level does not re-latch",
+      lp.transforms._STRIP_GUARD_LATCH.get("sess-flip") == "sentinel")
+lp.transforms._strip_thinking_set_override("sess-flip", 0)   # disable -> no-strip
+check("strip flip: explicit disable latches no-strip",
+      lp.transforms._STRIP_GUARD_LATCH.get("sess-flip") is False)
+lp.transforms._strip_thinking_set_override("sess-flip", None)  # clear -> drop latch
+check("strip flip: clear drops the guard latch (cold-gate re-decides fresh)",
+      "sess-flip" not in lp.transforms._STRIP_GUARD_LATCH)
 lp.transforms._STRIP_OVERRIDE.clear()
 # --- L2 strip level: L2 = L1 + the shady bust-riders -------------------------
 # level 2 sets thinking ON (L1) AND opens the L2 gate; persists + reloads as 2.
@@ -3013,6 +3031,29 @@ _tr = lp.transforms._strip_prior_thinking(_ti)
 check("strip_prior_thinking: reports earliest_idx for the ack free-rider gate",
       _tr and _tr.get("earliest_idx") == 1)
 lp.transforms.STRIP_PRIOR_THINKING = _tsave2
+
+# /_context VISIBILITY: the L2 edit-ack collapse must surface its reclaim in the
+# composition panel (`strip_prior_edit_acks`) so a consumer's UI can show L2 as
+# distinct from L1 — the gap clodex hit (L2 looked identical to L1). Mirrors the
+# failed-call panel; would_strip rides the thinking bust + L2/flag gate.
+lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
+_pea = {"model": "claude-opus-4-8", "messages": [
+    {"role": "user", "content": "edit"},
+    {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "z" * 200, "signature": "s"},
+        {"type": "tool_use", "id": "e1", "name": "Edit",
+         "input": {"file_path": "/x.py", "old_string": "a", "new_string": "b"}}]},
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "e1",
+         "content": _UPD % "/x.py", "is_error": False}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    {"role": "user", "content": "next"}]}
+_pea_panel = lp.status._strip_edit_acks_panel(_pea, 1.0, 100000)
+check("/_context: strip_prior_edit_acks panel surfaces the L2 ack reclaim",
+      _pea_panel is not None and _pea_panel["collapsed_acks"] == 1
+      and _pea_panel["edit_ack_tokens"] > 0
+      and _pea_panel["rides_thinking_bust"] is True
+      and _pea_panel["would_strip"] is True)
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
 
 print()
