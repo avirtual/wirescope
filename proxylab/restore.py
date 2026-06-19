@@ -206,6 +206,25 @@ def _restore_strip_overrides():
         return 0
 
 
+def _restore_strip_guard_latches():
+    """Reload per-session strip-guard latches BEFORE the first post-restart turn,
+    so the guard keeps its sticky decision instead of recomputing the ratio and
+    re-flipping against a still-warm prefix. Same durability rationale as
+    strip_overrides — anti-flap depends on the control state outliving restarts."""
+    try:
+        from proxylab import transforms as transforms_mod
+        con = store_mod.db()
+        with store_mod.LOCK:
+            rows = con.execute("SELECT session_id, strip FROM strip_guard_latch "
+                               "WHERE owner=?", (store_mod.OWNER,)).fetchall()
+        for sid, strip in rows:
+            transforms_mod._STRIP_GUARD_LATCH[sid] = bool(strip)
+        return len(rows)
+    except Exception as e:
+        print(f"[restore] strip_guard_latches failed: {e}", flush=True)
+        return 0
+
+
 def _restore_state():
     now = time.time()
     _RESTORED["holds"] = _restore_holds(now)
@@ -214,9 +233,11 @@ def _restore_state():
     _RESTORED["cwd_done"] = _restore_cwd_done()
     _RESTORED["ended"] = _restore_ended()
     _RESTORED["strip_overrides"] = _restore_strip_overrides()
+    _RESTORED["strip_guard_latches"] = _restore_strip_guard_latches()
     print(f"[restore] holds={_RESTORED['holds']} "
           f"last_requests={_RESTORED['last_requests']} (auth-less until live "
           f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
           f"session_totals={_RESTORED['session_totals']} "
           f"cwd_known={_RESTORED['cwd_done']} "
-          f"strip_overrides={_RESTORED['strip_overrides']}", flush=True)
+          f"strip_overrides={_RESTORED['strip_overrides']} "
+          f"strip_guard_latches={_RESTORED['strip_guard_latches']}", flush=True)

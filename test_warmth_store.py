@@ -2598,22 +2598,83 @@ _mon = {"messages": [
     {"role": "assistant", "content": [
         {"type": "thinking", "thinking": "current"}, {"type": "text", "text": "a"}]},
 ]}
-_mr = lp.transforms._strip_prior_thinking(_mon)
-check("strip_prior_thinking: monster guard skips body-dominated history",
-      _mr and _mr.get("stripped") is False
-      and _mr.get("skipped_reason") == "body_thinking_ratio"
-      and _mr["body_thinking_ratio"] > 4.0)
-check("strip_prior_thinking: skipped monster is NOT mutated",
-      any(b.get("type") == "thinking" for b in _mon["messages"][1]["content"]))
+# DECISION B (v0.4.35): cold-gating removed the warm bust, so we always strip
+# from cold even on a monster (body-dominated) history -> free reclaim, L1 honored.
+_mon_b = _copy.deepcopy(_mon)
+_mr = lp.transforms._strip_prior_thinking(_mon_b)
+check("strip_prior_thinking: Decision B strips the monster from cold",
+      _mr and _mr.get("stripped") is True
+      and _mr.get("guard_reason") == "cold_latch_strip"
+      and _mr["body_thinking_ratio"] > 4.0
+      and not any(b.get("type") == "thinking" for b in _mon_b["messages"][1]["content"]))
 
-# gate disabled (ratio<=0) -> strips even the monster
-lp.transforms.STRIP_THINK_MAX_BODY_RATIO = 0.0
-_mon2 = _copy.deepcopy(_mon)
-_mr2 = lp.transforms._strip_prior_thinking(_mon2)
-check("strip_prior_thinking: gate disabled strips regardless of ratio",
-      _mr2 and _mr2.get("stripped") is True
-      and not any(b.get("type") == "thinking" for b in _mon2["messages"][1]["content"]))
-lp.transforms.STRIP_THINK_MAX_BODY_RATIO = 4.0
+# experimental kill knob STRIP_GUARD_COLD_RATIO -> restores old A (no-strip monster)
+lp.transforms.STRIP_GUARD_COLD_RATIO = True
+_mon_a = _copy.deepcopy(_mon)
+_mra = lp.transforms._strip_prior_thinking(_mon_a)
+check("strip_prior_thinking: COLD_RATIO knob restores monster no-strip (experimental A)",
+      _mra and _mra.get("stripped") is False
+      and _mra.get("skipped_reason") == "cold_latch_no_strip"
+      and any(b.get("type") == "thinking" for b in _mon_a["messages"][1]["content"]))
+lp.transforms.STRIP_GUARD_COLD_RATIO = False
+
+# ---- STICKY COLD-GATED GUARD LATCH (anti-flap, v0.4.35) -------------------
+_dec = lp.transforms._strip_thinking_guard_decision
+_LATCH = lp.transforms._STRIP_GUARD_LATCH
+_o_dummy = {"messages": _spt_msgs()}
+
+# A latched decision is reused verbatim and OVERRIDES the per-turn ratio (the
+# flap fix): a no-strip latch declines even when ratio is low enough to strip.
+_LATCH["sessA"] = False
+_rA = _dec(_o_dummy, "sessA", 1.0, 1)        # ratio 1.0 << 4.0 would otherwise strip
+check("guard latch: no-strip latch overrides a strippable ratio",
+      _rA == (False, "latched_no_strip"))
+_LATCH["sessB"] = True
+_rB = _dec(_o_dummy, "sessB", 99.0, 1)       # monster ratio would otherwise decline
+check("guard latch: strip latch overrides a monster ratio",
+      _rB == (True, "latched_strip"))
+_LATCH.pop("sessA", None); _LATCH.pop("sessB", None)
+
+# COLD-GATE: with no latch, a WARM incoming thinking-prefix declines WITHOUT
+# latching (don't originate a bust; wait for a cold moment to decide durably).
+_orig_warm = lp.transforms._incoming_thinking_prefix_warm
+lp.transforms._incoming_thinking_prefix_warm = lambda o, e: True
+_rW = _dec(_o_dummy, "sessWarm", 1.0, 1)
+check("guard latch: warm prefix + no latch -> decline, no latch set",
+      _rW == (False, "warm_no_latch") and "sessWarm" not in _LATCH)
+
+# COLD/ABSENT incoming prefix -> establish the latch now (rides the cold write).
+lp.transforms._incoming_thinking_prefix_warm = lambda o, e: False
+_rC = _dec(_o_dummy, "sessCold", 1.0, 1)      # ratio<MAX -> latch strip
+check("guard latch: cold prefix latches the decision (strip)",
+      _rC == (True, "cold_latch_strip") and _LATCH.get("sessCold") is True)
+# DECISION B: cold + monster ratio still latches STRIP (ratio vestigial at cold).
+_rM = _dec(_o_dummy, "sessColdMon", 99.0, 1)
+check("guard latch: Decision B latches strip even at a monster ratio (cold)",
+      _rM == (True, "cold_latch_strip") and _LATCH.get("sessColdMon") is True)
+# experimental knob restores old A (cold + monster -> no-strip latch)
+lp.transforms.STRIP_GUARD_COLD_RATIO = True
+_rMa = _dec(_o_dummy, "sessColdMonA", 99.0, 1)
+check("guard latch: COLD_RATIO knob latches no-strip at monster ratio (cold)",
+      _rMa == (False, "cold_latch_no_strip") and _LATCH.get("sessColdMonA") is False)
+lp.transforms.STRIP_GUARD_COLD_RATIO = False
+_LATCH.pop("sessColdMonA", None)
+# ledger can't judge -> conservative decline, no latch
+lp.transforms._incoming_thinking_prefix_warm = lambda o, e: None
+_rU = _dec(_o_dummy, "sessUnk", 1.0, 1)
+check("guard latch: warmth-unknown -> decline, no latch",
+      _rU == (False, "warmth_unknown") and "sessUnk" not in _LATCH)
+lp.transforms._incoming_thinking_prefix_warm = _orig_warm
+
+# PERSISTENCE round-trip: set -> reload drops in-memory then restores from store.
+lp.transforms._strip_guard_set_latch("sessPersist", True)
+_LATCH.pop("sessPersist", None)               # simulate a restart dropping memory
+import proxylab.restore as _restore_mod
+_restore_mod._restore_strip_guard_latches()
+check("guard latch: persists + reloads across a restart",
+      _LATCH.get("sessPersist") is True)
+lp.transforms._ws_forget("sessPersist")       # cleanup (in-memory + DB row)
+_LATCH.pop("sessCold", None); _LATCH.pop("sessColdMon", None)
 
 # no prior history (only the current turn) -> None
 check("strip_prior_thinking: no prior turn -> None",

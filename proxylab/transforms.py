@@ -690,6 +690,8 @@ def _ws_forget(session_id):
     _WS_SPAWN_MEMORY.pop(session_id, None)
     if _STRIP_OVERRIDE.pop(session_id, None) is not None:
         _delete_strip_override(session_id)
+    if _STRIP_GUARD_LATCH.pop(session_id, None) is not None:
+        _delete_strip_guard_latch(session_id)
 
 
 def _ws_merged_pairs(obj, agent_id=None):
@@ -1297,6 +1299,140 @@ def _delete_strip_override(session_id):
         print(f"[strip] row delete failed for {session_id[:12]}…: {e}", flush=True)
 
 
+# STRIP-GUARD LATCH (anti-flap, v0.4.35): the monster guard used to recompute
+# `prior_body / prior_think` EVERY turn and strip iff ratio <= MAX. On a session
+# whose ratio wobbles across the threshold (thinking-sparse, tool-output-heavy —
+# the ratio drifts as each turn adds body vs thinking) the decision FLIPPED turn
+# to turn, and every flip changed the forwarded bytes -> busted the warm prefix
+# from the first thinking position -> full-suffix re-write (measured live on
+# clodex session ef043611: 4 mid-session busts, 42k/49k-tok floor-collapses).
+# FIX: decide strip/no-strip ONCE per session and LATCH it (sticky), so it can't
+# flip. COLD-GATE: the latch is only ESTABLISHED when the incoming thinking-prefix
+# is NOT warm — so the first decision rides an unavoidable cold write and never
+# ORIGINATES a warm bust (a latch that first-fired mid-warm-lineage would just
+# relocate the bust). On a warm prefix with no latch we decline WITHOUT latching,
+# leaving a later cold moment to make the durable call. Persisted like
+# strip_override (a restart must not drop it and re-flip). Keyed by session_id;
+# a CLI reload rotates the id -> fresh cold decision (correct).
+_STRIP_GUARD_LATCH = {}
+
+# Experimental kill knob (default OFF = Decision B: always strip from cold). When
+# set, restores the old monster-ratio tiebreaker AT THE COLD DECISION ONLY (latch
+# no-strip if ratio > MAX). For one-off A-vs-B experiments; NOT for production
+# economics (cold-gating already removed the bust the ratio guarded against).
+STRIP_GUARD_COLD_RATIO = os.environ.get("STRIP_GUARD_COLD_RATIO", "0") not in ("0", "no", "off", "false")
+
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS strip_guard_latch ("
+    "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
+    "strip INTEGER NOT NULL, set_at REAL NOT NULL, "
+    "PRIMARY KEY (owner, session_id))")
+
+
+def _persist_strip_guard_latch(session_id, strip):
+    """Mirror a guard latch to SQLite so a restart reloads it BEFORE the first
+    post-restart turn (else the latch drops, the guard recomputes, and it can
+    re-flip against a still-warm prefix). Degrades to in-memory-only on failure."""
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            con.execute(
+                "INSERT INTO strip_guard_latch(owner, session_id, strip, set_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(owner, session_id) DO UPDATE SET "
+                "strip=excluded.strip, set_at=excluded.set_at",
+                (store_mod.OWNER, session_id, 1 if strip else 0, time.time()))
+            con.commit()
+    except Exception as e:
+        print(f"[strip] guard-latch persist failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _delete_strip_guard_latch(session_id):
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            con.execute("DELETE FROM strip_guard_latch WHERE owner=? AND session_id=?",
+                        (store_mod.OWNER, session_id))
+            con.commit()
+    except Exception as e:
+        print(f"[strip] guard-latch delete failed for {session_id[:12]}…: {e}", flush=True)
+
+
+def _strip_guard_set_latch(session_id, strip):
+    """Latch the strip/no-strip decision for a session (in-memory + persisted)."""
+    if not session_id:
+        return
+    _STRIP_GUARD_LATCH[session_id] = bool(strip)
+    _persist_strip_guard_latch(session_id, bool(strip))
+
+
+def _incoming_thinking_prefix_warm(obj, earliest):
+    """True iff some INCOMING (as-received, pre-strip) prefix that INCLUDES the
+    first prior thinking block (depth > earliest) is warm — i.e. this exact
+    unstripped byte-lineage carrying the thinking is already cached, so a strip
+    would BUST it. Only depths > earliest differ between the stripped/unstripped
+    forms; shallower prefixes (before any thinking) are byte-identical either way
+    and MUST be excluded — counting them would misread an established STRIPPED
+    lineage (whose shallow prefixes are warm too) as warm-unstripped and stop us
+    stripping it, re-introducing the flap. Returns False on cold/absent (safe to
+    strip: fresh, or an established stripped lineage whose unstripped bytes were
+    never sent), None when the ledger can't judge. Batched query, mirrors
+    _compact_history_warmth."""
+    if not warmth_mod.WARMTH_LEDGER:
+        return None
+    msgs = obj.get("messages") or []
+    depths = list(range(len(msgs) - 1, earliest, -1))   # prefixes that contain msg[earliest]
+    if not depths:
+        return False
+    hashes = _prefix_hashes(obj)
+    try:
+        rows = warmth_mod._warmth_rows([hashes[d] for d in depths])
+    except Exception:
+        return None
+    now = time.time()
+    for d in depths:
+        r = rows.get(hashes[d])
+        if r and r[2] > now:
+            return True
+    return False
+
+
+def _strip_thinking_guard_decision(obj, sid, ratio, earliest):
+    """Sticky, cold-gated strip/no-strip decision (anti-flap). Returns
+    (should_strip: bool, reason: str). Once latched per session the latch is
+    reused verbatim, so the decision cannot flip turn-to-turn. The latch is only
+    ESTABLISHED on a cold/absent incoming thinking-prefix (the first decision then
+    rides an unavoidable cold write); on a warm prefix with no latch we decline
+    without latching (don't bust; a later cold moment latches). The cold decision
+    preserves the validated monster-ratio stance (ratio > MAX -> no-strip) — it
+    just makes it sticky."""
+    if sid is not None and sid in _STRIP_GUARD_LATCH:
+        latched = _STRIP_GUARD_LATCH[sid]
+        return latched, ("latched_strip" if latched else "latched_no_strip")
+    warm = _incoming_thinking_prefix_warm(obj, earliest)
+    if warm is None:            # ledger can't judge -> conservative: don't strip, don't latch
+        return False, "warmth_unknown"
+    if warm:                    # established warm (unstripped) lineage -> don't originate a bust
+        return False, "warm_no_latch"
+    # COLD/ABSENT: make the durable decision now (rides the cold write) + latch it.
+    # DECISION B (clodex, v0.4.35): always strip from cold. The old monster-ratio
+    # tiebreaker (ratio > MAX -> no-strip) existed SOLELY to avoid a warm re-cache
+    # bust; cold-gating already eliminates that bust, so the ratio is vestigial at
+    # the cold decision point. Stripping from cold is free reclaim even on
+    # tool-heavy (thinking-sparse) sessions — small-but-positive, never a loss —
+    # and it makes a consumer's explicit L1 opt-in actually take effect everywhere
+    # instead of silently no-op'ing on the heavy sessions they'd most want it on.
+    # `ratio` is still recorded for observability. (If the strip on/off QUALITY
+    # A/B ever shows stripping hurts tool-heavy sessions, that's a quality
+    # special-case on quality evidence — NOT a reason to revive the economics
+    # ratio.) STRIP_THINK_MAX_BODY_RATIO is retained only as the ratio>0 legacy
+    # kill knob below for one-off experiments; default path always strips.
+    decision = True
+    if STRIP_GUARD_COLD_RATIO and STRIP_THINK_MAX_BODY_RATIO > 0 and ratio > STRIP_THINK_MAX_BODY_RATIO:
+        decision = False        # experimental opt-in only (default off): old A behavior
+    _strip_guard_set_latch(sid, decision)
+    return decision, ("cold_latch_strip" if decision else "cold_latch_no_strip")
+
+
 def _ws_resolve_strip_thinking(pairs):
     """Last `strip-thinking <on|off>` directive in the merged pair stream wins ->
     True / False, or None if none present (bare directive = on). Vocabulary lives
@@ -1420,10 +1556,21 @@ def _strip_prior_thinking(obj, agent_id=None):
         return None                       # no prior thinking to strip
     prior_body = sum(_msg_nonthinking_chars(m) for m in prior)
     ratio = round(prior_body / prior_think, 2)
-    if STRIP_THINK_MAX_BODY_RATIO > 0 and ratio > STRIP_THINK_MAX_BODY_RATIO:
-        # MONSTER GUARD: tool-output-dominated history -> skip (re-cache loses).
-        return {"stripped": False, "skipped_reason": "body_thinking_ratio",
+    # First prior thinking index = where a strip would first change bytes (the
+    # bust point). Needed for the cold-gate warmth check below + edit-ack riding.
+    first_think = next((i for i, m in enumerate(prior)
+                        if m.get("role") == "assistant" and _msg_thinking_chars(m)), None)
+    # STICKY COLD-GATED GUARD (anti-flap): decide once per session, latch it, and
+    # only establish the latch on a cold prefix (so it never originates a warm
+    # bust). Replaces the per-turn ratio recompute that flapped across the
+    # threshold and busted warm prefixes.
+    sid = (writer_mod._session_ids(obj) or [None])[0]
+    should_strip, decision_reason = _strip_thinking_guard_decision(
+        obj, sid, ratio, first_think if first_think is not None else 0)
+    if not should_strip:
+        return {"stripped": False, "skipped_reason": decision_reason,
                 "body_thinking_ratio": ratio, "max_body_ratio": STRIP_THINK_MAX_BODY_RATIO,
+                "guard_latch": _STRIP_GUARD_LATCH.get(sid),
                 "prior_thinking_chars": prior_think, "prior_body_chars": prior_body,
                 "boundary_idx": last_user, "total_messages": len(msgs)}
     removed = stripped_chars = touched_msgs = 0
@@ -1453,6 +1600,7 @@ def _strip_prior_thinking(obj, agent_id=None):
         return None
     return {"stripped": True, "removed_thinking_blocks": removed, "touched_messages": touched_msgs,
             "stripped_chars": stripped_chars, "body_thinking_ratio": ratio,
+            "guard_latch": _STRIP_GUARD_LATCH.get(sid), "guard_reason": decision_reason,
             "earliest_idx": earliest,     # edit-ack strip rides this bust point
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
