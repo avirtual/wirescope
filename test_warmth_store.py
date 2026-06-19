@@ -2792,13 +2792,15 @@ lp.transforms._ws_forget("sess-forget")
 check("strip override: _ws_forget drops the per-session override",
       "sess-forget" not in lp.transforms._STRIP_OVERRIDE)
 # resolver vocabulary
-check("strip override: resolver maps on/off/bare/last-wins",
-      lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "on")]) is True
-      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "off")]) is False
-      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "")]) is True
+check("strip override: resolver maps off/on/l1/l2/bare/last-wins to LEVEL",
+      lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "on")]) == 1
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "off")]) == 0
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "l1")]) == 1
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "l2")]) == 2
+      and lp.transforms._ws_resolve_strip_thinking([("strip-thinking", "")]) == 1
       and lp.transforms._ws_resolve_strip_thinking([("omit", "x")]) is None
       and lp.transforms._ws_resolve_strip_thinking(
-          [("strip-thinking", "on"), ("strip-thinking", "off")]) is False)
+          [("strip-thinking", "l2"), ("strip-thinking", "off")]) == 0)
 # PERSISTENCE / anti-flap: an override survives an in-memory wipe via SQLite
 # reload (a restart must not silently flip strip state against a warm cache).
 lp.transforms._strip_thinking_set_override("sess-persist", True)
@@ -2810,7 +2812,7 @@ check("strip override: endpoint setter write-throughs to SQLite",
 lp.transforms._STRIP_OVERRIDE.clear()                       # simulate a restart
 _n_reload = lp.restore._restore_strip_overrides()
 check("strip override: survives a restart (reload restores the dict)",
-      lp.transforms._STRIP_OVERRIDE.get("sess-persist") is True)
+      lp.transforms._STRIP_OVERRIDE.get("sess-persist") == 1)
 # clearing the override deletes the persisted row (no stale resurrection)
 lp.transforms._strip_thinking_set_override("sess-persist", None)
 check("strip override: clearing deletes the persisted row",
@@ -2824,6 +2826,29 @@ check("strip override: _ws_forget deletes the persisted row too",
       lp.store.db().execute(
           "SELECT 1 FROM strip_override WHERE owner=? AND session_id=?",
           (lp.store.OWNER, "sess-forget2")).fetchone() is None)
+lp.transforms._STRIP_OVERRIDE.clear()
+# --- L2 strip level: L2 = L1 + the shady bust-riders -------------------------
+# level 2 sets thinking ON (L1) AND opens the L2 gate; persists + reloads as 2.
+lp.transforms._strip_thinking_set_override("sess-l2", 2)
+check("strip level: L2 setter -> level 2 enables both L1 and L2 gates",
+      lp.transforms._STRIP_OVERRIDE.get("sess-l2") == 2)
+_l2obj = {"metadata": {"user_id": json.dumps({"session_id": "sess-l2"})},
+          "messages": [{"role": "user", "content": "x"}]}
+check("strip level: L2 -> _strip_thinking_enabled AND _strip_l2_enabled",
+      lp.transforms._strip_thinking_enabled(_l2obj) is True
+      and lp.transforms._strip_l2_enabled(_l2obj) is True)
+lp.transforms._strip_thinking_set_override("sess-l1", 1)
+_l1obj = {"metadata": {"user_id": json.dumps({"session_id": "sess-l1"})},
+          "messages": [{"role": "user", "content": "x"}]}
+check("strip level: L1 -> thinking enabled but L2 gate CLOSED",
+      lp.transforms._strip_thinking_enabled(_l1obj) is True
+      and lp.transforms._strip_l2_enabled(_l1obj) is False)
+lp.transforms._STRIP_OVERRIDE.clear()
+_n_reload2 = lp.restore._restore_strip_overrides()
+check("strip level: L2 level survives a restart (reloads as int 2)",
+      lp.transforms._STRIP_OVERRIDE.get("sess-l2") == 2)
+lp.transforms._strip_thinking_set_override("sess-l2", None)
+lp.transforms._strip_thinking_set_override("sess-l1", None)
 lp.transforms._STRIP_OVERRIDE.clear()
 lp.transforms.STRIP_PRIOR_THINKING, lp.transforms.STRIP_THINK_MAX_BODY_RATIO = _spt_save
 

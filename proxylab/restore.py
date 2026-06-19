@@ -199,7 +199,7 @@ def _restore_strip_overrides():
             rows = con.execute("SELECT session_id, enabled FROM strip_override "
                                "WHERE owner=?", (store_mod.OWNER,)).fetchall()
         for sid, enabled in rows:
-            transforms_mod._STRIP_OVERRIDE[sid] = bool(enabled)
+            transforms_mod._STRIP_OVERRIDE[sid] = int(enabled)   # level 0/1/2
         return len(rows)
     except Exception as e:
         print(f"[restore] strip_overrides failed: {e}", flush=True)

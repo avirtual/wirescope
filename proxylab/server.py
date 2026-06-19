@@ -398,40 +398,51 @@ async def handler(request: Request) -> Response:
         return Response(json.dumps(res), media_type="application/json")
 
     # ---- per-session strip-prior-thinking toggle (consumer opt-in) ------------
-    # GET  /_strip?session=<id>            -> current effective override (read-only)
-    # POST /_strip?session=<id>&on=1       -> turn prior-thinking stripping ON
-    # POST /_strip?session=<id>&on=0       -> turn it OFF (force, even if global on)
+    # GET  /_strip?session=<id>             -> current effective level (read-only)
+    # POST /_strip?session=<id>&level=2     -> set the strip LEVEL (0 off / 1 L1
+    #                                          thinking / 2 L2 = L1 + bust-riders)
+    # POST /_strip?session=<id>&on=1|0      -> legacy bool twin (on=L1, off=level 0)
     # POST /_strip?session=<id>&action=clear -> drop the override (fall back global)
-    # The programmatic twin of the `[wirescope:strip-thinking on]` directive, so a
-    # consumer (clodex) can flip an agent from its UI without a forwarded turn.
-    # Body convention: HTTP status = request validity, outcome in the JSON.
+    # The programmatic twin of the `[wirescope:strip-thinking <off|on|l2>]`
+    # directive, so a consumer (clodex) can flip an agent from its UI without a
+    # forwarded turn. Body convention: HTTP status = request validity, outcome in
+    # the JSON. `effective`/`override` are int levels; `enabled` mirrors level>=1.
     if request.url.path.rstrip("/") == "/_strip":
         q = request.query_params
         sess = q.get("session")
         if not sess:
             return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
                             status_code=400, media_type="application/json")
+        gdef = transforms_mod._global_strip_level()
+
+        def _body(override):
+            eff = override if override is not None else gdef
+            return {"ok": True, "session": sess, "override": override,
+                    "global_default": gdef, "effective": eff,
+                    "enabled": eff >= 1, "l2": eff >= 2}
         if request.method == "GET":
-            cur = transforms_mod._STRIP_OVERRIDE.get(sess)
-            return Response(json.dumps(
-                {"ok": True, "session": sess, "override": cur,
-                 "global_default": transforms_mod.STRIP_PRIOR_THINKING,
-                 "effective": cur if cur is not None else transforms_mod.STRIP_PRIOR_THINKING}),
-                media_type="application/json")
+            return Response(json.dumps(_body(transforms_mod._STRIP_OVERRIDE.get(sess))),
+                            media_type="application/json")
         action = (q.get("action") or "").lower()
+        level_raw = q.get("level")
         on_raw = q.get("on")
-        if action == "clear" or on_raw in ("clear", "none"):
+        if action == "clear" or on_raw in ("clear", "none") or level_raw in ("clear", "none"):
             new = transforms_mod._strip_thinking_set_override(sess, None)
+        elif level_raw is not None:
+            lv = {"l1": 1, "l2": 2}.get(level_raw.lower())
+            if lv is None:
+                try:
+                    lv = int(level_raw)
+                except ValueError:
+                    return Response(json.dumps({"ok": False, "session": sess,
+                                    "reason": f"bad level={level_raw!r} (0|1|2|l1|l2)"}),
+                                    status_code=400, media_type="application/json")
+            new = transforms_mod._strip_thinking_set_override(sess, lv)
         else:
             on = (on_raw in ("1", "yes", "on", "true")) if on_raw is not None else True
-            new = transforms_mod._strip_thinking_set_override(sess, on)
-        print(f"[strip] session={sess[:12]}… override={new} "
-              f"(global={transforms_mod.STRIP_PRIOR_THINKING})", flush=True)
-        return Response(json.dumps(
-            {"ok": True, "session": sess, "override": new,
-             "global_default": transforms_mod.STRIP_PRIOR_THINKING,
-             "effective": new if new is not None else transforms_mod.STRIP_PRIOR_THINKING}),
-            media_type="application/json")
+            new = transforms_mod._strip_thinking_set_override(sess, 1 if on else 0)
+        print(f"[strip] session={sess[:12]}… level={new} (global={gdef})", flush=True)
+        return Response(json.dumps(_body(new)), media_type="application/json")
 
     # ---- subscriber registry: app-agnostic push feed (see SUBSCRIBERS.md) -----
     # GET/POST/DELETE /_subscribe — consumers register an endpoint + agent globs
@@ -623,6 +634,18 @@ async def handler(request: Request) -> Response:
             if sea:
                 record["strip_prior_edit_acks"] = sea
                 if sea.get("collapsed_edit_acks"):
+                    changed = True
+            # STUB PRIOR-TURN FAILED CALLS (experimental, scratch-port A/B; OFF on
+            # :7800): a failed Edit etc. re-rides as the fat tool_use input + its
+            # is_error result; in a completed prior turn the recovery is already
+            # recorded downstream, so both halves are deadweight. Free-rides the
+            # SAME thinking-strip bust as the edit-ack strip (busted_from=None ->
+            # strips nothing). Current turn's error kept (live retry signal).
+            ste = transforms_mod._strip_prior_tool_errors(
+                obj, agent_id=agent_id, busted_from=busted_from)
+            if ste:
+                record["strip_prior_tool_errors"] = ste
+                if ste.get("stubbed_error_results") or ste.get("stubbed_failed_calls"):
                     changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the

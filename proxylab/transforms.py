@@ -1192,6 +1192,17 @@ try:
 except ValueError:
     STRIP_THINK_MAX_BODY_RATIO = 4.0
 
+# STRIP LEVELS (per-session, consumer-tiered — mirrors clodex's Off / L1 / L2):
+#   0 = off, 1 = L1 (prior-turn thinking only — the conservative, defensible tier
+#   clodex already opts sessions into), 2 = L2 = L1 PLUS the shadier bust-RIDING
+#   strips (failed-call stubbing + edit-ack collapse). L2 strictly contains L1:
+#   the riders gate on busted_from (the thinking-strip's bust), so they are no-ops
+#   unless L1 actually stripped this turn — "L2 is L1 + some more" is the literal
+#   runtime dependency, which is why a LEVEL (not two independent bools) is the
+#   right model. STRIP_L2 is the deployment default-level knob (implies thinking);
+#   per-session it's set by `[wirescope:strip-thinking l2]` / `/_strip?level=2`.
+STRIP_L2 = os.environ.get("STRIP_L2", "0") not in ("0", "no", "off", "false")
+
 # EXPERIMENTAL (scratch-port A/B): merciless class-strip of prior-turn Read
 # results — replace each Read tool_result body in COMPLETED prior turns with the
 # CLI's own cleared-marker, keeping the envelope + tool_use_id (byte-stable,
@@ -1244,6 +1255,29 @@ _EDIT_ACK_FRAGMENTS = (
     "All occurrences were successfully replaced",
 )
 
+# STRIP PRIOR-TURN TOOL ERRORS (experimental, scratch-port A/B; OFF on :7800).
+# A failed tool call (e.g. an Edit whose old_string didn't match) re-rides the
+# wire forever as TWO fat paired blocks: the assistant `tool_use` (its `input`
+# carries the whole old_string + new_string the model tried) and the user
+# `tool_result` (`is_error`, echoing old_string back + a hint paragraph). In the
+# turn it happened the error is load-bearing — it's how the model knows to
+# re-Read and retry. But in a COMPLETED prior turn the recovery (read + corrected
+# edit + its success ack) is already recorded downstream, so the failed call is a
+# breadcrumb to a destination the transcript already reached: pure deadweight.
+# We stub BOTH sides (paired by tool_use_id) — the model's framing ("the failed
+# edit is discardable later") taken to its conclusion, since the assistant-side
+# input is the larger half. Class+position only (any is_error before the
+# boundary), never relational — byte-stable as the boundary advances, like the
+# read/thinking strips. SAME economics as the edit-ack strip: stubbing busts the
+# message cache from the strip point, so it pays ONLY as a FREE-RIDER inside the
+# region the thinking-strip ALREADY busted this turn (busted_from..last_user);
+# originating its own bust to reclaim bursty error text is the ~1400-turn loss.
+STRIP_PRIOR_TOOL_ERRORS = os.environ.get("STRIP_PRIOR_TOOL_ERRORS", "0") not in ("0", "no", "off", "false")
+ERROR_ELIDED_MARKER = "[Tool error elided: resolved in a later turn]"
+# Constant stub for a failed call's assistant-side `input` (envelope id/type/name
+# kept for pairing + API validity; only the args object is replaced). Byte-stable.
+ERROR_CALL_STUB = {"_elided": "prior failed call, superseded"}
+
 # PER-SESSION OVERRIDE of the global STRIP_PRIOR_THINKING flag, so a CONSUMER app
 # (clodex) can opt INDIVIDUAL agents in (or out) while the proxy ships the flag
 # globally OFF — the "marketing trick": stock proxy is conservative, the app
@@ -1253,7 +1287,8 @@ _EDIT_ACK_FRAGMENTS = (
 # we remember it so it persists across the session's later (directive-less) turns.
 # transforms OWNS + mutates this; the pinger sweep drops it via _ws_forget. In
 # memory only (a directive-driven override self-heals on the next directive turn;
-# the endpoint re-asserts after a restart). session_id -> bool.
+# the endpoint re-asserts after a restart). session_id -> int LEVEL (0/1/2; see
+# STRIP LEVELS above). Legacy bool persistence reads back as 0/1, fully compatible.
 _STRIP_OVERRIDE = {}
 
 # PERSISTENCE (restart-amnesia / anti-flap): the per-session strip decision is
@@ -1271,10 +1306,11 @@ store_mod.register_schema(
     "PRIMARY KEY (owner, session_id))")
 
 
-def _persist_strip_override(session_id, enabled):
-    """Mirror a strip override to SQLite so a restart can't drop it (which would
-    flip strip state against a warm cache and force a full re-write). A store
-    failure degrades to the old in-memory-only behavior."""
+def _persist_strip_override(session_id, level):
+    """Mirror a strip override LEVEL (0/1/2) to SQLite so a restart can't drop it
+    (which would flip strip state against a warm cache and force a full re-write).
+    The `enabled` column now stores the int level; legacy 0/1 rows still mean
+    off/L1. A store failure degrades to the old in-memory-only behavior."""
     try:
         con = store_mod.db()
         with store_mod.LOCK:
@@ -1282,7 +1318,7 @@ def _persist_strip_override(session_id, enabled):
                 "INSERT INTO strip_override(owner, session_id, enabled, set_at) "
                 "VALUES(?,?,?,?) ON CONFLICT(owner, session_id) DO UPDATE SET "
                 "enabled=excluded.enabled, set_at=excluded.set_at",
-                (store_mod.OWNER, session_id, 1 if enabled else 0, time.time()))
+                (store_mod.OWNER, session_id, int(level), time.time()))
             con.commit()
     except Exception as e:
         print(f"[strip] persist failed for {session_id[:12]}…: {e}", flush=True)
@@ -1434,52 +1470,77 @@ def _strip_thinking_guard_decision(obj, sid, ratio, earliest):
 
 
 def _ws_resolve_strip_thinking(pairs):
-    """Last `strip-thinking <on|off>` directive in the merged pair stream wins ->
-    True / False, or None if none present (bare directive = on). Vocabulary lives
-    here next to the section/tool resolvers."""
+    """Last `strip-thinking <off|on|l1|l2>` directive in the merged pair stream
+    wins -> an int LEVEL (0/1/2), or None if none present. `on`/`l1`/`1` = L1
+    (thinking only, the back-compat value clodex emits today); `l2`/`2` = L2
+    (L1 + the shady bust-riders); `off`/`0` = level 0; bare directive = L1.
+    Vocabulary lives here next to the section/tool resolvers."""
     val = None
     for name, value in pairs:
         if name == "strip-thinking":
             v = (value or "").strip().lower()
-            if v in ("", "on", "1", "true", "yes"):
-                val = True
+            if v in ("", "on", "1", "true", "yes", "l1"):
+                val = 1
             elif v in ("off", "0", "false", "no"):
-                val = False
+                val = 0
+            elif v in ("l2", "2"):
+                val = 2
     return val
 
 
-def _strip_thinking_set_override(session_id, on):
-    """Endpoint/programmatic setter for the per-session override (on=True/False,
-    or None to clear -> fall back to the global flag). Returns the effective
-    stored value (None when cleared)."""
+def _global_strip_level():
+    """Deployment default level when a session has no override: 2 if STRIP_L2
+    (implies thinking), else 1 if STRIP_PRIOR_THINKING, else 0."""
+    return 2 if STRIP_L2 else (1 if STRIP_PRIOR_THINKING else 0)
+
+
+def _strip_thinking_set_override(session_id, level):
+    """Endpoint/programmatic setter for the per-session override LEVEL: an int
+    0/1/2 (or True/False = 1/0 for the legacy `on=` API), or None to clear ->
+    fall back to the global default. Returns the effective stored value (None when
+    cleared). Level is clamped to 0..2."""
     if not session_id:
         return None
-    if on is None:
+    if level is None:
         _STRIP_OVERRIDE.pop(session_id, None)
         _delete_strip_override(session_id)
         return None
-    _STRIP_OVERRIDE[session_id] = bool(on)
-    _persist_strip_override(session_id, bool(on))
-    return _STRIP_OVERRIDE[session_id]
+    lvl = max(0, min(2, int(level)))     # True->1, False->0 via int()
+    _STRIP_OVERRIDE[session_id] = lvl
+    _persist_strip_override(session_id, lvl)
+    return lvl
 
 
-def _strip_thinking_enabled(obj, agent_id=None):
-    """Resolve whether prior-thinking stripping is ON for THIS request: a
-    `[wirescope:strip-thinking ...]` directive (body+spawn, sticky per session) or
-    a /_strip endpoint override takes precedence; otherwise the global flag. A
-    seen directive updates the sticky store. Reads body+spawn pairs directly (not
-    the sticky-spawn machinery) so it never perturbs _WS_SPAWN_MEMORY."""
+def _strip_level(obj, agent_id=None):
+    """Resolve the effective strip LEVEL (0/1/2) for THIS request: a
+    `[wirescope:strip-thinking <off|on|l2>]` directive (body+spawn, sticky per
+    session) or a /_strip override takes precedence; otherwise the global default
+    level. A seen directive updates the sticky store (on CHANGE only — this runs
+    several times per request). Reads body+spawn pairs directly so it never
+    perturbs _WS_SPAWN_MEMORY."""
     sid = (writer_mod._session_ids(obj) or [None])[0] if isinstance(obj, dict) else None
     if isinstance(obj, dict):
         pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
         directive = _ws_resolve_strip_thinking(pairs)
-        # Persist a directive-driven opt-in too, but only on CHANGE (this runs
-        # every request) so we don't hammer the store with no-op writes.
-        if sid and directive is not None and _STRIP_OVERRIDE.get(sid) is not directive:
+        if sid and directive is not None and _STRIP_OVERRIDE.get(sid) != directive:
             _strip_thinking_set_override(sid, directive)
     if sid is not None and sid in _STRIP_OVERRIDE:
         return _STRIP_OVERRIDE[sid]
-    return STRIP_PRIOR_THINKING
+    return _global_strip_level()
+
+
+def _strip_thinking_enabled(obj, agent_id=None):
+    """L1+ gate: prior-thinking stripping is ON when the effective level >= 1.
+    (Kept as the public name; the chain calls this both to decide and to persist
+    the resolved directive before the line is stripped from the wire.)"""
+    return _strip_level(obj, agent_id) >= 1
+
+
+def _strip_l2_enabled(obj, agent_id=None):
+    """L2 gate: the shady bust-riding strips (failed-call stubbing, edit-ack
+    collapse) run when the effective level >= 2 (or their own scratch-A/B global
+    flag is set — checked by the callers)."""
+    return _strip_level(obj, agent_id) >= 2
 
 
 def _is_real_user_turn(m):
@@ -1699,8 +1760,11 @@ def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
     earliest stripped index; when None (thinking didn't fire / declined) we collapse
     NOTHING — originating a fresh bust to reclaim ~1.4k tok/turn is a ~1400-turn
     loss. Byte-stable envelope (tool_use_id + type kept). Gated by
-    STRIP_PRIOR_EDIT_ACKS. Returns a log dict or None."""
-    if not isinstance(obj, dict) or not STRIP_PRIOR_EDIT_ACKS:
+    the per-session L2 level (or the STRIP_PRIOR_EDIT_ACKS scratch-A/B flag).
+    Returns a log dict or None."""
+    if not isinstance(obj, dict):
+        return None
+    if not (STRIP_PRIOR_EDIT_ACKS or _strip_l2_enabled(obj, agent_id)):
         return None
     if busted_from is None:               # no already-busted region to ride -> skip
         return None
@@ -1747,6 +1811,99 @@ def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
     return {"stripped": True, "collapsed_edit_acks": collapsed,
             "touched_messages": touched_msgs, "stripped_chars": stripped_chars,
             "rode_bust_from": busted_from,  # free-rode the thinking-strip bust here
+            "boundary_idx": last_user, "total_messages": len(msgs)}
+
+
+def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
+    """Stub both halves of a FAILED tool call in COMPLETED prior turns: the
+    assistant `tool_use.input` (the fat old_string/new_string the model tried)
+    AND its paired error `tool_result.content`, matched by tool_use_id. A call is
+    "failed" iff its result carries a truthy `is_error`. Envelopes preserved
+    (tool_use id/type/name; result tool_use_id/type/is_error) — only the args
+    object / body string are replaced with byte-stable constants, so the API
+    pairing holds and the stripped prefix stays stable as the boundary advances.
+    ECONOMIC GATE — identical to the edit-ack strip: confined to [busted_from,
+    last_user), the region the thinking-strip ALREADY busted this turn; with
+    busted_from None (thinking didn't fire/declined) we strip NOTHING, since
+    originating a fresh bust to reclaim bursty error text is a ~1400-turn loss.
+    Current turn untouched (its error is the live retry signal). Gated by
+    the per-session L2 level (or the STRIP_PRIOR_TOOL_ERRORS scratch-A/B flag).
+    Returns a log dict or None."""
+    if not isinstance(obj, dict):
+        return None
+    if not (STRIP_PRIOR_TOOL_ERRORS or _strip_l2_enabled(obj, agent_id)):
+        return None
+    if busted_from is None:               # no already-busted region to ride -> skip
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
+    if last_user <= 0:
+        return None
+    # Pass 1 (user side): stub error result bodies in the busted region; collect
+    # their tool_use_ids so pass 2 can find the matching failed calls.
+    error_ids = set()
+    stripped_chars = stubbed_results = stubbed_calls = touched_msgs = 0
+    for i, m in enumerate(msgs):
+        if i < busted_from or i >= last_user or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        touched = False
+        for blk in c:
+            if not (isinstance(blk, dict) and blk.get("type") == "tool_result"
+                    and blk.get("is_error")):
+                continue
+            tuid = blk.get("tool_use_id")
+            if tuid is not None:
+                error_ids.add(tuid)
+            body = blk.get("content")
+            if body == ERROR_ELIDED_MARKER:        # idempotent: already stubbed
+                continue
+            n = len(body) if isinstance(body, str) else len(json.dumps(body, default=str))
+            if n <= len(ERROR_ELIDED_MARKER):       # nothing to reclaim
+                continue
+            blk["content"] = ERROR_ELIDED_MARKER
+            stripped_chars += n - len(ERROR_ELIDED_MARKER)
+            stubbed_results += 1
+            touched = True
+        if touched:
+            touched_msgs += 1
+    if not error_ids:
+        return None
+    # Pass 2 (assistant side): stub the input of each failed tool_use in the
+    # busted region whose id matched an error result (the larger half).
+    stub_len = len(json.dumps(ERROR_CALL_STUB, default=str))
+    for i, m in enumerate(msgs):
+        if i < busted_from or i >= last_user or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        touched = False
+        for blk in c:
+            if not (isinstance(blk, dict) and blk.get("type") == "tool_use"
+                    and blk.get("id") in error_ids):
+                continue
+            inp = blk.get("input")
+            if inp == ERROR_CALL_STUB:             # idempotent: already stubbed
+                continue
+            n = len(json.dumps(inp, default=str)) if inp is not None else 0
+            if n <= stub_len:                       # nothing to reclaim
+                continue
+            blk["input"] = dict(ERROR_CALL_STUB)
+            stripped_chars += n - stub_len
+            stubbed_calls += 1
+            touched = True
+        if touched:
+            touched_msgs += 1
+    if not (stubbed_results or stubbed_calls):
+        return None
+    return {"stripped": True, "stubbed_error_results": stubbed_results,
+            "stubbed_failed_calls": stubbed_calls, "touched_messages": touched_msgs,
+            "stripped_chars": stripped_chars, "rode_bust_from": busted_from,
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
 
