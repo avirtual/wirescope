@@ -400,6 +400,7 @@ def _sweep_state(now=None):
     # sweep is a cross-cutting teardown (like the meta_mod pops below) so reaching
     # into transforms' own sticky store for hygiene is consistent.
     from proxylab import transforms as _transforms_mod
+    from proxylab import fold as _fold_mod
     for sid in stale:
         # companion debug state rides the same staleness verdict (since the
         # /_end redesign nothing else deletes it; ended markers + session_meta
@@ -410,6 +411,7 @@ def _sweep_state(now=None):
         meta_mod._SUBAGENTS.pop(sid, None)
         meta_mod._SUBAGENT_LAST_REQ.pop(sid, None)
         _transforms_mod._ws_forget(sid)   # sticky wirescope spawn memory
+        _fold_mod._forget(sid)            # fold maps + override
         meta_mod.writer_mod._forget_session_fp(sid)   # main-line fingerprint
     purged = heads = 0
     try:

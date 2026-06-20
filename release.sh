@@ -27,6 +27,7 @@ fi
 echo "running test suites…"
 python3 test_warmth_store.py >/dev/null
 python3 test_subscribers.py >/dev/null
+python3 test_fold.py >/dev/null
 echo "tests OK"
 
 git tag -a "$VERSION" -m "proxy release $VERSION"

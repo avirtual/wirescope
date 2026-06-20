@@ -26,6 +26,7 @@ from proxylab import billing as billing_mod
 from proxylab import canary as canary_mod
 from proxylab import codex as codex_mod
 from proxylab import core as core_mod
+from proxylab import fold as fold_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
@@ -938,6 +939,18 @@ async def handler(request: Request) -> Response:
             if ste:
                 record["strip_prior_tool_errors"] = ste
                 if ste.get("stubbed_error_results") or ste.get("stubbed_failed_calls"):
+                    changed = True
+            # FOLD same-turn Read+Edit chains: apply the edit onto the Read body
+            # so downstream turns see the file's FINAL shape directly, and stub
+            # the now-redundant Edit input + ack. Deterministic + memoized ->
+            # byte-stable across turns (warm after the transition turn). Default
+            # OFF; per-session opt-in via `[wirescope:fold-reads on]`. Settled
+            # turns only (current turn's read+edit stay live until they're
+            # history). See proxylab/fold.py.
+            fld = fold_mod.fold_read_edits(obj, agent_id=agent_id)
+            if fld:
+                record["fold_read_edits"] = fld
+                if fld.get("folded_read_bodies") or fld.get("stubbed_edit_calls") or fld.get("stubbed_edit_acks"):
                     changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the
