@@ -27,7 +27,7 @@ from proxylab import transforms as transforms_mod
 # (the in-memory path; no DB write, no directive needed). Cleanup drops the memo
 # maps AND the strip override/latch so tests stay isolated.
 def _enable_fold(sid):
-    transforms_mod._STRIP_OVERRIDE[sid] = 3
+    transforms_mod._STRIP_OVERRIDE[sid] = 2   # fold is part of L2 (>=2)
 
 
 def _cleanup(sid):
@@ -262,9 +262,10 @@ def test_directive_resolved_before_strip():
     """REGRESSION (scratch arm, v0.6.5): a strip-level directive rides the system
     body and is STRIPPED off the wire by _ws_strip_directives. The server resolves
     the strip level EARLY (via _strip_thinking_enabled, before that strip), so fold
-    — gated on level>=3 — still sees L3 by the time it runs. Fold is now level 3,
-    so the opt-in is `[wirescope:strip-thinking l3]`; this exercises the same early-
-    resolve path that makes the bug structurally impossible."""
+    — gated on level>=2 — still sees L2 by the time it runs. Fold is part of L2,
+    so the opt-in is `[wirescope:strip-thinking l2]` (the legacy `l3` here also
+    works — it clamps to L2 — exercising both the back-compat alias and the same
+    early-resolve path that makes the bug structurally impossible)."""
     from proxylab import transforms as t
     rid, eid = "tu_dr", "tu_de"
     sysblk = [{"type": "text", "text": "You are helpful.\n[wirescope:strip-thinking l3]"}]
@@ -289,18 +290,18 @@ def test_directive_resolved_before_strip():
     t._strip_thinking_enabled(o)          # EARLY resolve (sets strip level override)
     t._ws_strip_directives(o)             # strips the directive off the wire
     assert "strip-thinking" not in json.dumps(o["system"]), "directive should be stripped"
-    assert t._strip_level(o) == 3, "L3 directive must have set the override"
+    assert t._strip_level(o) == 2, "l3 directive must clamp to L2 override"
     r = fold.fold_read_edits(o)           # later in the chain
-    assert r and r["folded_read_bodies"] == 1, f"L3 directive must survive as override: {r}"
+    assert r and r["folded_read_bodies"] == 1, f"L2 directive must survive as override: {r}"
     assert o["messages"][2]["content"][0]["content"] == "1\tone\n2\tTWO\n"
     _cleanup("S-dir")
     # clean the persisted strip_override row the directive path wrote
     t._delete_strip_override("S-dir")
-    print("ok  directive (L3) resolved before strip (v0.6.5 regression)")
+    print("ok  directive (l3->L2) resolved before strip (v0.6.5 regression)")
 
 
 def test_disabled_below_l3():
-    """Fold is OFF at levels 0/1/2 and ON at 3."""
+    """Fold is OFF at levels 0/1 and ON at 2 (fold is part of L2)."""
     def mk():
         return {"metadata": {"user_id": json.dumps({"session_id": "S-off"})},
                 "messages": [
@@ -317,14 +318,14 @@ def test_disabled_below_l3():
                     {"role": "assistant", "content": [{"type": "text", "text": "k"}]},
                     {"role": "user", "content": [{"type": "text", "text": "next"}]},
                 ]}
-    for lvl in (0, 1, 2):
+    for lvl in (0, 1):
         _cleanup("S-off")
         transforms_mod._STRIP_OVERRIDE["S-off"] = lvl
         assert fold.fold_read_edits(mk()) is None, f"fold must be off at level {lvl}"
     _cleanup("S-off"); _enable_fold("S-off")
-    assert fold.fold_read_edits(mk()) is not None, "fold must be on at level 3"
+    assert fold.fold_read_edits(mk()) is not None, "fold must be on at level 2"
     _cleanup("S-off")
-    print("ok  fold off at levels 0/1/2, on at 3")
+    print("ok  fold off at levels 0/1, on at 2")
 
 
 # --------------------------------------------------------------- replay tests

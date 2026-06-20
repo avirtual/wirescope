@@ -940,13 +940,15 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_tool_errors"] = ste
                 if ste.get("stubbed_error_results") or ste.get("stubbed_failed_calls"):
                     changed = True
-            # FOLD same-turn Read+Edit chains (STRIP LEVEL 3): apply the edit onto
-            # the Read body so downstream turns see the file's FINAL shape
-            # directly, and stub the now-redundant Edit input + ack. Deterministic
-            # + memoized -> byte-stable across turns (warm after the transition
-            # turn). Gated by the L3 strip level (`[wirescope:strip-thinking l3]` /
-            # /_strip?level=3 / STRIP_L3) — no separate flag. Settled turns only
-            # (current turn's read+edit stay live until history). See fold.py.
+            # FOLD same-turn Read+Edit chains (part of STRIP LEVEL 2): apply the
+            # edit onto the Read body so downstream turns see the file's FINAL
+            # shape directly, and stub the now-redundant Edit input + ack.
+            # Deterministic + memoized -> byte-stable across turns (warm after the
+            # transition turn). Gated by the L2 strip level
+            # (`[wirescope:strip-thinking l2]` / /_strip?level=2 / STRIP_L2) — no
+            # separate flag, runs alongside the other L2 optimizations. Settled
+            # turns only (current turn's read+edit stay live until history). See
+            # fold.py.
             fld = fold_mod.fold_read_edits(obj, agent_id=agent_id)
             if fld:
                 record["fold_read_edits"] = fld

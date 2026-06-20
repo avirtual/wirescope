@@ -44,14 +44,15 @@ session eats one deeper re-cache — the accepted price of a deliberate per-sess
 opt-in (same stance as the L2 strips), not an automatic decision that needs the
 cold-gate.
 
-GATING — fold is STRIP LEVEL 3 (L3 = L2 + fold). It is NOT a separate
-flag/table/directive: it rides the existing consumer-tiered strip ladder
-(transforms.STRIP LEVELS), gated by `transforms._strip_l3_enabled` (effective
-level >= 3). That intent already persists in `strip_override` and is resolved
-EARLY in the chain (via `_strip_thinking_enabled`, before the directive strip),
-so fold inherits the durable-across-restart override AND is immune to the
+GATING — fold is part of STRIP LEVEL 2 (L2 = bust-riders + fold). It is NOT a
+separate flag/table/directive: it rides the existing consumer-tiered strip
+ladder (transforms.STRIP LEVELS), gated by `transforms._strip_l2_enabled`
+(effective level >= 2). That intent already persists in `strip_override` and is
+resolved EARLY in the chain (via `_strip_thinking_enabled`, before the directive
+strip), so fold inherits the durable-across-restart override AND is immune to the
 directive-before-strip race for free. Per-session: `[wirescope:strip-thinking
-l3]` / `/_strip?level=3`; global default: STRIP_L3. This module therefore owns
+l2]` / `/_strip?level=2`; global default: STRIP_L2. (Fold moved L3->L2 2026-06-20
+so it runs alongside the other L2 optimizations; L3 retired.) This module owns
 NO table — only its in-memory MEMO maps (deterministically recomputable).
 
 OWNERSHIP. Wired into the server transform chain after the strips, before the
@@ -340,12 +341,12 @@ def writer_mod_is_real_user_turn(m):
 
 def fold_read_edits(obj, agent_id=None):
     """Fold settled same-turn Read+Edit chains. Returns a log dict, or None when
-    disabled (strip level < 3) / nothing to do. Mutates obj["messages"] in place.
-    Gate = transforms._strip_l3_enabled (fold IS strip level 3)."""
+    disabled (strip level < 2) / nothing to do. Mutates obj["messages"] in place.
+    Gate = transforms._strip_l2_enabled (fold is part of strip level 2)."""
     if not isinstance(obj, dict):
         return None
     from proxylab import transforms as _t
-    if not _t._strip_l3_enabled(obj, agent_id):
+    if not _t._strip_l2_enabled(obj, agent_id):
         return None
     sid = (writer_mod._session_ids(obj) or [None])[0]
     msgs = obj.get("messages")

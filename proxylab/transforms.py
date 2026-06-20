@@ -1195,16 +1195,15 @@ except ValueError:
 # STRIP LEVELS (per-session, consumer-tiered — mirrors clodex's Off / L1 / L2 / L3):
 #   0 = off, 1 = L1 (prior-turn thinking only — the conservative, defensible tier
 #   clodex already opts sessions into), 2 = L2 = L1 PLUS the shadier bust-RIDING
-#   strips (failed-call stubbing + edit-ack collapse), 3 = L3 = L2 PLUS READ+EDIT
-#   FOLD (apply same-turn edits onto the Read buffer, stub the redundant edit;
-#   proxylab/fold.py). L2 strictly contains L1 (the riders gate on busted_from);
-#   L3 contains L2 (a strict capability ladder) — fold is independent of the
-#   thinking bust but rides the SAME consumer opt-in channel, so it's a LEVEL, not
-#   a separate flag/table/directive. STRIP_L2/STRIP_L3 are the deployment
-#   default-level knobs; per-session it's `[wirescope:strip-thinking l2|l3]` /
-#   `/_strip?level=2|3`.
+#   strips (failed-call stubbing + edit-ack collapse) PLUS READ+EDIT FOLD (apply
+#   same-turn edits onto the Read buffer, stub the redundant edit; proxylab/
+#   fold.py). L2 strictly contains L1 (the riders gate on busted_from); fold is
+#   independent of the thinking bust but rides the SAME consumer opt-in channel,
+#   so it's part of the L2 bundle, not a separate flag/table/directive. STRIP_L2
+#   is the deployment default-level knob; per-session it's
+#   `[wirescope:strip-thinking l2]` / `/_strip?level=2`. (L3 is RETIRED — fold
+#   folded into L2 2026-06-20; `l3`/`level=3` inputs clamp to 2 for back-compat.)
 STRIP_L2 = os.environ.get("STRIP_L2", "0") not in ("0", "no", "off", "false")
-STRIP_L3 = os.environ.get("STRIP_L3", "0") not in ("0", "no", "off", "false")
 
 # COLLAPSE PRIOR-TURN EDIT/WRITE SUCCESS ACKS. An Edit/Write tool_result on
 # success is fixed boilerplate (~155 ch) carrying ONE bit, "it succeeded", plus a
@@ -1473,8 +1472,9 @@ def _ws_resolve_strip_thinking(pairs):
     """Last `strip-thinking <off|on|l1|l2>` directive in the merged pair stream
     wins -> an int LEVEL (0/1/2), or None if none present. `on`/`l1`/`1` = L1
     (thinking only, the back-compat value clodex emits today); `l2`/`2` = L2
-    (L1 + the shady bust-riders); `off`/`0` = level 0; bare directive = L1.
-    Vocabulary lives here next to the section/tool resolvers."""
+    (L1 + the bust-riders + read/edit fold); `off`/`0` = level 0; bare directive
+    = L1. `l3`/`3` is accepted as a back-compat ALIAS for L2 (fold moved into L2
+    2026-06-20; L3 retired). Vocabulary lives here next to the resolvers."""
     val = None
     for name, value in pairs:
         if name == "strip-thinking":
@@ -1483,25 +1483,24 @@ def _ws_resolve_strip_thinking(pairs):
                 val = 1
             elif v in ("off", "0", "false", "no"):
                 val = 0
-            elif v in ("l2", "2"):
+            elif v in ("l2", "2", "l3", "3"):   # l3/3 = back-compat alias for L2
                 val = 2
-            elif v in ("l3", "3"):
-                val = 3
     return val
 
 
 def _global_strip_level():
-    """Deployment default level when a session has no override: 3 if STRIP_L3
-    (implies L2+fold), else 2 if STRIP_L2 (implies thinking), else 1 if
+    """Deployment default level when a session has no override: 2 if STRIP_L2
+    (L1 thinking + the bust-riders + read/edit fold), else 1 if
     STRIP_PRIOR_THINKING, else 0."""
-    return 3 if STRIP_L3 else (2 if STRIP_L2 else (1 if STRIP_PRIOR_THINKING else 0))
+    return 2 if STRIP_L2 else (1 if STRIP_PRIOR_THINKING else 0)
 
 
 def _strip_thinking_set_override(session_id, level):
     """Endpoint/programmatic setter for the per-session override LEVEL: an int
     0/1/2 (or True/False = 1/0 for the legacy `on=` API), or None to clear ->
     fall back to the global default. Returns the effective stored value (None when
-    cleared). Level is clamped to 0..3 (3 = L3 = +read/edit fold).
+    cleared). Level is clamped to 0..2 (L2 = bust-riders + read/edit fold; a
+    legacy 3 clamps to 2 — L3 retired 2026-06-20).
 
     DELIBERATE-FLIP -> ESTABLISH THE GUARD LATCH NOW. An explicit per-session
     level CHANGE (this endpoint / a directive) is the "flip once on purpose" case
@@ -1522,7 +1521,7 @@ def _strip_thinking_set_override(session_id, level):
         _delete_strip_guard_latch(session_id)
         return None
     prev = _STRIP_OVERRIDE.get(session_id)
-    lvl = max(0, min(3, int(level)))     # True->1, False->0 via int()
+    lvl = max(0, min(2, int(level)))     # True->1, False->0 via int(); 3->2
     _STRIP_OVERRIDE[session_id] = lvl
     _persist_strip_override(session_id, lvl)
     if prev != lvl:                      # genuine deliberate change -> latch now
@@ -1556,20 +1555,15 @@ def _strip_thinking_enabled(obj, agent_id=None):
 
 
 def _strip_l2_enabled(obj, agent_id=None):
-    """L2 gate: the shady bust-riding strips (failed-call stubbing, edit-ack
-    collapse) run when the effective level >= 2 (or their own scratch-A/B global
-    flag is set — checked by the callers)."""
-    return _strip_level(obj, agent_id) >= 2
-
-
-def _strip_l3_enabled(obj, agent_id=None):
-    """L3 gate: READ+EDIT FOLD runs when the effective level >= 3. Fold reads this
-    (its only gate now — no separate flag/table/directive). Because _strip_level
-    resolves the per-session directive/override EARLY in the chain (via
+    """L2 gate: the bust-riding tool-result strips (failed-call stubbing, edit-ack
+    collapse) AND the READ+EDIT FOLD all run when the effective level >= 2 (or
+    their own scratch-A/B global flag is set — checked by the callers). Fold's
+    ONLY gate (no separate flag/table/directive). Because _strip_level resolves
+    the per-session directive/override EARLY in the chain (via
     _strip_thinking_enabled, before _ws_strip_directives removes the line), fold
     sees the resolved level by the time it runs — the directive-before-strip race
     that bit fold's old standalone gate cannot recur."""
-    return _strip_level(obj, agent_id) >= 3
+    return _strip_level(obj, agent_id) >= 2
 
 
 def _is_real_user_turn(m):
