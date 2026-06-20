@@ -511,6 +511,27 @@ async def handler(request: Request) -> Response:
         res = status_mod._context_snapshot(sess, utilization=util)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
+    # GET /_subagents?session=<sid>&child=<key>[&detail=1][&maxlen=N] — on-demand
+    # per-subagent detail for a popover: latest assistant text + tool from that
+    # instance's last forwarded request body (one turn stale; never the in-flight
+    # stream). `child` = the sub_agents[].key from /_status. Read-only, in-memory,
+    # OFF the 5s poll path (transcripts are heavy). found:false + reason
+    # (unknown_child|no_request_body|session_cold) for the absent cases — all 200,
+    # 400 only on missing params (action-endpoint convention). `maxlen` clamps
+    # string values in-place so a popover never pulls full file bodies.
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_subagents":
+        q = request.query_params
+        sess, child = q.get("session"), q.get("child")
+        if not sess or not child:
+            return Response(json.dumps({"error": "session and child required"}),
+                            status_code=400, media_type="application/json")
+        try:
+            maxlen = int(q.get("maxlen")) if q.get("maxlen") else None
+        except (TypeError, ValueError):
+            maxlen = None
+        res = status_mod._subagent_detail(sess, child, maxlen=maxlen)
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
     # GET /_report?session=<id>[&detail=1] — read-only, spends nothing. The
     # per-session cost/efficiency report (where the tokens AND dollars went +
     # findings + verdict). DISK-based (works on ended/historical sessions),

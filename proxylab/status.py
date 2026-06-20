@@ -269,7 +269,10 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
             # Task-spawned subagents that share this session_id (each with its
             # own model + request count) — shown under the main agent so the two
             # are obviously distinct and neither overwrites the other.
-            "sub_agents": meta_mod._subagents_snapshot(sid),
+            # `last_active_s` (server-computed now - last_seen) is folded in so a
+            # consumer derives running/idle/done off a skew-free fact (clodex
+            # subagent child rows; policy/aging stay client-side).
+            "sub_agents": _subagents_with_active(sid, now),
         })
     sessions.sort(key=lambda s: s.get("last_seen") or 0, reverse=True)
     res = {"proxy": {"version": core_mod.VERSION,
@@ -297,6 +300,112 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
     if meta_err:
         res["proxy"]["session_meta_error"] = meta_err
     return res
+
+
+def _subagents_with_active(sid, now):
+    """The session's `sub_agents[]` for /_status, each augmented with the one
+    server-computed FACT a consumer can't compute skew-free on its own:
+    `last_active_s` = now - last_seen (float secs). Policy (running/idle/done)
+    and aging stay the consumer's — we emit no `status`. Snapshot entries are
+    fresh dict copies (meta clones them), so mutating is safe. None passthrough."""
+    subs = meta_mod._subagents_snapshot(sid)
+    if not subs:
+        return subs
+    for s in subs:
+        ls = s.get("last_seen")
+        s["last_active_s"] = round(now - ls, 1) if ls else None
+    return subs
+
+
+def _last_assistant_activity(obj):
+    """(last_text, last_tool, last_tool_input) from the LATEST assistant message
+    in a forwarded request body. text = that message's text blocks joined; tool =
+    its last tool_use (name + verbatim `input`). This is one-turn-stale by
+    construction — the request body holds the transcript up to the last COMPLETED
+    turn, never the in-flight response. All None when there's no assistant turn."""
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list):
+        return None, None, None
+    for m in reversed(msgs):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        c = m.get("content")
+        blocks = (c if isinstance(c, list)
+                  else [{"type": "text", "text": c}] if isinstance(c, str) else [])
+        texts, tool, tin = [], None, None
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            bt = b.get("type")
+            if bt == "text":
+                texts.append(b.get("text") or "")
+            elif bt == "tool_use":
+                tool = b.get("name")          # last one wins = most recent in turn
+                tin = b.get("input")
+        return ("\n".join(t for t in texts if t).strip() or None), tool, tin
+    return None, None, None
+
+
+def _clamp_strings(val, maxlen):
+    """Clamp every string VALUE nested in val to maxlen chars, preserving the JSON
+    STRUCTURE (never truncating keys or the shape — only leaf string values), so a
+    popover can preview multi-arg tool inputs without pulling full file bodies.
+    Returns (clamped_copy, any_truncated)."""
+    truncated = False
+
+    def go(v):
+        nonlocal truncated
+        if isinstance(v, str):
+            if len(v) > maxlen:
+                truncated = True
+                return v[:maxlen]
+            return v
+        if isinstance(v, list):
+            return [go(x) for x in v]
+        if isinstance(v, dict):
+            return {k: go(x) for k, x in v.items()}
+        return v
+
+    return go(val), truncated
+
+
+def _subagent_detail(session, child, maxlen=None):
+    """On-demand detail for ONE subagent instance (clodex popover): the latest
+    assistant text + tool from its last forwarded request body. `child` is the
+    instance key from `sub_agents[].key` (agent-id when present, else role).
+    Facts-only, in-memory, off the poll path. `found:false` + `reason` (200, never
+    4xx — action-endpoint convention) for the absent cases:
+      unknown_child   — no such instance key under this (live) session
+      no_request_body — instance is in sub_agents[] but no body was ever captured
+      session_cold    — session swept/ended/restored, in-memory bodies gone
+    `maxlen` clamps string values in last_text/last_tool_input in place; `truncated`
+    is true iff any clamp fired."""
+    snap = meta_mod._subagents_snapshot(session) or []
+    match = next((s for s in snap if s.get("key") == child), None)
+    entry = meta_mod._subagent_request(session, child)   # {"obj","ts",...} | None
+    if entry is None:
+        reason = ("no_request_body" if match else
+                  "unknown_child" if snap else "session_cold")
+        return {"session": session, "child": child, "found": False,
+                "reason": reason}
+    obj = entry.get("obj") or {}
+    last_text, last_tool, last_tool_input = _last_assistant_activity(obj)
+    truncated = False
+    if maxlen and maxlen > 0:
+        if isinstance(last_text, str) and len(last_text) > maxlen:
+            last_text, truncated = last_text[:maxlen], True
+        if last_tool_input is not None:
+            last_tool_input, ti_trunc = _clamp_strings(last_tool_input, maxlen)
+            truncated = truncated or ti_trunc
+    return {"session": session, "child": child, "found": True,
+            "role": (match or {}).get("role"),
+            "model": (match or {}).get("model") or obj.get("model"),
+            "display_name": (match or {}).get("display_name"),
+            "turn_ts": entry.get("ts"),
+            "last_text": last_text or None,
+            "last_tool": last_tool,
+            "last_tool_input": last_tool_input,
+            "truncated": truncated}
 
 
 # Rough JSON-chars -> tokens divisor for tool schema sizing. Mirrors
