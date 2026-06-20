@@ -225,26 +225,6 @@ def _restore_strip_guard_latches():
         return 0
 
 
-def _restore_fold_overrides():
-    """Reload per-session fold overrides BEFORE the first post-restart turn, so
-    an opted-in session keeps folding instead of forwarding UNFOLDED bytes against
-    a warm FOLDED lineage (a full-window re-write). Same durability rationale as
-    strip_overrides — control state must outlive the cache it agrees with. (The
-    fold MEMO maps are NOT restored: they're deterministically recomputed.)"""
-    try:
-        from proxylab import fold as fold_mod
-        con = store_mod.db()
-        with store_mod.LOCK:
-            rows = con.execute("SELECT session_id, enabled FROM fold_override "
-                               "WHERE owner=?", (store_mod.OWNER,)).fetchall()
-        for sid, enabled in rows:
-            fold_mod._FOLD_OVERRIDE[sid] = bool(enabled)
-        return len(rows)
-    except Exception as e:
-        print(f"[restore] fold_overrides failed: {e}", flush=True)
-        return 0
-
-
 def _restore_state():
     now = time.time()
     _RESTORED["holds"] = _restore_holds(now)
@@ -254,12 +234,10 @@ def _restore_state():
     _RESTORED["ended"] = _restore_ended()
     _RESTORED["strip_overrides"] = _restore_strip_overrides()
     _RESTORED["strip_guard_latches"] = _restore_strip_guard_latches()
-    _RESTORED["fold_overrides"] = _restore_fold_overrides()
     print(f"[restore] holds={_RESTORED['holds']} "
           f"last_requests={_RESTORED['last_requests']} (auth-less until live "
           f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
           f"session_totals={_RESTORED['session_totals']} "
           f"cwd_known={_RESTORED['cwd_done']} "
           f"strip_overrides={_RESTORED['strip_overrides']} "
-          f"strip_guard_latches={_RESTORED['strip_guard_latches']} "
-          f"fold_overrides={_RESTORED['fold_overrides']}", flush=True)
+          f"strip_guard_latches={_RESTORED['strip_guard_latches']}", flush=True)

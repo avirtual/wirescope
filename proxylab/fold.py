@@ -42,24 +42,25 @@ just-settled turn at the TAIL -> cheap (the "~2x the settling turn" bargain we
 already accepted for thinking-strip). First-enabling fold on a long ALREADY-warm
 session eats one deeper re-cache — the accepted price of a deliberate per-session
 opt-in (same stance as the L2 strips), not an automatic decision that needs the
-cold-gate. What DOES need to outlive a restart is the on/off OVERRIDE (intent):
-lose it and we'd forward UNFOLDED bytes against a warm FOLDED lineage -> a real
-bust. So the override persists (mirrors strip_override); the maps do not.
+cold-gate.
 
-OWNERSHIP. This module owns the `fold_override` table and mutates only its own
-globals. Wired into the server transform chain after the strips, before the
-hold echo. Default OFF; per-session opt-in via `[wirescope:fold-reads on|off]`.
+GATING — fold is STRIP LEVEL 3 (L3 = L2 + fold). It is NOT a separate
+flag/table/directive: it rides the existing consumer-tiered strip ladder
+(transforms.STRIP LEVELS), gated by `transforms._strip_l3_enabled` (effective
+level >= 3). That intent already persists in `strip_override` and is resolved
+EARLY in the chain (via `_strip_thinking_enabled`, before the directive strip),
+so fold inherits the durable-across-restart override AND is immune to the
+directive-before-strip race for free. Per-session: `[wirescope:strip-thinking
+l3]` / `/_strip?level=3`; global default: STRIP_L3. This module therefore owns
+NO table — only its in-memory MEMO maps (deterministically recomputable).
+
+OWNERSHIP. Wired into the server transform chain after the strips, before the
+hold echo. Gated by the L3 strip level.
 """
 import json
-import os
 import re
-import time
 
-from proxylab import store as store_mod
 from proxylab import writer as writer_mod
-
-# Deployment default (global). Per-session override (directive) takes precedence.
-FOLD_READ_EDIT = os.environ.get("FOLD_READ_EDIT", "0") not in ("0", "no", "off", "false")
 
 # Only single-op Edit for v1. Write creates files (no prior read); MultiEdit /
 # NotebookEdit carry a multi-op shape we deliberately leave live for now.
@@ -80,104 +81,21 @@ _FOLDED_EDITS = {}
 # session_id -> set(read_tool_use_id) already examined (foldable OR not) — the
 # memo that keeps discovery O(new settled pairs), not O(history) every turn.
 _PROCESSED_READS = {}
-# session_id -> bool  (per-session on/off override; sticky, persisted)
-_FOLD_OVERRIDE = {}
-
-store_mod.register_schema(
-    "CREATE TABLE IF NOT EXISTS fold_override ("
-    "owner TEXT NOT NULL, session_id TEXT NOT NULL, "
-    "enabled INTEGER NOT NULL, set_at REAL NOT NULL, "
-    "PRIMARY KEY (owner, session_id))")
-
-
-# ---------------------------------------------------------------- persistence
-def _persist_fold_override(session_id, enabled):
-    """Mirror the on/off intent to SQLite so a restart can't drop it (which would
-    forward unfolded bytes against a warm folded lineage -> a full re-write).
-    Degrades to in-memory-only on failure."""
-    try:
-        con = store_mod.db()
-        with store_mod.LOCK:
-            con.execute(
-                "INSERT INTO fold_override(owner, session_id, enabled, set_at) "
-                "VALUES(?,?,?,?) ON CONFLICT(owner, session_id) DO UPDATE SET "
-                "enabled=excluded.enabled, set_at=excluded.set_at",
-                (store_mod.OWNER, session_id, 1 if enabled else 0, time.time()))
-            con.commit()
-    except Exception as e:
-        print(f"[fold] override persist failed for {session_id[:12]}…: {e}", flush=True)
-
-
-def _delete_fold_override(session_id):
-    try:
-        con = store_mod.db()
-        with store_mod.LOCK:
-            con.execute("DELETE FROM fold_override WHERE owner=? AND session_id=?",
-                        (store_mod.OWNER, session_id))
-            con.commit()
-    except Exception as e:
-        print(f"[fold] override delete failed for {session_id[:12]}…: {e}", flush=True)
-
-
-def _set_fold_override(session_id, enabled):
-    """Setter for the per-session override (directive/endpoint). enabled=None
-    clears -> fall back to the global default. Returns the effective value."""
-    if not session_id:
-        return None
-    if enabled is None:
-        _FOLD_OVERRIDE.pop(session_id, None)
-        _delete_fold_override(session_id)
-        return None
-    _FOLD_OVERRIDE[session_id] = bool(enabled)
-    _persist_fold_override(session_id, bool(enabled))
-    return bool(enabled)
 
 
 def _forget(session_id):
-    """Drop all per-session fold state (maps + override). Called on sweep/end."""
-    _FOLDED_READS.pop(session_id, None)
-    _FOLDED_EDITS.pop(session_id, None)
-    _PROCESSED_READS.pop(session_id, None)
-    if session_id in _FOLD_OVERRIDE:
-        _FOLD_OVERRIDE.pop(session_id, None)
-        _delete_fold_override(session_id)
-
-
-def _clear_maps(session_id):
-    """Drop the memo maps only (keep the override). Used on a /compact boundary:
-    the summarized history retires the old tool_ids; fold resumes on new pairs."""
+    """Drop all per-session fold MEMO state. Called on sweep/end. (No override
+    table to clear — the L3 intent lives in transforms' strip_override, reaped by
+    _ws_forget / the strip machinery.)"""
     _FOLDED_READS.pop(session_id, None)
     _FOLDED_EDITS.pop(session_id, None)
     _PROCESSED_READS.pop(session_id, None)
 
 
-# ---------------------------------------------------------------- gate
-def _resolve_directive(pairs):
-    """Last `fold-reads <on|off>` directive wins -> True/False, or None if none."""
-    val = None
-    for name, value in pairs:
-        if name == "fold-reads":
-            v = (value or "").strip().lower()
-            if v in ("", "on", "1", "true", "yes"):
-                val = True
-            elif v in ("off", "0", "false", "no"):
-                val = False
-    return val
-
-
-def _fold_enabled(obj):
-    """Resolve (enabled, session_id) for THIS request: a `[wirescope:fold-reads]`
-    directive (body+spawn, sticky per session) overrides the global default. A
-    seen directive updates the sticky store on CHANGE only."""
-    sid = (writer_mod._session_ids(obj) or [None])[0] if isinstance(obj, dict) else None
-    if isinstance(obj, dict):
-        pairs = writer_mod._ws_body_pairs(obj) + writer_mod._ws_spawn_pairs(obj)
-        d = _resolve_directive(pairs)
-        if sid and d is not None and _FOLD_OVERRIDE.get(sid) != d:
-            _set_fold_override(sid, d)
-    if sid is not None and sid in _FOLD_OVERRIDE:
-        return _FOLD_OVERRIDE[sid], sid
-    return FOLD_READ_EDIT, sid
+# _clear_maps is an alias kept for the /compact path's intent (drop the memo so
+# retired tool_ids don't linger); identical to _forget now that there's no
+# separate override to preserve.
+_clear_maps = _forget
 
 
 # ---------------------------------------------------------------- buffer ops
@@ -422,19 +340,20 @@ def writer_mod_is_real_user_turn(m):
 
 def fold_read_edits(obj, agent_id=None):
     """Fold settled same-turn Read+Edit chains. Returns a log dict, or None when
-    disabled / nothing to do. Mutates obj["messages"] in place."""
+    disabled (strip level < 3) / nothing to do. Mutates obj["messages"] in place.
+    Gate = transforms._strip_l3_enabled (fold IS strip level 3)."""
     if not isinstance(obj, dict):
         return None
-    enabled, sid = _fold_enabled(obj)
-    if not enabled:
+    from proxylab import transforms as _t
+    if not _t._strip_l3_enabled(obj, agent_id):
         return None
+    sid = (writer_mod._session_ids(obj) or [None])[0]
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
 
-    # /compact retires the old tool_ids -> drop the memo maps (keep the override).
+    # /compact retires the old tool_ids -> drop the memo maps.
     try:
-        from proxylab import transforms as _t
         if _t._is_compact_request(obj):
             _clear_maps(sid)
     except Exception:

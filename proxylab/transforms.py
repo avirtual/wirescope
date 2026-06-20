@@ -1192,16 +1192,19 @@ try:
 except ValueError:
     STRIP_THINK_MAX_BODY_RATIO = 4.0
 
-# STRIP LEVELS (per-session, consumer-tiered — mirrors clodex's Off / L1 / L2):
+# STRIP LEVELS (per-session, consumer-tiered — mirrors clodex's Off / L1 / L2 / L3):
 #   0 = off, 1 = L1 (prior-turn thinking only — the conservative, defensible tier
 #   clodex already opts sessions into), 2 = L2 = L1 PLUS the shadier bust-RIDING
-#   strips (failed-call stubbing + edit-ack collapse). L2 strictly contains L1:
-#   the riders gate on busted_from (the thinking-strip's bust), so they are no-ops
-#   unless L1 actually stripped this turn — "L2 is L1 + some more" is the literal
-#   runtime dependency, which is why a LEVEL (not two independent bools) is the
-#   right model. STRIP_L2 is the deployment default-level knob (implies thinking);
-#   per-session it's set by `[wirescope:strip-thinking l2]` / `/_strip?level=2`.
+#   strips (failed-call stubbing + edit-ack collapse), 3 = L3 = L2 PLUS READ+EDIT
+#   FOLD (apply same-turn edits onto the Read buffer, stub the redundant edit;
+#   proxylab/fold.py). L2 strictly contains L1 (the riders gate on busted_from);
+#   L3 contains L2 (a strict capability ladder) — fold is independent of the
+#   thinking bust but rides the SAME consumer opt-in channel, so it's a LEVEL, not
+#   a separate flag/table/directive. STRIP_L2/STRIP_L3 are the deployment
+#   default-level knobs; per-session it's `[wirescope:strip-thinking l2|l3]` /
+#   `/_strip?level=2|3`.
 STRIP_L2 = os.environ.get("STRIP_L2", "0") not in ("0", "no", "off", "false")
+STRIP_L3 = os.environ.get("STRIP_L3", "0") not in ("0", "no", "off", "false")
 
 # COLLAPSE PRIOR-TURN EDIT/WRITE SUCCESS ACKS. An Edit/Write tool_result on
 # success is fixed boilerplate (~155 ch) carrying ONE bit, "it succeeded", plus a
@@ -1482,20 +1485,23 @@ def _ws_resolve_strip_thinking(pairs):
                 val = 0
             elif v in ("l2", "2"):
                 val = 2
+            elif v in ("l3", "3"):
+                val = 3
     return val
 
 
 def _global_strip_level():
-    """Deployment default level when a session has no override: 2 if STRIP_L2
-    (implies thinking), else 1 if STRIP_PRIOR_THINKING, else 0."""
-    return 2 if STRIP_L2 else (1 if STRIP_PRIOR_THINKING else 0)
+    """Deployment default level when a session has no override: 3 if STRIP_L3
+    (implies L2+fold), else 2 if STRIP_L2 (implies thinking), else 1 if
+    STRIP_PRIOR_THINKING, else 0."""
+    return 3 if STRIP_L3 else (2 if STRIP_L2 else (1 if STRIP_PRIOR_THINKING else 0))
 
 
 def _strip_thinking_set_override(session_id, level):
     """Endpoint/programmatic setter for the per-session override LEVEL: an int
     0/1/2 (or True/False = 1/0 for the legacy `on=` API), or None to clear ->
     fall back to the global default. Returns the effective stored value (None when
-    cleared). Level is clamped to 0..2.
+    cleared). Level is clamped to 0..3 (3 = L3 = +read/edit fold).
 
     DELIBERATE-FLIP -> ESTABLISH THE GUARD LATCH NOW. An explicit per-session
     level CHANGE (this endpoint / a directive) is the "flip once on purpose" case
@@ -1516,7 +1522,7 @@ def _strip_thinking_set_override(session_id, level):
         _delete_strip_guard_latch(session_id)
         return None
     prev = _STRIP_OVERRIDE.get(session_id)
-    lvl = max(0, min(2, int(level)))     # True->1, False->0 via int()
+    lvl = max(0, min(3, int(level)))     # True->1, False->0 via int()
     _STRIP_OVERRIDE[session_id] = lvl
     _persist_strip_override(session_id, lvl)
     if prev != lvl:                      # genuine deliberate change -> latch now
@@ -1554,6 +1560,16 @@ def _strip_l2_enabled(obj, agent_id=None):
     collapse) run when the effective level >= 2 (or their own scratch-A/B global
     flag is set — checked by the callers)."""
     return _strip_level(obj, agent_id) >= 2
+
+
+def _strip_l3_enabled(obj, agent_id=None):
+    """L3 gate: READ+EDIT FOLD runs when the effective level >= 3. Fold reads this
+    (its only gate now — no separate flag/table/directive). Because _strip_level
+    resolves the per-session directive/override EARLY in the chain (via
+    _strip_thinking_enabled, before _ws_strip_directives removes the line), fold
+    sees the resolved level by the time it runs — the directive-before-strip race
+    that bit fold's old standalone gate cannot recur."""
+    return _strip_level(obj, agent_id) >= 3
 
 
 def _is_real_user_turn(m):

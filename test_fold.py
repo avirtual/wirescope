@@ -20,6 +20,20 @@ import os
 import sys
 
 from proxylab import fold
+from proxylab import transforms as transforms_mod
+
+
+# Fold is STRIP LEVEL 3 — enable a session by setting the strip override to 3
+# (the in-memory path; no DB write, no directive needed). Cleanup drops the memo
+# maps AND the strip override/latch so tests stay isolated.
+def _enable_fold(sid):
+    transforms_mod._STRIP_OVERRIDE[sid] = 3
+
+
+def _cleanup(sid):
+    fold._forget(sid)
+    transforms_mod._STRIP_OVERRIDE.pop(sid, None)
+    transforms_mod._STRIP_GUARD_LATCH.pop(sid, None)
 
 
 # ----------------------------------------------------------------- unit tests
@@ -100,8 +114,8 @@ def test_synthetic_fold_and_stability():
         o["messages"].append({"role": "user", "content": [{"type": "text", "text": "now what"}]})
         return o
 
-    fold._forget("S-syn")
-    fold._FOLD_OVERRIDE["S-syn"] = True
+    _cleanup("S-syn")
+    _enable_fold("S-syn")
 
     # turn 1: the pair is the CURRENT turn (after the last real-user msg "edit it"
     # all blocks are tool plumbing) -> NOT settled -> no fold
@@ -135,7 +149,7 @@ def test_synthetic_fold_and_stability():
     o2b = turn2()
     fold.fold_read_edits(o2b)
     assert o2b["messages"][2]["content"][0]["content"] == folded_read
-    fold._forget("S-syn")
+    _cleanup("S-syn")
     print("ok  synthetic fold + live-tail + stability + determinism")
 
 
@@ -168,7 +182,7 @@ def test_multichunk_two_windows_one_edit():
              {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
              {"role": "user", "content": [{"type": "text", "text": "next"}]},
          ]}
-    fold._forget(sid); fold._FOLD_OVERRIDE[sid] = True
+    _cleanup(sid); _enable_fold(sid)
     r = fold.fold_read_edits(o)
     # window A changes (TARGET->FIXED); window B is a different region so its
     # folded bytes == original -> apply is a no-op there (1 body actually swapped,
@@ -205,7 +219,7 @@ def test_multichunk_overlapping_windows_kept_consistent():
              {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
              {"role": "user", "content": [{"type": "text", "text": "y"}]},
          ]}
-    fold._forget(sid); fold._FOLD_OVERRIDE[sid] = True
+    _cleanup(sid); _enable_fold(sid)
     r = fold.fold_read_edits(o)
     assert r and r["folded_read_bodies"] == 2, r
     a = o["messages"][2]["content"][0]["content"]
@@ -236,8 +250,7 @@ def test_failed_edit_not_folded():
              {"role": "assistant", "content": [{"type": "text", "text": "hm"}]},
              {"role": "user", "content": [{"type": "text", "text": "next"}]},
          ]}
-    fold._forget("S-err")
-    fold._FOLD_OVERRIDE["S-err"] = True
+    _cleanup("S-err"); _enable_fold("S-err")
     r = fold.fold_read_edits(o)
     assert r is None, f"failed edit must not fold: {r}"
     assert o["messages"][2]["content"][0]["content"] == "1\taaa\n"
@@ -246,15 +259,15 @@ def test_failed_edit_not_folded():
 
 
 def test_directive_resolved_before_strip():
-    """REGRESSION (scratch arm, v0.6.5): the `[wirescope:fold-reads on]` directive
-    rides the system body and is STRIPPED off the wire by _ws_strip_directives.
-    The server must resolve the fold override EARLY (before that strip), else
-    fold_read_edits sees no directive and never folds. This test reproduces the
-    chain order: early-resolve -> strip directives -> fold, and asserts a fold
-    still happens. (Without the early _fold_enabled call this fails.)"""
+    """REGRESSION (scratch arm, v0.6.5): a strip-level directive rides the system
+    body and is STRIPPED off the wire by _ws_strip_directives. The server resolves
+    the strip level EARLY (via _strip_thinking_enabled, before that strip), so fold
+    — gated on level>=3 — still sees L3 by the time it runs. Fold is now level 3,
+    so the opt-in is `[wirescope:strip-thinking l3]`; this exercises the same early-
+    resolve path that makes the bug structurally impossible."""
     from proxylab import transforms as t
     rid, eid = "tu_dr", "tu_de"
-    sysblk = [{"type": "text", "text": "You are helpful.\n[wirescope:fold-reads on]"}]
+    sysblk = [{"type": "text", "text": "You are helpful.\n[wirescope:strip-thinking l3]"}]
     o = {"metadata": {"user_id": json.dumps({"session_id": "S-dir"})},
          "system": sysblk,
          "messages": [
@@ -271,24 +284,47 @@ def test_directive_resolved_before_strip():
              {"role": "assistant", "content": [{"type": "text", "text": "k"}]},
              {"role": "user", "content": [{"type": "text", "text": "next"}]},
          ]}
-    fold._forget("S-dir")
+    _cleanup("S-dir")
     # chain order as in server.handler:
-    fold._fold_enabled(o)                 # EARLY resolve (sets sticky override)
+    t._strip_thinking_enabled(o)          # EARLY resolve (sets strip level override)
     t._ws_strip_directives(o)             # strips the directive off the wire
-    assert "fold-reads" not in json.dumps(o["system"]), "directive should be stripped"
+    assert "strip-thinking" not in json.dumps(o["system"]), "directive should be stripped"
+    assert t._strip_level(o) == 3, "L3 directive must have set the override"
     r = fold.fold_read_edits(o)           # later in the chain
-    assert r and r["folded_read_bodies"] == 1, f"directive must survive as override: {r}"
+    assert r and r["folded_read_bodies"] == 1, f"L3 directive must survive as override: {r}"
     assert o["messages"][2]["content"][0]["content"] == "1\tone\n2\tTWO\n"
-    fold._forget("S-dir")
-    print("ok  directive resolved before strip (v0.6.5 regression)")
+    _cleanup("S-dir")
+    # clean the persisted strip_override row the directive path wrote
+    t._delete_strip_override("S-dir")
+    print("ok  directive (L3) resolved before strip (v0.6.5 regression)")
 
 
-def test_disabled_by_default():
-    o = {"metadata": {"user_id": json.dumps({"session_id": "S-off"})},
-         "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]}
-    fold._forget("S-off")
-    assert fold.fold_read_edits(o) is None
-    print("ok  disabled by default")
+def test_disabled_below_l3():
+    """Fold is OFF at levels 0/1/2 and ON at 3."""
+    def mk():
+        return {"metadata": {"user_id": json.dumps({"session_id": "S-off"})},
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "r", "name": "Read", "input": {"file_path": "/x"}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "r", "content": "1\ta\n2\tb\n"}]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "e", "name": "Edit",
+                         "input": {"file_path": "/x", "old_string": "b", "new_string": "B"}}]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "e", "content": "updated successfully"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "k"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "next"}]},
+                ]}
+    for lvl in (0, 1, 2):
+        _cleanup("S-off")
+        transforms_mod._STRIP_OVERRIDE["S-off"] = lvl
+        assert fold.fold_read_edits(mk()) is None, f"fold must be off at level {lvl}"
+    _cleanup("S-off"); _enable_fold("S-off")
+    assert fold.fold_read_edits(mk()) is not None, "fold must be on at level 3"
+    _cleanup("S-off")
+    print("ok  fold off at levels 0/1/2, on at 3")
 
 
 # --------------------------------------------------------------- replay tests
@@ -431,8 +467,8 @@ def test_replay_real_sessions(root="logs_main", limit=120):
             continue
         exp_reads, exp_edits = _independent_expected_folds(msgs, last_user)
         sid = f"REPLAY::{os.path.basename(s)}"
-        fold._forget(sid)
-        fold._FOLD_OVERRIDE[sid] = True
+        _cleanup(sid)
+        _enable_fold(sid)
         checked += 1
 
         # Build incremental snapshots: replay the transcript turn-by-turn by
@@ -482,7 +518,7 @@ def test_replay_real_sessions(root="logs_main", limit=120):
         if exp_reads:
             folded_sessions += 1
             total_folded_reads += len(exp_reads)
-        fold._forget(sid)
+        _cleanup(sid)
 
     print(f"ok  replay: {checked} sessions, {folded_sessions} with folds, "
           f"{total_folded_reads} folded reads; "
@@ -498,7 +534,7 @@ if __name__ == "__main__":
     test_multichunk_overlapping_windows_kept_consistent()
     test_failed_edit_not_folded()
     test_directive_resolved_before_strip()
-    test_disabled_by_default()
+    test_disabled_below_l3()
     root = sys.argv[1] if len(sys.argv) > 1 else "logs_main"
     if os.path.isdir(root):
         test_replay_real_sessions(root)

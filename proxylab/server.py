@@ -720,7 +720,7 @@ async def handler(request: Request) -> Response:
             eff = override if override is not None else gdef
             return {"ok": True, "session": sess, "override": override,
                     "global_default": gdef, "effective": eff,
-                    "enabled": eff >= 1, "l2": eff >= 2}
+                    "enabled": eff >= 1, "l2": eff >= 2, "l3": eff >= 3}
         if request.method == "GET":
             return Response(json.dumps(_body(transforms_mod._STRIP_OVERRIDE.get(sess))),
                             media_type="application/json")
@@ -730,13 +730,13 @@ async def handler(request: Request) -> Response:
         if action == "clear" or on_raw in ("clear", "none") or level_raw in ("clear", "none"):
             new = transforms_mod._strip_thinking_set_override(sess, None)
         elif level_raw is not None:
-            lv = {"l1": 1, "l2": 2}.get(level_raw.lower())
+            lv = {"l1": 1, "l2": 2, "l3": 3}.get(level_raw.lower())
             if lv is None:
                 try:
                     lv = int(level_raw)
                 except ValueError:
                     return Response(json.dumps({"ok": False, "session": sess,
-                                    "reason": f"bad level={level_raw!r} (0|1|2|l1|l2)"}),
+                                    "reason": f"bad level={level_raw!r} (0|1|2|3|l1|l2|l3)"}),
                                     status_code=400, media_type="application/json")
             new = transforms_mod._strip_thinking_set_override(sess, lv)
         else:
@@ -875,12 +875,6 @@ async def handler(request: Request) -> Response:
             # strips. Idempotent; endpoint-set overrides are untouched (no directive
             # -> no-op). Persists the directive opt-in so it survives restarts too.
             transforms_mod._strip_thinking_enabled(obj, agent_id=agent_id)
-            # Same early-resolve for [wirescope:fold-reads ...]: set the sticky
-            # per-session fold override NOW, before the directive-strip below
-            # removes the line — otherwise fold_read_edits (further down) never
-            # sees it and turn 1 silently never folds (the bug bogdan hit on the
-            # scratch arm). Idempotent; no directive -> no-op.
-            fold_mod._fold_enabled(obj)
             # WIRESCOPE: capture the display name BEFORE removing the directives,
             # then strip every [wirescope:...] line from system so the model never
             # sees our control lines (and they cost no prefix tokens). Strip is
@@ -946,13 +940,13 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_tool_errors"] = ste
                 if ste.get("stubbed_error_results") or ste.get("stubbed_failed_calls"):
                     changed = True
-            # FOLD same-turn Read+Edit chains: apply the edit onto the Read body
-            # so downstream turns see the file's FINAL shape directly, and stub
-            # the now-redundant Edit input + ack. Deterministic + memoized ->
-            # byte-stable across turns (warm after the transition turn). Default
-            # OFF; per-session opt-in via `[wirescope:fold-reads on]`. Settled
-            # turns only (current turn's read+edit stay live until they're
-            # history). See proxylab/fold.py.
+            # FOLD same-turn Read+Edit chains (STRIP LEVEL 3): apply the edit onto
+            # the Read body so downstream turns see the file's FINAL shape
+            # directly, and stub the now-redundant Edit input + ack. Deterministic
+            # + memoized -> byte-stable across turns (warm after the transition
+            # turn). Gated by the L3 strip level (`[wirescope:strip-thinking l3]` /
+            # /_strip?level=3 / STRIP_L3) — no separate flag. Settled turns only
+            # (current turn's read+edit stay live until history). See fold.py.
             fld = fold_mod.fold_read_edits(obj, agent_id=agent_id)
             if fld:
                 record["fold_read_edits"] = fld
