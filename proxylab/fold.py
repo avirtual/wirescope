@@ -258,19 +258,50 @@ def _error_edit_ids(msgs, last_user):
     return ids
 
 
+def _apply_to_buffers(bufs, old, new, replace_all):
+    """Apply one Edit's old->new to EVERY live buffer of the file that contains
+    old_string (the same file is often Read in several windows in one turn — the
+    edited line can sit in more than one, e.g. overlapping reads). Keeping all
+    containing windows in lock-step is what makes a multi-read file consistent
+    after folding (one window post-edit, another pre-edit would mislead the
+    model). Returns the number of buffers updated, or None if it CANNOT fold
+    cleanly: an empty old_string, or an ambiguous match (old_string appears >1×
+    in some window without replace_all). 0 hits is a clean "this edit's region
+    isn't in any carried window" -> the caller treats that as unfoldable too
+    (its diff would be lost), so only a positive count means folded."""
+    if not old:
+        return None
+    hits = 0
+    for buf in bufs:
+        cnt = buf["text"].count(old)
+        if cnt == 0:
+            continue
+        if cnt > 1 and not replace_all:
+            return None                  # ambiguous in this window -> abort file
+        buf["text"] = (buf["text"].replace(old, new) if replace_all
+                       else buf["text"].replace(old, new, 1))
+        hits += 1
+    return hits
+
+
 def _discover(msgs, last_user, folded_reads, folded_edits, processed, error_ids):
-    """Walk the SETTLED region (msgs[:last_user]) turn by turn; for each not-yet-
-    processed Read followed by same-turn Edit(s) on that file, rebase the edits
-    onto the read buffer (all-or-nothing) and populate the maps. Pure memo:
-    a read examined once is never re-rebased."""
-    cur = {}            # file_path -> readinfo for the CURRENT turn segment
+    """Walk the SETTLED region (msgs[:last_user]) turn by turn. For each file
+    Read (one or MORE windows) and then Edited in the SAME turn, rebase every
+    edit onto every window that contains it. ALL-OR-NOTHING PER FILE: the file's
+    reads+edits fold as a unit only if every edit landed cleanly in >=1 window
+    with no ambiguity and no failure — otherwise none of that file's blocks are
+    touched (a partly-folded file could show inconsistent windows / a stubbed
+    edit whose diff isn't reflected somewhere). Pure memo: a read examined once
+    (in whichever pass first saw its turn settled) is never re-rebased."""
+    cur = {}            # file_path -> {bufs:[{read_id,start,text}], edit_ids, ok}
     pending = {}        # read tool_use_id -> file_path (read awaiting its result)
 
     def commit():
-        for ri in cur.values():
-            if ri["ok"] and ri["edit_ids"]:
-                folded_reads[ri["read_id"]] = _render_numbered(ri["start"], ri["text"])
-                for eid in ri["edit_ids"]:
+        for g in cur.values():
+            if g["ok"] and g["edit_ids"] and g["bufs"]:
+                for buf in g["bufs"]:
+                    folded_reads[buf["read_id"]] = _render_numbered(buf["start"], buf["text"])
+                for eid in g["edit_ids"]:
                     folded_edits[eid] = True
 
     for i in range(last_user):
@@ -292,20 +323,20 @@ def _discover(msgs, last_user, folded_reads, folded_edits, processed, error_ids)
                 if nm == "Read" and fp:
                     pending[b.get("id")] = fp
                 elif nm in _FOLD_EDIT_NAMES and fp and fp in cur:
-                    ri = cur[fp]
-                    if not ri["ok"]:
+                    g = cur[fp]
+                    if not g["ok"]:
                         continue
-                    if b.get("id") in error_ids:     # failed edit -> abort chain
-                        ri["ok"] = False
+                    if b.get("id") in error_ids:     # failed edit -> abort file
+                        g["ok"] = False
                         continue
                     inp = b.get("input") or {}
-                    nt = _apply_edit(ri["text"], inp.get("old_string"),
-                                     inp.get("new_string") or "", inp.get("replace_all"))
-                    if nt is None:
-                        ri["ok"] = False             # all-or-nothing per read
+                    hits = _apply_to_buffers(g["bufs"], inp.get("old_string"),
+                                             inp.get("new_string") or "",
+                                             inp.get("replace_all"))
+                    if not hits:                     # ambiguous (None) or no window
+                        g["ok"] = False              # held its diff -> abort file
                     else:
-                        ri["text"] = nt
-                        ri["edit_ids"].append(b.get("id"))
+                        g["edit_ids"].append(b.get("id"))
         elif role == "user":
             for b in c:
                 if not isinstance(b, dict) or b.get("type") != "tool_result":
@@ -315,16 +346,24 @@ def _discover(msgs, last_user, folded_reads, folded_edits, processed, error_ids)
                     continue
                 fp = pending.pop(tid)
                 if tid in processed:                 # already examined -> skip
-                    cur.pop(fp, None)
                     continue
                 processed.add(tid)
                 parsed = _parse_numbered(_result_text(b))
+                g = cur.get(fp)
                 if parsed is None:
-                    cur.pop(fp, None)                # unparseable read -> can't fold
+                    # unparseable window (error read) -> the file can't fold
+                    # consistently; abort the whole file's cluster this turn.
+                    if g is not None:
+                        g["ok"] = False
+                    else:
+                        cur[fp] = {"bufs": [], "edit_ids": [], "ok": False}
                     continue
                 start, text = parsed
-                cur[fp] = {"read_id": tid, "start": start, "text": text,
-                           "edit_ids": [], "ok": True}
+                if g is None:
+                    cur[fp] = {"bufs": [{"read_id": tid, "start": start, "text": text}],
+                               "edit_ids": [], "ok": True}
+                else:
+                    g["bufs"].append({"read_id": tid, "start": start, "text": text})
     commit()
 
 

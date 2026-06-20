@@ -139,6 +139,84 @@ def test_synthetic_fold_and_stability():
     print("ok  synthetic fold + live-tail + stability + determinism")
 
 
+def test_multichunk_two_windows_one_edit():
+    """File read in TWO non-overlapping windows; the edit's old_string lives in
+    ONE window. Both reads belong to one foldable file unit: the matching window
+    folds post-edit, the other window is byte-unchanged (a faithful pre-edit view
+    of a DIFFERENT region), and the edit is stubbed. Hand-computed expected."""
+    sid = "S-mc1"
+    r1, r2, eid = "tu_r1", "tu_r2", "tu_e1"
+    # window A: lines 1-3 ; window B: lines 50-52 (disjoint)
+    bodyA = "1\talpha\n2\tTARGET\n3\tgamma\n"
+    bodyB = "50\tfifty\n51\tfiftyone\n52\tfiftytwo\n"
+    o = {"metadata": {"user_id": json.dumps({"session_id": sid})},
+         "messages": [
+             {"role": "user", "content": [{"type": "text", "text": "go"}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": r1, "name": "Read",
+                  "input": {"file_path": "/f", "offset": 1, "limit": 3}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1, "content": bodyA}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": r2, "name": "Read",
+                  "input": {"file_path": "/f", "offset": 50, "limit": 3}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r2, "content": bodyB}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": eid, "name": "Edit",
+                  "input": {"file_path": "/f", "old_string": "TARGET", "new_string": "FIXED"}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": eid,
+                                           "content": "updated successfully"}]},
+             {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+             {"role": "user", "content": [{"type": "text", "text": "next"}]},
+         ]}
+    fold._forget(sid); fold._FOLD_OVERRIDE[sid] = True
+    r = fold.fold_read_edits(o)
+    # window A changes (TARGET->FIXED); window B is a different region so its
+    # folded bytes == original -> apply is a no-op there (1 body actually swapped,
+    # 2 reads tracked as part of the file unit).
+    assert r and r["folded_read_bodies"] == 1 and r["tracked_reads"] == 2 \
+        and r["stubbed_edit_calls"] == 1, r
+    assert o["messages"][2]["content"][0]["content"] == "1\talpha\n2\tFIXED\n3\tgamma\n"
+    assert o["messages"][4]["content"][0]["content"] == bodyB           # untouched, faithful
+    assert o["messages"][5]["content"][0]["input"] == fold.FOLD_CALL_STUB
+    fold._forget(sid)
+    print("ok  multi-chunk: two windows, edit folds the matching one, both consistent")
+
+
+def test_multichunk_overlapping_windows_kept_consistent():
+    """Two OVERLAPPING windows both contain the edited line. Folding must update
+    BOTH so the model never sees one window post-edit and the other pre-edit."""
+    sid = "S-mc2"
+    r1, r2, eid = "tu_o1", "tu_o2", "tu_oe"
+    # both windows include line 10 ("HERE")
+    bodyA = "8\teight\n9\tnine\n10\tHERE\n11\televen\n"
+    bodyB = "10\tHERE\n11\televen\n12\ttwelve\n"
+    o = {"metadata": {"user_id": json.dumps({"session_id": sid})},
+         "messages": [
+             {"role": "user", "content": [{"type": "text", "text": "go"}]},
+             {"role": "assistant", "content": [{"type": "tool_use", "id": r1, "name": "Read",
+                  "input": {"file_path": "/g", "offset": 8, "limit": 4}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r1, "content": bodyA}]},
+             {"role": "assistant", "content": [{"type": "tool_use", "id": r2, "name": "Read",
+                  "input": {"file_path": "/g", "offset": 10, "limit": 3}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": r2, "content": bodyB}]},
+             {"role": "assistant", "content": [{"type": "tool_use", "id": eid, "name": "Edit",
+                  "input": {"file_path": "/g", "old_string": "HERE", "new_string": "THERE"}}]},
+             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": eid, "content": "ok"}]},
+             {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+             {"role": "user", "content": [{"type": "text", "text": "y"}]},
+         ]}
+    fold._forget(sid); fold._FOLD_OVERRIDE[sid] = True
+    r = fold.fold_read_edits(o)
+    assert r and r["folded_read_bodies"] == 2, r
+    a = o["messages"][2]["content"][0]["content"]
+    b = o["messages"][4]["content"][0]["content"]
+    assert a == "8\teight\n9\tnine\n10\tTHERE\n11\televen\n", repr(a)
+    assert b == "10\tTHERE\n11\televen\n12\ttwelve\n", repr(b)
+    # the shared line is identical in both windows -> consistent
+    fold._forget(sid)
+    print("ok  multi-chunk: overlapping windows folded in lock-step")
+
+
 def test_failed_edit_not_folded():
     """An is_error edit result means the real file didn't change -> don't fold."""
     rid, eid = "toolu_R2", "toolu_E2"
@@ -167,6 +245,44 @@ def test_failed_edit_not_folded():
     print("ok  failed edit not folded")
 
 
+def test_directive_resolved_before_strip():
+    """REGRESSION (scratch arm, v0.6.5): the `[wirescope:fold-reads on]` directive
+    rides the system body and is STRIPPED off the wire by _ws_strip_directives.
+    The server must resolve the fold override EARLY (before that strip), else
+    fold_read_edits sees no directive and never folds. This test reproduces the
+    chain order: early-resolve -> strip directives -> fold, and asserts a fold
+    still happens. (Without the early _fold_enabled call this fails.)"""
+    from proxylab import transforms as t
+    rid, eid = "tu_dr", "tu_de"
+    sysblk = [{"type": "text", "text": "You are helpful.\n[wirescope:fold-reads on]"}]
+    o = {"metadata": {"user_id": json.dumps({"session_id": "S-dir"})},
+         "system": sysblk,
+         "messages": [
+             {"role": "user", "content": [{"type": "text", "text": "edit"}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": rid, "name": "Read", "input": {"file_path": "/d"}}]},
+             {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": rid, "content": "1\tone\n2\ttwo\n"}]},
+             {"role": "assistant", "content": [
+                 {"type": "tool_use", "id": eid, "name": "Edit",
+                  "input": {"file_path": "/d", "old_string": "two", "new_string": "TWO"}}]},
+             {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": eid, "content": "updated successfully"}]},
+             {"role": "assistant", "content": [{"type": "text", "text": "k"}]},
+             {"role": "user", "content": [{"type": "text", "text": "next"}]},
+         ]}
+    fold._forget("S-dir")
+    # chain order as in server.handler:
+    fold._fold_enabled(o)                 # EARLY resolve (sets sticky override)
+    t._ws_strip_directives(o)             # strips the directive off the wire
+    assert "fold-reads" not in json.dumps(o["system"]), "directive should be stripped"
+    r = fold.fold_read_edits(o)           # later in the chain
+    assert r and r["folded_read_bodies"] == 1, f"directive must survive as override: {r}"
+    assert o["messages"][2]["content"][0]["content"] == "1\tone\n2\tTWO\n"
+    fold._forget("S-dir")
+    print("ok  directive resolved before strip (v0.6.5 regression)")
+
+
 def test_disabled_by_default():
     o = {"metadata": {"user_id": json.dumps({"session_id": "S-off"})},
          "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]}
@@ -190,11 +306,13 @@ def _largest_snapshot(session_dir):
 
 
 def _independent_expected_folds(msgs, last_user):
-    """Recompute, independently of fold.py's discovery, what each settled
-    same-turn read should fold to (final file shape) + which edits stub. Returns
-    {read_id: expected_content, ...}, set(edit_ids). All-or-nothing per read."""
+    """Recompute, independently of fold.py's discovery, what each settled read
+    should fold to + which edits stub. Multi-buffer, ALL-OR-NOTHING PER FILE:
+    a file Read in N windows folds only if every same-turn edit lands cleanly in
+    >=1 window with no ambiguity/failure. Deliberately written with a different
+    shape (per-file groups holding a window list) than the impl so it's a real
+    cross-check, not a copy. Returns {read_id: content}, set(edit_ids)."""
     expected_reads, expected_edits = {}, set()
-    # gather error ids
     err = set()
     for i in range(last_user):
         m = msgs[i]
@@ -202,20 +320,35 @@ def _independent_expected_folds(msgs, last_user):
             for b in m["content"]:
                 if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
                     err.add(b.get("tool_use_id"))
-    cur = {}
+    groups = {}      # fp -> {wins:[{rid,start,text}], eids:[], ok}
     pending = {}
 
+    def apply_all(wins, old, new, ra):
+        if not old:
+            return None
+        hits = 0
+        for w in wins:
+            cnt = w["text"].count(old)
+            if cnt == 0:
+                continue
+            if cnt > 1 and not ra:
+                return None
+            w["text"] = w["text"].replace(old, new) if ra else w["text"].replace(old, new, 1)
+            hits += 1
+        return hits
+
     def commit():
-        for ri in cur.values():
-            if ri["ok"] and ri["eids"]:
-                expected_reads[ri["rid"]] = fold._render_numbered(ri["start"], ri["text"])
-                expected_edits.update(ri["eids"])
+        for g in groups.values():
+            if g["ok"] and g["eids"] and g["wins"]:
+                for w in g["wins"]:
+                    expected_reads[w["rid"]] = fold._render_numbered(w["start"], w["text"])
+                expected_edits.update(g["eids"])
 
     from proxylab import transforms as t
     for i in range(last_user):
         m = msgs[i]
         if t._is_real_user_turn(m):
-            commit(); cur = {}; pending = {}
+            commit(); groups = {}; pending = {}
         c = m.get("content")
         if not isinstance(c, list):
             continue
@@ -226,19 +359,19 @@ def _independent_expected_folds(msgs, last_user):
                 fp = (b.get("input") or {}).get("file_path")
                 if b.get("name") == "Read" and fp:
                     pending[b.get("id")] = fp
-                elif b.get("name") == "Edit" and fp and fp in cur:
-                    ri = cur[fp]
-                    if not ri["ok"]:
+                elif b.get("name") == "Edit" and fp and fp in groups:
+                    g = groups[fp]
+                    if not g["ok"]:
                         continue
                     if b.get("id") in err:
-                        ri["ok"] = False; continue
+                        g["ok"] = False; continue
                     inp = b.get("input") or {}
-                    nt = fold._apply_edit(ri["text"], inp.get("old_string"),
-                                          inp.get("new_string") or "", inp.get("replace_all"))
-                    if nt is None:
-                        ri["ok"] = False
+                    hits = apply_all(g["wins"], inp.get("old_string"),
+                                     inp.get("new_string") or "", inp.get("replace_all"))
+                    if not hits:
+                        g["ok"] = False
                     else:
-                        ri["text"] = nt; ri["eids"].append(b.get("id"))
+                        g["eids"].append(b.get("id"))
         elif m.get("role") == "user":
             for b in c:
                 if not isinstance(b, dict) or b.get("type") != "tool_result":
@@ -248,9 +381,18 @@ def _independent_expected_folds(msgs, last_user):
                     continue
                 fp = pending.pop(tid)
                 parsed = fold._parse_numbered(fold._result_text(b))
+                g = groups.get(fp)
                 if parsed is None:
-                    cur.pop(fp, None); continue
-                cur[fp] = {"rid": tid, "start": parsed[0], "text": parsed[1], "eids": [], "ok": True}
+                    if g is None:
+                        groups[fp] = {"wins": [], "eids": [], "ok": False}
+                    else:
+                        g["ok"] = False
+                    continue
+                if g is None:
+                    groups[fp] = {"wins": [{"rid": tid, "start": parsed[0], "text": parsed[1]}],
+                                  "eids": [], "ok": True}
+                else:
+                    g["wins"].append({"rid": tid, "start": parsed[0], "text": parsed[1]})
     commit()
     return expected_reads, expected_edits
 
@@ -352,7 +494,10 @@ if __name__ == "__main__":
     test_apply_edit()
     test_render_renumbers_after_growth()
     test_synthetic_fold_and_stability()
+    test_multichunk_two_windows_one_edit()
+    test_multichunk_overlapping_windows_kept_consistent()
     test_failed_edit_not_folded()
+    test_directive_resolved_before_strip()
     test_disabled_by_default()
     root = sys.argv[1] if len(sys.argv) > 1 else "logs_main"
     if os.path.isdir(root):

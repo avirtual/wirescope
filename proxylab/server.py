@@ -875,6 +875,12 @@ async def handler(request: Request) -> Response:
             # strips. Idempotent; endpoint-set overrides are untouched (no directive
             # -> no-op). Persists the directive opt-in so it survives restarts too.
             transforms_mod._strip_thinking_enabled(obj, agent_id=agent_id)
+            # Same early-resolve for [wirescope:fold-reads ...]: set the sticky
+            # per-session fold override NOW, before the directive-strip below
+            # removes the line — otherwise fold_read_edits (further down) never
+            # sees it and turn 1 silently never folds (the bug bogdan hit on the
+            # scratch arm). Idempotent; no directive -> no-op.
+            fold_mod._fold_enabled(obj)
             # WIRESCOPE: capture the display name BEFORE removing the directives,
             # then strip every [wirescope:...] line from system so the model never
             # sees our control lines (and they cost no prefix tokens). Strip is
