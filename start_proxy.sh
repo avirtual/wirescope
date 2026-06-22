@@ -84,6 +84,13 @@ export STRIP_PRIOR_EDIT_ACKS="${STRIP_PRIOR_EDIT_ACKS-1}"
 # not a code-level behavior change). Override with WS_SPAWNER_HINT=0 / WS_OMIT_DEFAULT=.
 export WS_SPAWNER_HINT="${WS_SPAWNER_HINT-1}"
 export WS_OMIT_DEFAULT="${WS_OMIT_DEFAULT-useremail}"
+# Surgically drop the claude.ai `claude_design` connector's 20 auto-injected
+# tools (~3.5k tok schema/turn deadweight on coding agents; late-attaches on GUI
+# restart -> tools-segment bust). Targeted alternative to --strict-mcp-config
+# (real project/user MCPs survive). Code default OFF; canonical proxy on. A
+# genuine design session re-admits per-agent with [wirescope:keep-mcp claude_design];
+# STRIP_MCP_SERVERS= disables entirely.
+export STRIP_MCP_SERVERS="${STRIP_MCP_SERVERS-claude_design}"
 
 # Refuse to double-bind the port.
 if lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then

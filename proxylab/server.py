@@ -962,6 +962,16 @@ async def handler(request: Request) -> Response:
                 record["ws_tools"] = wst
                 if wst.get("removed"):
                     changed = True
+            # STRIP_MCP_SERVERS: surgically drop a named MCP server's tool family
+            # (mcp__<server>__*) from tools[] for every routed CLI — the targeted
+            # alternative to --strict-mcp-config (real MCPs untouched). Default
+            # off in code, on for the lab via start_proxy.sh. Per-agent re-admit:
+            # [wirescope:keep-mcp <server>]. Runs before the directive-strip below.
+            smcp = transforms_mod._strip_mcp_tools(obj, agent_id=agent_id)
+            if smcp:
+                record["strip_mcp"] = smcp
+                if smcp.get("removed"):
+                    changed = True
             # WIRESCOPE [wirescope:strip-thinking ...]: resolve the strip decision
             # into the sticky per-session store NOW, BEFORE the directive-strip
             # below removes the line from the wire — otherwise a directive placed

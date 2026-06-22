@@ -158,6 +158,17 @@ Fail-safe: a name that matches no tool in the roster is a logged **miss**, never
 
 > **Sharp edge (the spawner's call, same as `--tools`):** if the agent's prompt expects a tool you removed and the model emits a call for it, the upstream API rejects the turn. Trim to a set the agent's task actually needs.
 
+### `[wirescope:keep-mcp <servers>]`
+
+Re-admit (un-strip) a whole **MCP server's** tool family for this agent, cancelling the deployment-level `STRIP_MCP_SERVERS` filter. That filter (off in code, on for the canonical proxy via `start_proxy.sh`) surgically drops every `mcp__<server>__*` tool — its motivating case is the claude.ai `claude_design` connector, 20 auto-injected tools (~3.5k tok schema/turn) a coding agent never calls and that late-attaches on GUI restart, busting the tools segment. Unlike `--strict-mcp-config` (all-or-nothing), it removes exactly the named server and leaves every real project/user MCP intact, for any CLI routed through the proxy.
+
+```
+# this agent genuinely does design work — keep its tools:
+[wirescope:keep-mcp claude_design]
+```
+
+Server **names** (not tool names) are matched with the same liberal separator. Same forge-safety + stickiness as the other verbs. The deployment toggle is `STRIP_MCP_SERVERS` (comma/space list of servers; empty = off); `keep-mcp` is the per-agent escape hatch.
+
 ## Directives are consumed, not forwarded
 
 The proxy reads and acts on directives, then **strips them before forwarding upstream** — body directives from the system prompt (every `[wirescope:...]` line), and spawn directives from the prompt head (only the consumed leading lines).
@@ -209,6 +220,7 @@ v1.
 - `replace` — live; substitutes a section body inline. Same `WS_OMIT` gate (the section-rewrite family).
 - `keep` — live, the per-target override verb.
 - `tools` / `strip-tools` / `keep-tools` — live; trim the tool roster (allowlist / denylist / override). Gated by `WS_STRIP_TOOLS` (default on; `=0` kill-switch). Sticky per instance like the section verbs.
+- `keep-mcp` — live, per-agent override of the `STRIP_MCP_SERVERS` deployment filter (re-admit a whole `mcp__<server>__*` family). Server names, not tool names.
 - **spawn-position directives** — capability-gated by `WS_SPAWN_DIRECTIVES` (default on; `=0` disables message-content parsing entirely).
 - **operator default policy** — `WS_OMIT_DEFAULT` (comma list; default empty/off); strips those targets from every subagent spawn, keep-overridable.
 - **spawner discovery hint** — `WS_SPAWNER_HINT` (default off); the one model-visible block, self-contained inline grammar, injected only into spawn-capable main agents, never subagents.

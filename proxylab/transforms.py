@@ -827,6 +827,81 @@ def _ws_strip_tools(obj, agent_id=None):
     return log
 
 
+# ---- MCP SERVER TOOL STRIP (surgical, deployment-level) -------------------
+# Drop the tool schemas of named MCP servers from tools[] on the wire, keyed by
+# SERVER PREFIX (`mcp__<server>__*`) rather than exact name. This is the
+# SURGICAL alternative to the CLI's all-or-nothing `--strict-mcp-config`: it
+# removes exactly one server's tool family (present AND future tools) while
+# leaving every real project/user MCP untouched, for EVERY CLI routed through
+# the proxy, with zero ~/.claude.json edits. Motivating case: the claude.ai
+# `claude_design` connector auto-injects 20 tools (~3.5k tok schema/turn) a
+# coding agent never calls, and LATE-ATTACHES on GUI restart -> busts the tools
+# segment 9->29 each relaunch. tools[] is logically FIRST in cache order, so a
+# CONSTANT strip set reshapes the cached prefix to the smaller roster ONCE
+# (one downstream bust at adoption), then rides byte-stable -> net cache WIN +
+# the connector can no longer move the hash restart-to-restart. Determinism: the
+# match is by SET membership on the server prefix, so the client's tool order is
+# irrelevant; SORT_TOOLS (downstream) re-alphabetizes the output anyway, so the
+# forwarded tools[] is byte-identical every turn. Per-agent escape hatch:
+# `[wirescope:keep-mcp claude_design]` re-admits the server for a genuine design
+# session (body/spawn directive, same forge-safety as omit/strip-tools).
+# Default OFF in CODE (library/test embeddings unaffected); start_proxy.sh turns
+# it ON for the lab via STRIP_MCP_SERVERS=claude_design. Kill switch:
+# STRIP_MCP_SERVERS="" (or =off).
+STRIP_MCP_SERVERS = frozenset(
+    s for s in re.split(r"[,\s]+",
+                        os.environ.get("STRIP_MCP_SERVERS", "").strip().lower())
+    if s and s not in ("0", "no", "off", "false"))
+
+
+def _strip_mcp_tools(obj, agent_id=None):
+    """Drop tools[] whose name matches `mcp__<server>__*` for each configured
+    server, minus any the agent re-admits via `[wirescope:keep-mcp <server>]`.
+    Returns a log dict {removed, kept, servers[, miss]} or None (gate off / no
+    tools / no server left to strip). Migrates a cache_control off a stripped
+    tool onto the new last tool if one ever rides it — on the org-scope wire the
+    proxy serves, NO breakpoint marks tools[] (the first marker sits on the
+    system blocks, whose cached prefix still includes tools cumulatively), so
+    this never fires here; it's defensive for a first-party path where the M1
+    tools+preamble breakpoint rides the last tool."""
+    if not STRIP_MCP_SERVERS:
+        return None
+    tools = obj.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    keep = set()
+    for name, value in _ws_merged_pairs(obj, agent_id):
+        if name == "keep-mcp":
+            keep.update(_ws_omit_target_list(value))
+    servers = STRIP_MCP_SERVERS - keep
+    if not servers:
+        return None                          # every configured server re-admitted
+    prefixes = tuple("mcp__%s__" % s for s in servers)
+    kept, removed, lost_cc = [], [], None
+    for t in tools:
+        nm = t.get("name") if isinstance(t, dict) else None
+        if nm and nm.lower().startswith(prefixes):
+            removed.append(nm)
+            if isinstance(t, dict) and t.get("cache_control") and lost_cc is None:
+                lost_cc = t["cache_control"]
+        else:
+            kept.append(t)
+    log = {"servers": sorted(servers)}
+    if not removed:
+        log["removed"] = []
+        log["miss"] = True                   # configured but this req carried none
+        return log
+    # Re-anchor a dropped breakpoint onto the new last tool (defensive; see above).
+    if (lost_cc and kept and isinstance(kept[-1], dict)
+            and not any(isinstance(t, dict) and t.get("cache_control")
+                        for t in kept)):
+        kept[-1]["cache_control"] = lost_cc
+    obj["tools"] = kept
+    log["removed"] = removed
+    log["kept"] = [t.get("name") for t in kept]
+    return log
+
+
 def _ws_reminder_is_empty(text):
     """True if `text` is a <system-reminder> whose every `# Section` was stripped,
     leaving only the wrapper + the "you can use the following context:" intro with
