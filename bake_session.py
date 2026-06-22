@@ -77,6 +77,30 @@ def bake(lines):
             ln["parentUuid"] = survivor_parent(ln["parentUuid"])
             rewired += 1
 
+    # 4) PURE-THINKING TURNS = the ONLY place bake diverges from the LIVE strip.
+    # Live-strip removes thinking blocks only when the coalesced wire message keeps
+    # OTHER content (transforms.py: `if msg_removed and kept:` — it can't emit an
+    # empty content array, the API 400s). So a turn that is ENTIRELY thinking (all
+    # its consecutive assistant lines are thinking-only) survives live-strip intact
+    # on the wire, but bake DELETES it. That's a benign/beneficial divergence (bake
+    # safely out-strips what live-strip structurally can't), but it means a one-time
+    # re-cache at that point even on a strip-ACTIVE session — so we COUNT it as the
+    # divergence predictor: 0 => compact output is byte-identical to the live wire
+    # (pure cache recycle); >0 => that many turns will re-cache once (then slimmer
+    # forever). A run = maximal block of consecutive assistant lines.
+    pure_turns = 0
+    run_all_think = None
+    for ln in lines:
+        if ln.get("type") == "assistant":
+            it = _is_thinking_only(ln)
+            run_all_think = it if run_all_think is None else (run_all_think and it)
+        else:
+            if run_all_think:
+                pure_turns += 1
+            run_all_think = None
+    if run_all_think:
+        pure_turns += 1
+
     stats = {
         "lines_in": len(lines),
         "lines_out": len(kept),
@@ -85,6 +109,8 @@ def bake(lines):
         "carriage_chars_removed": block_chars,          # incl. signatures (the big part)
         "carriage_tokens_removed_est": block_chars // 4,
         "parent_links_rewired": rewired,
+        # wire-divergence predictor (see above): 0 = byte-identical to live-strip
+        "pure_thinking_turns": pure_turns,
     }
     return kept, stats
 

@@ -581,13 +581,29 @@ async def handler(request: Request) -> Response:
         stripped_live = (st["configured_level"] >= 1
                          and (st.get("guard") or {}).get("decision") == "strip")
         if res.get("ok") and not res.get("noop"):
+            # pure-thinking turns are the ONE case bake diverges from live-strip
+            # (live-strip's empty-content guard KEEPS an all-thinking turn it can't
+            # empty; bake deletes it). So on a strip-ACTIVE session the bake is
+            # byte-identical to the wire — hence pure cache RECYCLE — IFF
+            # pure_thinking_turns == 0; each such turn re-caches once even when
+            # strip is live (then permanently slimmer than live-strip can manage).
+            pure = res.get("pure_thinking_turns", 0)
             res["wire_delta"] = {
                 "thinking_stripped_live": stripped_live,
-                "classification": "already_live" if stripped_live else "wire_carried",
-                "note": ("removed bytes the wire already dropped — disk/CPU only, "
-                         "cache recycles" if stripped_live else
-                         "removed wire-carried bytes — durable token win, "
-                         "one-time re-cache on next forward")}
+                "pure_thinking_turns": pure,
+                "byte_identical_to_live_wire": bool(stripped_live and pure == 0),
+                "classification": (
+                    "already_live" if (stripped_live and pure == 0)
+                    else "pure_thinking_recache" if stripped_live
+                    else "wire_carried"),
+                "note": (
+                    "byte-identical to the live-stripped wire — pure cache recycle, "
+                    "disk/CPU only" if (stripped_live and pure == 0) else
+                    f"strip is live, but {pure} pure-thinking turn(s) bake out beyond "
+                    "what live-strip can drop — one-time re-cache there, then slimmer "
+                    "forever" if stripped_live else
+                    "removed wire-carried bytes — durable token win, "
+                    "one-time re-cache on next forward")}
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
     # GET /_report?session=<id>[&detail=1] — read-only, spends nothing. The
