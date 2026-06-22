@@ -532,6 +532,64 @@ async def handler(request: Request) -> Response:
         res = status_mod._subagent_detail(sess, child, maxlen=maxlen)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
+    # POST /_compact?session=<id>&path=<jsonl> — offline transcript compaction
+    # (the bake): rewrite a parked session's JSONL on disk to the maximal SAFE-to-
+    # drop set (today: thinking-only), preserving session_id so `--resume` still
+    # resolves. Bakes ⊆ safe-to-drop (model-correctness, owned in-repo by
+    # bake_session); the wire-delta it produces is a COST signal, not a safety gate
+    # — reported in `wire_delta` so a consumer fires it on COLD resume (re-cache
+    # unavoidable there) and warns on a warm "slim now". Integrity-gated + backed
+    # up + atomic: on any problem returns {ok:false, reason} (200) so the caller
+    # resumes the ORIGINAL untouched. `path` is required (the consumer resolves it;
+    # we never guess and overwrite). 400 only on missing params.
+    if request.method == "POST" and request.url.path.rstrip("/") == "/_compact":
+        q = request.query_params
+        sess, path = q.get("session"), q.get("path")
+        if not sess or not path:
+            return Response(json.dumps({"error": "session and path required"}),
+                            status_code=400, media_type="application/json")
+        # `level` = the consumer's intended bake DEPTH (at cold restore it holds
+        # the intent; the proxy has no live override to read). v1 bakes THINKING
+        # ONLY regardless of level — thinking is always model-safe (whole-block
+        # delete, signature never touched) and it's the durable win whenever the
+        # wire was carrying it. The L2 FOLD-bake (edit-ack/failed-call) is a
+        # different risk class (durable content MUTATION in the transcript, not a
+        # deletion) and stays a wire-only transform for now -> reported, not yet
+        # applied. So `baked_families` is the authoritative "what actually changed".
+        try:
+            level = int(q.get("level")) if q.get("level") is not None else None
+        except (TypeError, ValueError):
+            level = None
+        import bake_session
+        res = bake_session.compact_file(path, expect_session=sess)
+        res["session"] = sess
+        res["requested_level"] = level
+        res["baked_families"] = ["thinking"]
+        if level is not None and level >= 2:
+            res["folds_deferred"] = True   # L2 folds stay wire-only in v1
+        if "carriage_tokens_removed_est" in res:    # consumer-friendly alias
+            res["tokens_removed"] = res["carriage_tokens_removed_est"]
+        # warmth at compaction time + whether this session's wire was ALREADY
+        # being thinking-stripped live -> the cost classification of what we
+        # removed: already_live = bytes the wire dropped anyway (disk/CPU win,
+        # free recycle); wire_carried = bytes the wire still shipped (durable
+        # token win, but a one-time re-cache on the next forward).
+        wq = warmth_mod.warmth_query(session=sess)
+        res["warmth_state"] = ("warm" if wq.get("warm")
+                               else "cold" if wq.get("found") else "absent")
+        st = status_mod._strip_state(sess)
+        stripped_live = (st["configured_level"] >= 1
+                         and (st.get("guard") or {}).get("decision") == "strip")
+        if res.get("ok") and not res.get("noop"):
+            res["wire_delta"] = {
+                "thinking_stripped_live": stripped_live,
+                "classification": "already_live" if stripped_live else "wire_carried",
+                "note": ("removed bytes the wire already dropped — disk/CPU only, "
+                         "cache recycles" if stripped_live else
+                         "removed wire-carried bytes — durable token win, "
+                         "one-time re-cache on next forward")}
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
     # GET /_report?session=<id>[&detail=1] — read-only, spends nothing. The
     # per-session cost/efficiency report (where the tokens AND dollars went +
     # findings + verdict). DISK-based (works on ended/historical sessions),

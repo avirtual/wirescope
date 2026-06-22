@@ -26,7 +26,7 @@ USAGE:
   python3 bake_session.py SESSION.jsonl --apply      # backup + rewrite in place
   python3 bake_session.py SESSION.jsonl --apply -o OUT.jsonl   # write elsewhere
 """
-import json, sys, os, time, argparse
+import json, sys, os, time, argparse, shutil
 
 THINK = ("thinking", "redacted_thinking")
 
@@ -99,6 +99,70 @@ def validate(lines):
         if p is not None and p not in uuids:
             dangling.append((ln.get("uuid"), p))
     return dangling
+
+
+def compact_file(path, expect_session=None):
+    """Programmatic twin of the CLI (the proxy's POST /_compact calls this). Reads
+    a Claude Code transcript JSONL, bakes out the maximal SAFE-to-drop set (today:
+    thinking-only — whole-block deletes, signatures never edited), validates chain
+    integrity BEFORE replacing, backs up + ATOMICALLY rewrites. Never raises for an
+    expected condition — always returns {ok: bool, ...} so the caller can resume
+    the ORIGINAL transcript on any problem rather than risk a broken one.
+
+    Guarantees: NO partial writes. The file on `path` is only ever replaced via
+    os.replace of a fully-written temp, and only after a .bak-<ts> copy exists and
+    the baked chain validated clean. Idempotent: an already-slim file is a no-op
+    (no write, no backup). Outcomes (all dicts):
+      not_found / unreadable / not_a_transcript -> ok:False (no write)
+      session_mismatch (file isn't this session) -> ok:False (no write)
+      chain_integrity (a delete would dangle a parentUuid) -> ok:False (no write)
+      slim already -> ok:True, noop:True (no write)
+      success -> ok:True, noop:False, + stats + backup path
+    """
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "reason": "not_found", "path": path}
+    try:
+        raw = [l for l in open(path) if l.strip()]
+        lines = [json.loads(l) for l in raw]
+    except Exception as e:
+        return {"ok": False, "reason": "unreadable", "error": str(e), "path": path}
+    if not lines:
+        return {"ok": False, "reason": "not_a_transcript", "path": path}
+    # sanity: a real CC transcript is uuid/parentUuid-linked (same gate as the CLI)
+    linked = sum(1 for l in lines if "uuid" in l and "parentUuid" in l)
+    if linked < len(lines) // 2:
+        return {"ok": False, "reason": "not_a_transcript", "path": path,
+                "linked": linked, "lines": len(lines)}
+    # safety: refuse to compact a file that isn't the named session (prevents a
+    # wrong-path request silently rewriting someone else's transcript).
+    if expect_session:
+        sids = {l.get("sessionId") for l in lines if l.get("sessionId")}
+        if sids and expect_session not in sids:
+            return {"ok": False, "reason": "session_mismatch", "path": path,
+                    "found_sessions": sorted(s for s in sids if s)[:3]}
+
+    baked, stats = bake(lines)
+    dangling = validate(baked)
+    if dangling:
+        return {"ok": False, "reason": "chain_integrity",
+                "dangling": len(dangling), "path": path}
+    if stats["thinking_lines_deleted"] == 0:        # already slim -> idempotent no-op
+        return {"ok": True, "noop": True, "path": path, **stats}
+
+    bak = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(path, bak)
+    tmp = f"{path}.tmp-{os.getpid()}-{int(time.time())}"
+    try:
+        with open(tmp, "w") as fh:
+            for ln in baked:
+                fh.write(json.dumps(ln, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)                       # atomic swap into place
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return {"ok": False, "reason": "write_failed", "error": str(e),
+                "backup": bak, "path": path}
+    return {"ok": True, "noop": False, "path": path, "backup": bak, **stats}
 
 
 def main():
