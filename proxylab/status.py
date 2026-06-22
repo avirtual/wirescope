@@ -116,7 +116,19 @@ def _identity():
                           "strip_tools": transforms_mod.WS_STRIP_TOOLS,
                           # `[wirescope:strip-thinking on|off]` per-session opt-in
                           # (twin of the /_strip endpoint); always parsed.
-                          "strip_thinking": True},
+                          "strip_thinking": True,
+                          # `[wirescope:keep-mcp <server>]` per-agent re-admit of
+                          # a STRIP_MCP_SERVERS-filtered family; always parsed.
+                          "keep_mcp": True},
+            # MCP-server tool strip (STRIP_MCP_SERVERS): the LIVE configured set
+            # of server prefixes this port surgically drops from tools[]. A
+            # consumer gating its own --strict-mcp-config should check the actual
+            # server is in `servers` here, NOT just that traffic is routed — a
+            # routed port with strip OFF (empty servers) still ships those tools,
+            # so "routed" alone is the wrong contract boundary. Empty list = the
+            # feature is off on this port (kill switch or unconfigured).
+            "strip_mcp": {"available": True,
+                          "servers": sorted(transforms_mod.STRIP_MCP_SERVERS)},
         },
         "endpoints": {
             "identity": "/_identity",
