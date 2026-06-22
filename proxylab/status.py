@@ -266,6 +266,11 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
             # heaviness snapshot (turns_in_context resets at /compact)
             "turns_completed": (tot or {}).get("turns"),
             "context": meta_mod._context_stats(sid),
+            # per-session thinking-strip state, so a consumer can RECONCILE its
+            # configured intent against proxy-truth (closes the fire-once-and-
+            # forget desync) — reconcile against `configured_level`, never the
+            # guard. See _strip_state.
+            "strip": _strip_state(sid),
             # Task-spawned subagents that share this session_id (each with its
             # own model + request count) — shown under the main agent so the two
             # are obviously distinct and neither overwrites the other.
@@ -300,6 +305,46 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
     if meta_err:
         res["proxy"]["session_meta_error"] = meta_err
     return res
+
+
+def _strip_state(sid):
+    """Per-session thinking-strip state for /_status — the proxy-truth a consumer
+    (clodex) reconciles its configured intent against, killing the fire-once-and-
+    forget desync (a /_strip POST that silently didn't land left the consumer
+    believing L2 while the wire shipped L0).
+
+    RECONCILE AGAINST `configured_level` (+ check `source=="override"`): it is the
+    level the proxy WILL apply going forward = the per-session override if one is
+    recorded, else the deployment global default. When a consumer's POST /_strip
+    landed, the override is recorded and `configured_level` reflects it on the very
+    next poll; when it didn't land, `configured_level` falls back to the global
+    default (here 0) and `source` stays "global_default" — that mismatch is the
+    re-POST signal. An explicit override IMMEDIATELY forces the guard latch (the
+    setter eats the one-time warm re-cache the consumer asked for), so for an
+    override-set session there is NO cold-gated holding-off to fight.
+
+    Do NOT reconcile against the guard: `guard.latched` is the cold-gated
+    strip/no-strip DECISION and is only ever held off (`latched:null`) on the
+    AUTOMATIC/global path (sessions with no override). Re-POSTing because the guard
+    reads null would fight a legitimate cold-gate — and is unnecessary, since
+    setting an override resolves the guard immediately. Guard fields are for
+    DIAGNOSIS only. `riders_available` = the L2 bundle (read/edit fold + edit-ack/
+    tool-error free-rider stubs) is in the configured level; those riders fire
+    CONDITIONALLY per turn (only inside a region the thinking-strip already busted),
+    so this is "in the ceiling," not "fired this turn"."""
+    override = transforms_mod._STRIP_OVERRIDE.get(sid)
+    global_default = transforms_mod._global_strip_level()
+    configured = override if override is not None else global_default
+    latched = transforms_mod._STRIP_GUARD_LATCH.get(sid)   # bool | None (not yet decided)
+    return {
+        "configured_level": configured,
+        "source": "override" if override is not None else "global_default",
+        "global_default_level": global_default,
+        "riders_available": configured >= 2,
+        "guard": {"latched": latched,
+                  "decision": (None if latched is None
+                               else "strip" if latched else "no_strip")},
+    }
 
 
 def _subagents_with_active(sid, now):
