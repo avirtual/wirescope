@@ -317,9 +317,10 @@ def _split_system_rest(obj):
 # ships the volatile `# Environment` block (cwd/git-branch/commits) in `system`. Because
 # the cache prefix is cumulative (tools -> system -> messages), env sits UPSTREAM of
 # CLAUDE.md and POISONS it: a branch/commit/worktree change re-WRITES the (often large)
-# CLAUDE.md segment every session. This transform moves the two volatile, header-
-# delimited pieces (`# Environment`, `# currentDate`) DOWN to a tail block right before
-# the prompt, and gives the now-static CLAUDE.md bundle its OWN cache_control marker
+# CLAUDE.md segment every session. This transform moves the volatile, header-
+# delimited pieces (`# Environment`, `# Scratchpad Directory` — a per-session UUID
+# path, see RELOCATE_SCRATCHPAD_TO_TAIL below — and `# currentDate`) DOWN to a tail
+# block right before the prompt, and gives the now-static CLAUDE.md bundle its OWN cache_control marker
 # (the 4th breakpoint). Resulting layering:
 #   M1 tools+preamble+static | M2 contextmgmt+append | M4 CLAUDE.md | M3 env+date+prompt
 # so CLAUDE.md becomes an env-independent, project-shared cache segment.
@@ -336,7 +337,14 @@ def _split_system_rest(obj):
 # prevailing ttl (1h/5m) — a bare 5m marker before the CLI's 1h markers is a hard 400.
 RELOCATE_ENV_TO_TAIL = os.environ.get("RELOCATE_ENV_TO_TAIL", "1") not in ("0", "no", "off", "false")
 RELOCATE_CLAUDEMD_PATHSTAMP = os.environ.get("RELOCATE_CLAUDEMD_PATHSTAMP", "1") not in ("0", "no", "off", "false")
+# `# Scratchpad Directory` (CLI ≥ ~2026-07) embeds a per-session UUID path MID-WAY
+# through the big agent-prompt block (between `# Communicating with the user` and
+# `# Context management`) — every fresh/cleared instance rotates the UUID and busts
+# the whole block from that point. Same disease as `# Environment`, same cure: peel
+# the section (header → next `\n# ` header) down to the relocated tail.
+RELOCATE_SCRATCHPAD_TO_TAIL = os.environ.get("RELOCATE_SCRATCHPAD_TO_TAIL", "1") not in ("0", "no", "off", "false")
 _ENV_SECTION_HDR = "\n# Environment"
+_SCRATCHPAD_SECTION_HDR = "\n# Scratchpad Directory"
 _DATE_SECTION_HDR = "# currentDate"
 _PATHSTAMP_RE = re.compile(r"Contents of /[^\n]*?CLAUDE\.md")
 
@@ -378,18 +386,31 @@ def _relocate_env_to_tail(obj):
     if cmd is None:
         return None                          # no bundle block to anchor / pull date from
     moved = []
+
+    def _peel_system_section(hdr):
+        """Cut a header-delimited section (hdr → next top-level `\n# ` header) out of
+        whichever system block carries it. Returns the section text ('' if absent)."""
+        blk = next((b for b in sysb if isinstance(b, dict)
+                    and isinstance(b.get("text"), str)
+                    and hdr in b["text"]), None)
+        if blk is None:
+            return ""
+        bt = blk["text"]
+        i = bt.find(hdr)
+        j = bt.find("\n# ", i + len(hdr))
+        blk["text"] = bt[:i] + (bt[j:] if j != -1 else "")
+        return (bt[i:j] if j != -1 else bt[i:]).strip()
+
     # 1) pull the `# Environment` section out of whichever system block carries it
-    rest = next((b for b in sysb if isinstance(b, dict)
-                 and isinstance(b.get("text"), str)
-                 and _ENV_SECTION_HDR in b["text"]), None)
-    moved_env = ""
-    if rest is not None:
-        rt = rest["text"]
-        i = rt.find(_ENV_SECTION_HDR)
-        j = rt.find("\n# ", i + len(_ENV_SECTION_HDR))   # next top-level header (e.g. # Context management)
-        moved_env = (rt[i:j] if j != -1 else rt[i:]).strip()
-        rest["text"] = rt[:i] + (rt[j:] if j != -1 else "")
+    moved_env = _peel_system_section(_ENV_SECTION_HDR)
+    if moved_env:
         moved.append("# Environment")
+    # 1b) same for the per-session-UUID `# Scratchpad Directory` section
+    moved_scratch = ""
+    if RELOCATE_SCRATCHPAD_TO_TAIL:
+        moved_scratch = _peel_system_section(_SCRATCHPAD_SECTION_HDR)
+        if moved_scratch:
+            moved.append("# Scratchpad Directory")
     # 2) pull the `# currentDate` section out of the claudeMd bundle (keep # userEmail)
     ct = cmd["text"]
     moved_date = ""
@@ -408,7 +429,7 @@ def _relocate_env_to_tail(obj):
         if n:
             cmd["text"] = new
             moved.append("pathstamp")
-    pieces = [p for p in (moved_env, moved_date) if p]
+    pieces = [p for p in (moved_env, moved_scratch, moved_date) if p]
     if not pieces:
         return None
     # 3) assemble the relocated tail and insert it right AFTER the bundle block
