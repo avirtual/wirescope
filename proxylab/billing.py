@@ -144,6 +144,14 @@ PRICES = {
     # legacy opus 4.0 / 4.1 (also catches their dated full ids)
     "claude-opus-4":   {"in": 15.0, "out": 75.0, "cache_write_5m": 18.75, "cache_write_1h": 30.0, "cache_read": 1.50},
     "claude-sonnet-4": {"in": 3.0,  "out": 15.0, "cache_write_5m": 3.75,  "cache_write_1h": 6.0,  "cache_read": 0.30},
+    # sonnet-5 has TIME-DEPENDENT pricing: INTRODUCTORY ($2/$10) is in effect
+    # through 2026-08-31; STANDARD ($3/$15, == sonnet-4) starts 2026-09-01.
+    # Entry below is the INTRO rate (correct for all captures + live traffic
+    # until the cutover). ⚠️ FLIP ON 2026-09-01 to in:3/out:15/w5m:3.75/
+    # w1h:6.0/read:0.30 (or make _price_for date-aware — see note to fable).
+    # Distinct model id (newer tokenizer, ~30% more tokens; wire counts already
+    # reflect it, so no per-token adjustment — only the $/token rate differs).
+    "claude-sonnet-5": {"in": 2.0,  "out": 10.0, "cache_write_5m": 2.50,  "cache_write_1h": 4.0,  "cache_read": 0.20},
     "claude-haiku-4":  {"in": 1.0,  "out": 5.0,  "cache_write_5m": 1.25,  "cache_write_1h": 2.0,  "cache_read": 0.10},
 }
 
