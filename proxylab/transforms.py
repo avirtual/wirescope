@@ -1064,12 +1064,17 @@ def _ws_strip_spawn_directives(obj):
 
 def _ws_spawner_hint(obj):
     """Inject the constant spawner discovery hint (WS_SPAWNER_HINT, see
-    above) as a TRAILING system block — appended after the last system block, so
-    it lands past the system cache breakpoint: stable position, busts nothing
-    before it, ~tiny uncached tail. Gated to spawner requests only (not a
+    above) as a TRAILING system block, then MIGRATE the last system cache
+    marker onto it — so the hint rides INSIDE the marked system prefix (the
+    fleet-shared segment: same model+tools = same bytes across projects)
+    instead of the msg0-bounded per-project segment it'd land in past the
+    breakpoint. Marker MOVE, not add (4-breakpoint budget intact); the hint
+    stays its own block (clean proxy-authored attribution, canary sees a
+    distinct block, CLI text never mutated) — same marker-migration pattern
+    as STRIP_MCP's tools[-1]. Gated to spawner requests only (not a
     subagent; carries a spawn tool). Idempotent (won't double-inject). Returns
-    {injected:True} or None. Default OFF — this is the lone wire-visible
-    proxy-authored text in the whole protocol."""
+    {injected:True, marker_moved:bool} or None. Default OFF — this is the lone
+    wire-visible proxy-authored text in the whole protocol."""
     if not WS_SPAWNER_HINT:
         return None
     if writer_mod._genuine_subagent(obj):          # never teach a real subagent
@@ -1086,8 +1091,17 @@ def _ws_spawner_hint(obj):
     if any(isinstance(b, dict) and isinstance(b.get("text"), str)
            and "[wirescope] " in b["text"] for b in sys):
         return None                                # already present (idempotent)
-    sys.append({"type": "text", "text": _WS_HINT_TEXT})
-    return {"injected": True}
+    hint = {"type": "text", "text": _WS_HINT_TEXT}
+    # migrate the LAST system cache marker onto the hint block (move, never
+    # add: the 4-breakpoint budget is the CLI's). If no system block carries
+    # a marker (org-scope oddity / stream shapes), inject unmarked — the old
+    # trailing-tail behavior, still correct.
+    donor = next((b for b in reversed(sys)
+                  if isinstance(b, dict) and b.get("cache_control")), None)
+    if donor is not None:
+        hint["cache_control"] = donor.pop("cache_control")
+    sys.append(hint)
+    return {"injected": True, "marker_moved": donor is not None}
 
 
 # ---- TOOL SORT (experimental, off by default) -----------------------------

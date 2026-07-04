@@ -1261,6 +1261,29 @@ check("no hint for a main agent WITHOUT a spawn tool (Agent/Task absent)",
       lp.transforms._ws_spawner_hint(_spawner_obj(tools=("Read", "Bash"))) is None)
 check("no hint for a subagent (cc_is_subagent), even with a spawn tool",
       lp.transforms._ws_spawner_hint(_spawner_obj(sysflag="cc_is_subagent=true")) is None)
+check("hint with NO marked system block injects unmarked (marker_moved False, no marker invented)",
+      _hres.get("marker_moved") is False and "cache_control" not in _hobj["system"][-1])
+# marker migration: hint must ride INSIDE the marked system prefix (fleet-shared
+# segment), inheriting the LAST system marker — move, never add (budget is the CLI's)
+def _marked_spawner_obj():
+    o = _spawner_obj()
+    o["system"] = [
+        {"type": "text", "text": "You are Claude Code"},
+        {"type": "text", "text": "preamble",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        {"type": "text", "text": "big agent prompt",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+    return o
+_mobj = _marked_spawner_obj()
+_mres = lp.transforms._ws_spawner_hint(_mobj)
+check("hint MIGRATES the last system cache marker onto itself (donor stripped, ttl preserved)",
+      _mres == {"injected": True, "marker_moved": True}
+      and "cache_control" not in _mobj["system"][2]
+      and _mobj["system"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
+check("marker migration is a MOVE not an ADD (system marker count unchanged)",
+      sum(1 for b in _mobj["system"] if b.get("cache_control")) == 2)
+check("earlier system markers untouched by the migration",
+      _mobj["system"][1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
 lp.transforms.WS_SPAWNER_HINT = False
 check("spawner hint is off by default -> no-op",
       lp.transforms._ws_spawner_hint(_spawner_obj()) is None)
