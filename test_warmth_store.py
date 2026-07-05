@@ -3402,33 +3402,40 @@ check("nav: unknown session -> empty nav, no entry",
 # from the RECEIPT + prior head hashes (no body retention). Covers all five
 # classes, the write-frac append gate, and the main-line-only head guard.
 _bc_pure = lp.warmth._classify_bust
+
+
+# prior head tuple is (tools, sys_marked, sysfull, msg0); cur_* mirror it. The
+# helper defaults every current hash to the unchanged sentinel so each case only
+# names the ONE hash it perturbs (and its prior counterpart).
+def _cls(read, created, inp, *, prior, t="T", s="S", sf="SF", m="M", lapsed=False):
+    return _bc_pure(read, created, inp, prior=prior, cur_tools=t, cur_sys=s,
+                    cur_sysfull=sf, cur_msg0=m, lapsed=lapsed)
+
+
+_ALL = ("T", "S", "SF", "M")     # a prior head byte-identical to the current one
 check("classify: warm append (big read, tiny write) is not a bust",
-      _bc_pure(100000, 500, 5, prior=("T", "S", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+      _cls(100000, 500, 5, prior=_ALL) is None)
 check("classify: first turn (no prior head) is not a bust",
-      _bc_pure(0, 9000, 20, prior=None,
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+      _cls(0, 9000, 20, prior=None) is None)
 check("classify: tools change -> tools (total bust, first in cache order)",
-      _bc_pure(0, 8000, 20, prior=("T0", "S", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "tools")
-check("classify: system change (tools same) -> system",
-      _bc_pure(30, 8000, 20, prior=("T", "S0", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "system")
+      _cls(0, 8000, 20, prior=("T0", "S", "SF", "M")) == "tools")
+check("classify: marked system change (tools same) -> system",
+      _cls(30, 8000, 20, prior=("T", "S0", "SF", "M")) == "system")
+check("classify: past-marker system change (only sysfull differs) -> system",
+      # the clodex sanity-check case: a system[] block sitting PAST the last cache
+      # marker changed — marked `sys` hash is identical, only the full-system hash
+      # moved. Must file as `system`, NOT a false `conversation`.
+      _cls(30, 8000, 20, prior=("T", "S", "SF0", "M")) == "system")
 check("classify: messages[0] change (tools+sys same) -> preamble",
-      _bc_pure(2000, 8000, 20, prior=("T", "S", "M0"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "preamble")
+      _cls(2000, 8000, 20, prior=("T", "S", "SF", "M0")) == "preamble")
 check("classify: static prefix identical + not lapsed -> conversation (our bug)",
-      _bc_pure(3000, 8000, 20, prior=("T", "S", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "conversation")
+      _cls(3000, 8000, 20, prior=_ALL) == "conversation")
 check("classify: static prefix identical + lapsed -> lapse (time-caused)",
-      _bc_pure(0, 8000, 20, prior=("T", "S", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=True) == "lapse")
+      _cls(0, 8000, 20, prior=_ALL, lapsed=True) == "lapse")
 check("classify: content-divergence wins over lapse when both present",
-      _bc_pure(0, 8000, 20, prior=("T0", "S", "M"),
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=True) == "tools")
+      _cls(0, 8000, 20, prior=("T0", "S", "SF", "M"), lapsed=True) == "tools")
 check("classify: write_frac just under the gate -> append, not a bust",
-      _bc_pure(9000, 1400, 100, prior=("T", "S", "M0"),   # 1400/10500 = 0.133
-               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+      _cls(9000, 1400, 100, prior=("T", "S", "SF", "M0")) is None)   # 1400/10500=0.133
 
 
 def _bc_body(sys2, date, nmsgs, sid="sess-bc"):
@@ -3488,6 +3495,31 @@ check("live classifier: the next main turn after a subagent is unaffected (appen
       _r6["bust_class"] is None)
 check("bust_summary: unknown / never-busted session -> None",
       lp.warmth.bust_summary("sess-bc-ghost") is None)
+
+# past-marker system change, live path (the clodex sanity-check, end to end): a
+# body whose LAST cache marker is on system[1], with an UNMARKED trailing block
+# (our `[wirescope]` injection) at system[2]. Changing only that trailing block
+# leaves the marked `tools`/`system` segment hashes identical, but the full-system
+# hash moves -> must classify `system` (content), never a false `conversation`.
+def _bc_body_tail(tail_text, nmsgs, sid="sess-bc-tail"):
+    b = _bc_body(_BSA, "2026-07-05", nmsgs, sid=sid)
+    # replace the 3-block system with: marked preamble, marked prompt, UNMARKED tail
+    b["system"] = [
+        {"type": "text", "text": "You are Claude Code.",
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        {"type": "text", "text": _BSA,
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+        {"type": "text", "text": tail_text}]        # past the last marker
+    return b
+
+
+_rt1 = _bc_rec(_bc_body_tail("[wirescope] omit=useremail", 2), 0, 4000)      # establish
+_rt2 = _bc_rec(_bc_body_tail("[wirescope] omit=useremail", 3), 4000, 300)    # append
+_rt3 = _bc_rec(_bc_body_tail("[wirescope] omit=useremail claudemd", 4), 30, 6000)  # tail changed
+check("live classifier: a past-marker system-block change classifies as `system`",
+      _rt1["bust_class"] is None and _rt2["bust_class"] is None
+      and _rt3["bust_class"] == "system"
+      and lp.warmth.bust_summary("sess-bc-tail")["by_class"]["conversation"] == 0)
 
 print()
 if FAILS:

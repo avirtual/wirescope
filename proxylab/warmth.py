@@ -88,6 +88,15 @@ store_mod.register_schema(
     # whole history re-writes, tools+system survive) from a CONVERSATION bust (a
     # mid-history message changed while msg0 held). Additive; old rows -> NULL.
     "ALTER TABLE session_head ADD COLUMN msg0_hash TEXT",
+    # full-system hash (2026-07-06): the session's last-seen hash of the WHOLE
+    # system[] array (billing header excluded), NOT just the marked segment. The
+    # classifier's system check compares this so a change in a system block PAST
+    # the last cache marker (e.g. our own trailing `[wirescope]` injection, or any
+    # layout with the system prompt past the final marker) files as a `system`
+    # bust, never a false `conversation`. Additive; old rows -> NULL. See
+    # _sys_full_hash / _classify_bust. (The marked-segment hashes stay in
+    # session_head.sys_hash for cross-session warmth sharing — different job.)
+    "ALTER TABLE session_head ADD COLUMN sysfull_hash TEXT",
     # REAL-BUST counter (2026-07-06): per-session cumulative count of turns whose
     # write landed UPSTREAM of the prior cache end (previously-cached tokens
     # invalidated + re-paid at the write premium) — NOT the normal tail-append
@@ -183,6 +192,23 @@ def _msg0_hash(obj):
     return h.hexdigest()
 
 
+def _sys_full_hash(obj):
+    """blake2b of the WHOLE system[] array (billing header excluded — it's
+    out-of-band, never cached), cache_control-stripped. The bust classifier's
+    system check compares this, NOT the marked-segment hash: every system[] block
+    is upstream of messages[0] and participates in the messages[0] cache
+    breakpoint, so a change in a block that sits PAST the last cache marker (e.g.
+    our own trailing `[wirescope]` injection, or any layout where the system
+    prompt lives past the final marker) is still a SYSTEM-region bust — folding
+    the full array in files it as `system`/content, never a false `conversation`
+    (which would render loud/self and blame the wrong subsystem). None when there
+    is no system block. (Kept separate from _segment_hashes, whose marked-boundary
+    hashes drive cross-session warmth SHARING — those must stay marker-aligned.)"""
+    return hashlib.blake2b(
+        _stable_sys_text(obj).encode("utf-8", "replace"), digest_size=20
+    ).hexdigest() if obj.get("system") else None
+
+
 # ---- REAL-BUST classifier (live per-request twin of report.bust_series) -------
 # A "real bust" = a turn whose write landed UPSTREAM of the prior cache end
 # (previously-cached tokens invalidated + re-paid at the write premium), NOT the
@@ -215,22 +241,27 @@ _BUST_FAULT = {
 }
 
 
-def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_msg0, lapsed):
+def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_sysfull,
+                   cur_msg0, lapsed):
     """Classify this turn's cache event against the prior session_head row.
-    `prior` = (tools_hash, sys_hash, msg0_hash) of the last head, or None on the
-    session's first turn (an initial cold start is NOT a bust). Returns a class in
-    {tools, system, preamble, conversation, lapse} or None (normal append / not a
-    bust). Most-upstream divergence wins (it dominates the cache cost), matching
-    the canonical order tools -> system -> messages[0] -> deeper; a lapsed head
-    with an unchanged static prefix is the time-caused `lapse`.
+    `prior` = (tools_hash, sys_hash, sysfull_hash, msg0_hash) of the last head, or
+    None on the session's first turn (an initial cold start is NOT a bust). Returns
+    a class in {tools, system, preamble, conversation, lapse} or None (normal
+    append / not a bust). Most-upstream divergence wins (it dominates the cache
+    cost), matching the canonical order tools -> system -> messages[0] -> deeper; a
+    lapsed head with an unchanged static prefix is the time-caused `lapse`.
 
-    tools/sys hashes are the CUMULATIVE leading-breakpoint segment hashes
-    (_segment_hashes): `tools` = tools + preamble, `sys` = through the LAST system
-    marker. Real CLI traffic marks a block after the system prompt (verified on
-    4.x + fable + opus), so a system-prompt swap moves `sys` — the common model-
-    swap bust is caught. A layout with the system prompt entirely past the last
-    marker would fall through to `conversation`; the /_bust disk drill-down stays
-    the byte-exact ground truth for that rare case."""
+    The `tools` hash is the CUMULATIVE first-marker segment (_segment_hashes:
+    tools + the 'You are Claude Code' preamble) — a tools[] edit moves it. For the
+    SYSTEM check we compare TWO hashes: `sys` (the marked-segment hash, through the
+    LAST system cache marker — the common model/prompt-swap path) AND `sysfull`
+    (the WHOLE system[] array via _sys_full_hash). The second is what makes this
+    robust to layout: every system[] block is upstream of messages[0], so a change
+    in a block sitting PAST the last marker (our own trailing `[wirescope]`
+    injection, or any layout with the system prompt past the final marker) is still
+    a system-region bust — folding the full array in files it as `system`, never a
+    false `conversation` (which renders loud/self and would blame the wrong
+    subsystem). /_bust's disk diff stays the byte-exact ground truth."""
     window = (read or 0) + (created or 0) + (inp or 0)
     if window <= 0:
         return None
@@ -238,17 +269,18 @@ def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_msg0, l
         return None                          # tail-append write, not a real bust
     if prior is None:
         return None                          # first turn = initial cold start
-    p_tools, p_sys, p_msg0 = prior
+    p_tools, p_sys, p_sysfull, p_msg0 = prior
     if p_tools is not None and p_tools != cur_tools:
         return "tools"
-    if p_sys is not None and p_sys != cur_sys:
+    if (p_sys is not None and p_sys != cur_sys) or \
+       (p_sysfull is not None and p_sysfull != cur_sysfull):
         return "system"
     if p_msg0 is not None and p_msg0 != cur_msg0:
         return "preamble"
-    # static prefix (tools+system+msg0) is byte-identical to the prior head: the
-    # write landed deeper. A lapsed head means the bytes were fine but the cache
-    # went cold (time-caused); an unlapsed head means a settled mid-history
-    # message actually changed (content-caused — usually one of our transforms).
+    # static prefix (tools + full system + msg0) is byte-identical to the prior
+    # head: the write landed deeper. A lapsed head means the bytes were fine but
+    # the cache went cold (time-caused); an unlapsed head means a settled
+    # mid-history message actually changed (content — usually one of our transforms).
     return "lapse" if lapsed else "conversation"
 
 
@@ -578,6 +610,7 @@ def _record_warmth(obj, usage, is_main=True):
         bust_class = None
         head_advance = bool(sid and not ping and is_main)
         cur_msg0 = _msg0_hash(obj) if head_advance else None
+        cur_sysfull = _sys_full_hash(obj) if head_advance else None
         inp = (usage or {}).get("input_tokens") or 0
         with store_mod.LOCK:
             # COLD-RESUME detection (before we restamp). A real turn whose
@@ -593,14 +626,17 @@ def _record_warmth(obj, usage, is_main=True):
             prior_seg = None
             if head_advance:
                 prev = con.execute(
-                    "SELECT hash, cold_resumes, tools_hash, sys_hash, msg0_hash "
-                    "FROM session_head WHERE session_id=?", (sid,)).fetchone()
+                    "SELECT hash, cold_resumes, tools_hash, sys_hash, msg0_hash, "
+                    "sysfull_hash FROM session_head WHERE session_id=?",
+                    (sid,)).fetchone()
                 if prev:
                     pe = con.execute("SELECT expires_at FROM warmth WHERE hash=?",
                                      (prev[0],)).fetchone()
                     resumed = (not pe) or (pe[0] <= now)
                     new_resumes = (prev[1] or 0) + (1 if resumed else 0)
-                    prior_seg = (prev[2], prev[3], prev[4])
+                    # (tools_hash, sys_hash, sysfull_hash, msg0_hash) — the order
+                    # _classify_bust unpacks its `prior` tuple in.
+                    prior_seg = (prev[2], prev[3], prev[5], prev[4])
             con.executemany("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
                             "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
                             "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "
@@ -617,6 +653,7 @@ def _record_warmth(obj, usage, is_main=True):
                     read, created, inp, prior=prior_seg,
                     cur_tools=(segs.get("tools") or {}).get("hash"),
                     cur_sys=(segs.get("system") or {}).get("hash"),
+                    cur_sysfull=cur_sysfull,
                     cur_msg0=cur_msg0, lapsed=resumed)
                 if bust_class:
                     con.execute(
@@ -628,16 +665,18 @@ def _record_warmth(obj, usage, is_main=True):
                         "last_write_tokens=excluded.last_write_tokens",
                         (sid, bust_class, now, created))
                 con.execute("INSERT INTO session_head(session_id, hash, updated_at, "
-                            "tools_hash, sys_hash, msg0_hash, cold_resumes) "
-                            "VALUES(?,?,?,?,?,?,?) "
+                            "tools_hash, sys_hash, msg0_hash, sysfull_hash, "
+                            "cold_resumes) VALUES(?,?,?,?,?,?,?,?) "
                             "ON CONFLICT(session_id) DO UPDATE SET "
                             "hash=excluded.hash, updated_at=excluded.updated_at, "
                             "tools_hash=excluded.tools_hash, sys_hash=excluded.sys_hash, "
-                            "msg0_hash=excluded.msg0_hash, cold_resumes=excluded.cold_resumes",
+                            "msg0_hash=excluded.msg0_hash, "
+                            "sysfull_hash=excluded.sysfull_hash, "
+                            "cold_resumes=excluded.cold_resumes",
                             (sid, h, now,
                              (segs.get("tools") or {}).get("hash"),
                              (segs.get("system") or {}).get("hash"),
-                             cur_msg0, new_resumes))
+                             cur_msg0, cur_sysfull, new_resumes))
             con.commit()
             size = con.execute("SELECT COUNT(*) FROM warmth").fetchone()[0]
     except Exception as e:
