@@ -343,9 +343,29 @@ RELOCATE_CLAUDEMD_PATHSTAMP = os.environ.get("RELOCATE_CLAUDEMD_PATHSTAMP", "1")
 # the whole block from that point. Same disease as `# Environment`, same cure: peel
 # the section (header → next `\n# ` header) down to the relocated tail.
 RELOCATE_SCRATCHPAD_TO_TAIL = os.environ.get("RELOCATE_SCRATCHPAD_TO_TAIL", "1") not in ("0", "no", "off", "false")
+# The volatile date line rolls over at midnight → a byte change inside the cached
+# claudeMd bundle → the whole message prefix busts on the next resume/turn that
+# crosses midnight (measured live: read 26.6k / write 163.2k). Relocating it to a
+# tail reminder does NOT help — the tail sits UPSTREAM of the last-message cache
+# marker, so the history still busts. STRIP it out of the prefix entirely so the
+# static bundle is date-independent (zero midnight bust); agents can infer the
+# date without a hardcoded line. Set STRIP_CURRENT_DATE=0 to fall back to the old
+# relocate-to-tail behavior (keeps the date visible, but only shields the bundle,
+# not the history, from a midnight rollover).
+STRIP_CURRENT_DATE = os.environ.get("STRIP_CURRENT_DATE", "1") not in ("0", "no", "off", "false")
 _ENV_SECTION_HDR = "\n# Environment"
 _SCRATCHPAD_SECTION_HDR = "\n# Scratchpad Directory"
 _DATE_SECTION_HDR = "# currentDate"
+# Match ONLY the GENUINE currentDate section: a column-0 `# currentDate` header
+# line immediately followed by the `Today's date is …` line. Plain substring
+# matching (`ct.find("# currentDate")`) mis-fires on CLAUDE.md PROSE that mentions
+# `# currentDate` in backticks (this repo's own flag table does exactly that) —
+# it hits an earlier, wrong occurrence, and because a markdown table row has no
+# blank-line terminator it then sweeps ~18k chars into the tail while the REAL
+# date section survives in the cached bundle and busts it at midnight. The `(?m)^`
+# anchor requires the header at column 0, so a backtick-wrapped mid-line mention
+# never matches.
+_CURRENT_DATE_RE = re.compile(r"(?m)^# currentDate[ \t]*\r?\n(?:Today's date is[^\n]*\r?\n?)?")
 _PATHSTAMP_RE = re.compile(r"Contents of /[^\n]*?CLAUDE\.md")
 
 
@@ -411,16 +431,21 @@ def _relocate_env_to_tail(obj):
         moved_scratch = _peel_system_section(_SCRATCHPAD_SECTION_HDR)
         if moved_scratch:
             moved.append("# Scratchpad Directory")
-    # 2) pull the `# currentDate` section out of the claudeMd bundle (keep # userEmail)
+    # 2) handle the volatile `# currentDate` block in the claudeMd bundle (keep
+    #    # userEmail). Match ONLY the genuine section (column-0 header + the
+    #    `Today's date is …` line) — never a backtick prose mention in CLAUDE.md.
+    #    STRIP_CURRENT_DATE (default) removes it from the cached prefix entirely;
+    #    else fall back to relocating it into the tail reminder.
     ct = cmd["text"]
     moved_date = ""
-    di = ct.find(_DATE_SECTION_HDR)
-    if di != -1:
-        de = ct.find("\n\n", di)
-        if de == -1:
-            de = len(ct)
-        moved_date = ct[di:de].strip()
-        cmd["text"] = ct[:di].rstrip("\n") + "\n" + ct[de:].lstrip("\n")
+    stripped_date = False
+    m_date = _CURRENT_DATE_RE.search(ct)
+    if m_date:
+        cmd["text"] = ct[:m_date.start()].rstrip("\n") + "\n" + ct[m_date.end():].lstrip("\n")
+        if STRIP_CURRENT_DATE:
+            stripped_date = True                 # dropped from the prefix, not relocated
+        else:
+            moved_date = m_date.group(0).strip()  # legacy: relocate to the tail
         moved.append("# currentDate")
     # 2b) optional: dedupe the worktree-volatile absolute path stamp (only the
     #     claudeMd bundle carries a "Contents of <abspath>/CLAUDE.md" stamp)
@@ -430,12 +455,17 @@ def _relocate_env_to_tail(obj):
             cmd["text"] = new
             moved.append("pathstamp")
     pieces = [p for p in (moved_env, moved_scratch, moved_date) if p]
-    if not pieces:
+    if not pieces and not stripped_date:
         return None
-    # 3) assemble the relocated tail and insert it right AFTER the bundle block
-    #    (so it lands between the bundle and the prompt marker)
-    tail = "<system-reminder>\n" + "\n\n".join(pieces) + "\n</system-reminder>"
-    msgs[mi]["content"].insert(bi + 1, {"type": "text", "text": tail})
+    # 3) assemble the relocated tail (if anything to relocate) and insert it right
+    #    AFTER the bundle block (between the bundle and the prompt marker). A pure
+    #    date STRIP relocates nothing — it just left the prefix date-independent —
+    #    so there may be no tail to insert; still fall through to add the bundle's
+    #    own cache marker below (the strip reshaped the bundle worth protecting).
+    tail = None
+    if pieces:
+        tail = "<system-reminder>\n" + "\n\n".join(pieces) + "\n</system-reminder>"
+        msgs[mi]["content"].insert(bi + 1, {"type": "text", "text": tail})
     # 4) give the bundle its OWN cache_control breakpoint ONLY when it's the large
     #    static CLAUDE.md segment worth protecting as a shareable unit. For a tiny
     #    userEmail-only bundle (no CLAUDE.md) a marker buys nothing and would just
@@ -456,7 +486,8 @@ def _relocate_env_to_tail(obj):
             cc["ttl"] = last_sys_ttl
         cmd["cache_control"] = cc
         claudemd_ttl = cc.get("ttl")
-    return {"moved": moved, "has_claudemd": has_claudemd, "tail_chars": len(tail),
+    return {"moved": moved, "stripped_date": stripped_date, "has_claudemd": has_claudemd,
+            "tail_chars": len(tail) if tail else 0,
             "bundle_chars_after": len(cmd["text"]), "claudemd_ttl": claudemd_ttl}
 
 
