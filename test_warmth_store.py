@@ -677,7 +677,7 @@ empty_sub = lp._render_session_html(psid, lp._subagent_request(psid, "verificati
                                     snap_p, subrole="verification")
 check("missing-role subagent page renders gracefully (no crash, shows note)",
       "&#8627; <b>verification</b>" in empty_sub
-      and "no replayable request" in empty_sub.lower())
+      and "no request found" in empty_sub.lower())
 
 # --- concurrent custom subagents keyed by x-claude-code-agent-id instance ---------
 # Three customs spawned at once all classify as role "subagent"; the agent-id
@@ -1684,8 +1684,54 @@ check("session view escapes message content",
 check("session view never renders headers",
       "authorization" not in _sv.lower() and "x-api-key" not in _sv.lower())
 check("session view handles a missing entry",
-      "no replayable request" in lp._render_session_html(
+      "no request found" in lp._render_session_html(
           "nope", None, lp._status_snapshot(session="nope")))
+# --- cold-session disk fallback (2026-07-05): viewing is a distinct feature from
+# replay — once the sweeper drops the replayable entry (memory + SQLite), the
+# view rebuilds from the capture files instead of blanking. Fixture: a real main
+# turn + its response, a NEWER title side-call (must not win), a subagent turn.
+_cold_dir = pathlib.Path(os.environ["LOG_DIR"]) / "sess-cold-view-1"
+_cold_dir.mkdir(exist_ok=True)
+(_cold_dir / "001-clodex-parent-fable-5-120000.request.json").write_text(json.dumps(
+    {"seq": 1, "ts": "2026-07-05T12:00:00", "path": "/v1/messages",
+     "body": {"model": "claude-fable-5",
+              "tools": [{"name": "Bash", "description": "d"}],
+              "messages": [{"role": "user", "content": "COLD-MAIN-MARKER"}]},
+     "summary": {"role": "parent", "n_tools": 1, "agent_id": None}}))
+(_cold_dir / "001-clodex-parent-fable-5-120000.response.json").write_text(json.dumps(
+    {"seq": 1, "status_code": 200,
+     "billing": {"tokens": {"input_tokens": 7, "cache_read_input_tokens": 900,
+                            "output_tokens": 40}, "est_usd": 0.0123},
+     "meta": {"text": "COLD-ANSWER-MARKER", "stop_reason": "end_turn"}}))
+(_cold_dir / "002-clodex-parent-fable-5-120001.request.json").write_text(json.dumps(
+    {"seq": 2, "ts": "2026-07-05T12:00:01", "path": "/v1/messages",
+     "body": {"model": "claude-haiku-4-5",
+              "messages": [{"role": "user", "content": "title me"}]},
+     "summary": {"role": "parent", "n_tools": 0, "agent_id": None}}))
+(_cold_dir / "003-clodex-general-purpose-haiku-120002.request.json").write_text(json.dumps(
+    {"seq": 3, "ts": "2026-07-05T12:00:02", "path": "/v1/messages",
+     "body": {"model": "claude-haiku-4-5",
+              "messages": [{"role": "user", "content": "COLD-SUB-MARKER"}]},
+     "summary": {"role": "general-purpose", "n_tools": 0, "agent_id": "a1b2c3"}}))
+_ce, _cr, _cu = lp.views._load_last_request_disk("sess-cold-view-1")
+check("disk fallback finds the real main turn, not the newer title side-call",
+      _ce and _ce["from_disk"] and "COLD-MAIN-MARKER" in json.dumps(_ce["obj"])
+      and _ce["obj"]["model"] == "claude-fable-5")
+check("disk fallback rebuilds answer + receipts from the paired response",
+      _cr and _cr["text"] == "COLD-ANSWER-MARKER" and _cr["stop_reason"] == "end_turn"
+      and _cu and _cu["cache_read_input_tokens"] == 900 and _cu["est_usd"] == 0.0123)
+check("disk fallback resolves a subagent instance by agent_id and by role",
+      all("COLD-SUB-MARKER" in json.dumps(
+              lp.views._load_last_request_disk("sess-cold-view-1", subkey=k)[0]["obj"])
+          for k in ("a1b2c3", "general-purpose")))
+_cold_html = lp._render_session_html("sess-cold-view-1", _ce,
+                                     lp._status_snapshot(session="sess-cold-view-1"),
+                                     resp=_cr, usage=_cu)
+check("cold view renders the disk capture with the view-only badge + answer",
+      "view-only, not replayable" in _cold_html
+      and "COLD-MAIN-MARKER" in _cold_html and "COLD-ANSWER-MARKER" in _cold_html)
+check("disk fallback returns empty for an uncaptured session",
+      lp.views._load_last_request_disk("sess-never-existed") == (None, None, None))
 # /_session affordances (2026-06-12): cache-boundary dividers, expand-without-
 # duplication previews, slim tool lines, last-turn token receipts in the header
 check("a marked system block draws a cache-boundary divider",

@@ -20,7 +20,9 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from proxylab import billing as billing_mod
 from proxylab import codex as codex_mod
+from proxylab import core as core_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import store as store_mod
@@ -336,6 +338,80 @@ def _load_last_request_row(session_id):
     return None
 
 
+def _load_last_request_disk(session_id, subkey=None):
+    """VIEW-ONLY cold fallback: the newest captured request straight from the
+    session's capture dir, for when the replayable entry is gone (swept past
+    TTL+grace, or /_end'd). Replaying and viewing are distinct features — a
+    cold prefix genuinely can't be pinged, but the bytes on disk are still the
+    debugging record; without this the only ways to inspect a cold session
+    were re-warming the whole prefix or losing it. Returns (entry, resp,
+    usage); entry carries from_disk=True so the render badges it view-only
+    (never handed to the pinger). Main line = parent/unknown role, preferring
+    real turns (n_tools > 0) over title/probe side-calls; subkey = a subagent
+    instance (agent_id, fallback role — same key the /_status rows use)."""
+    d = core_mod.LOG_DIR / session_id
+    try:
+        files = sorted(d.glob("*.request.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        files = []
+    pick = side_call = None
+    for rf in files:
+        try:
+            rec = json.loads(rf.read_text())
+        except Exception:
+            continue
+        obj = rec.get("body")
+        if not isinstance(obj, dict) or not (obj.get("messages") or obj.get("input")):
+            continue
+        summ = rec.get("summary") or {}
+        if subkey is not None:
+            if subkey not in (summ.get("agent_id"), summ.get("role")):
+                continue
+        elif not codex_mod._is_openai_body(obj):  # codex: no roles/subagents
+            if summ.get("role") not in ("parent", "unknown"):
+                continue
+            if not summ.get("n_tools"):
+                # title/probe side-call shape — keep only as a last resort
+                side_call = side_call or (rf, rec)
+                continue
+        pick = (rf, rec)
+        break
+    pick = pick or side_call
+    if pick is None:
+        return None, None, None
+    rf, rec = pick
+    try:
+        ts = time.mktime(time.strptime(rec.get("ts") or "", "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        try:
+            ts = rf.stat().st_mtime
+        except OSError:
+            ts = None
+    entry = {"obj": rec.get("body"), "path": rec.get("path"), "ts": ts,
+             "from_disk": True}
+    # the paired response capture still holds the turn's answer + receipts —
+    # same shapes the in-memory _LAST_RESPONSE/_LAST_USAGE would have had
+    resp = usage = None
+    rp = rf.with_name(rf.name[:-len(".request.json")] + ".response.json")
+    try:
+        rrec = json.loads(rp.read_text())
+        rts = rp.stat().st_mtime
+    except Exception:
+        rrec, rts = None, None
+    if isinstance(rrec, dict):
+        m = rrec.get("meta") or {}
+        if m.get("text"):
+            resp = {"text": m["text"],
+                    "truncated": len(m["text"]) >= billing_mod._META_TEXT_CAP,
+                    "stop_reason": m.get("stop_reason"), "ts": rts or ts}
+        tok = (rrec.get("billing") or {}).get("tokens")
+        if tok:
+            usage = {**tok, "est_usd": (rrec.get("billing") or {}).get("est_usd"),
+                     "ts": rts or ts}
+    return entry, resp, usage
+
+
 def _flat_text(content):
     """All human-readable text under a content value (str | block list)."""
     if isinstance(content, str):
@@ -640,8 +716,8 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
                 f'<style>{_SESSION_CSS}</style></head><body>'
                 + head + body + foot + "</body></html>")
     if not entry:
-        body = ('<p class="warn">no replayable request tracked for this session '
-                '— nothing captured yet, evicted, or ended via /_end.</p>')
+        body = ('<p class="warn">no request found for this session — nothing '
+                'captured yet (in memory, SQLite, or the on-disk captures).</p>')
         obj = {}
     else:
         obj = entry.get("obj") or {}
@@ -655,6 +731,12 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
         m_ch = len(json.dumps(msgs)) if msgs else 0
         auth_badge = (' <span class="warn">awaiting auth (restored)</span>'
                       if entry.get("needs_auth") else "")
+        if entry.get("from_disk"):
+            # cold-session view: rebuilt from the capture files, not the
+            # replayable in-memory/SQLite entry (swept once the prefix went
+            # cold) — viewing is read-only, so cold is fine; pinging isn't.
+            auth_badge = (' <span class="cold">&#10052;&#65039; from disk '
+                          'capture (view-only, not replayable)</span>')
         n_turns = meta_mod._turn_stats(obj)["turns_in_context"]
         turns_link = (f'<span>turns <b><a href="#turn-{n_turns}">{n_turns}'
                       f'</a></b></span>' if n_turns else '')

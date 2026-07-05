@@ -665,8 +665,13 @@ async def handler(request: Request) -> Response:
         # role — so concurrent same-role subagents each get their own page.
         subkey = request.query_params.get("sub") or request.query_params.get("role")
         if subkey:
+            sub_entry = meta_mod._subagent_request(sess, subkey)
+            if sub_entry is None:
+                # cold fallback: swept subagent state, but the captures remain
+                sub_entry, _, _ = views_mod._load_last_request_disk(sess,
+                                                                    subkey=subkey)
             return Response(views_mod._render_session_html(
-                                sess, meta_mod._subagent_request(sess, subkey),
+                                sess, sub_entry,
                                 status_mod._status_snapshot(session=sess),
                                 subrole=subkey),
                             media_type="text/html; charset=utf-8")
@@ -680,11 +685,19 @@ async def handler(request: Request) -> Response:
         # from the per-turn capture files. The reconstruction stitches the final
         # answer in as its last item, so don't also render the standalone resp.
         recon = report_mod.codex_ws_transcript(sess)
+        # Cold-session VIEW fallback: the sweeper deletes the replayable entry
+        # (memory + SQLite mirror) once the prefix is provably cold — right for
+        # replay, wrong to blank the read-only view while the capture files are
+        # still on disk. Rebuild view/answer/receipts from the captures instead.
+        disk_resp = disk_usage = None
+        if entry is None and recon is None:
+            entry, disk_resp, disk_usage = views_mod._load_last_request_disk(sess)
         return Response(views_mod._render_session_html(
                             sess, recon or entry,
                             status_mod._status_snapshot(session=sess),
-                            resp=None if recon else meta_mod._LAST_RESPONSE.get(sess),
-                            usage=meta_mod._LAST_USAGE.get(sess)),
+                            resp=None if recon else (meta_mod._LAST_RESPONSE.get(sess)
+                                                     or disk_resp),
+                            usage=meta_mod._LAST_USAGE.get(sess) or disk_usage),
                         media_type="text/html; charset=utf-8")
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
