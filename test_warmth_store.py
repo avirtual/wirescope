@@ -3139,8 +3139,15 @@ check("/_context: strip_prior_edit_acks panel surfaces the L2 ack reclaim",
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
 
 # --- STRIP_TASK_REMINDERS: skip the CLI's accreting task-tool nag blocks -------
+# Gated on the L2 strip level (rides _strip_l2_enabled). The test objects carry
+# no session_id, so _strip_level falls to the global default -> force it via
+# STRIP_L2 / STRIP_PRIOR_THINKING here (save + restore all three flags).
 _str_save = lp.transforms.STRIP_TASK_REMINDERS
+_l2_save = lp.transforms.STRIP_L2
+_l1_save = lp.transforms.STRIP_PRIOR_THINKING
 lp.transforms.STRIP_TASK_REMINDERS = True
+lp.transforms.STRIP_L2 = True          # global default level -> 2
+lp.transforms.STRIP_PRIOR_THINKING = True
 _NAG = ("The task tools haven't been used recently. If you're working on tasks "
         "that would benefit from tracking progress, consider using TaskCreate...")
 
@@ -3168,7 +3175,7 @@ def _nag_msgs():
 
 _no = {"messages": _nag_msgs()}
 _nr = lp.transforms._strip_task_reminders(_no)
-check("strip_task_reminders: drops the system-message form whole",
+check("strip_task_reminders: drops the system-message form whole (at L2)",
       _nr and _nr["system_msgs"] == 1
       and not any(m.get("role") == "system" for m in _no["messages"]))
 check("strip_task_reminders: drops the wrapped user block, keeps its tool_result",
@@ -3185,10 +3192,24 @@ _sole = {"messages": [
 check("strip_task_reminders: sole-block nag stays (never empties a message)",
       lp.transforms._strip_task_reminders(_sole) is None
       and len(_sole["messages"][0]["content"]) == 1)
+# L1 (thinking only, no L2) leaves the nags — the strip rides the L2 gate.
+lp.transforms.STRIP_L2 = False
+check("strip_task_reminders: L1 (below L2) leaves the nags in place",
+      lp.transforms._strip_task_reminders({"messages": _nag_msgs()}) is None)
+# L0 (no stripping at all) likewise.
+lp.transforms.STRIP_PRIOR_THINKING = False
+check("strip_task_reminders: L0 leaves the nags in place",
+      lp.transforms._strip_task_reminders({"messages": _nag_msgs()}) is None)
+# Kill-switch: at L2 but STRIP_TASK_REMINDERS off -> nudge preserved, other L2
+# folds unaffected (they don't route through this function).
+lp.transforms.STRIP_L2 = True
+lp.transforms.STRIP_PRIOR_THINKING = True
 lp.transforms.STRIP_TASK_REMINDERS = False
-check("strip_task_reminders: no-op while the flag is off",
+check("strip_task_reminders: kill-switch off at L2 preserves the nudge",
       lp.transforms._strip_task_reminders({"messages": _nag_msgs()}) is None)
 lp.transforms.STRIP_TASK_REMINDERS = _str_save
+lp.transforms.STRIP_L2 = _l2_save
+lp.transforms.STRIP_PRIOR_THINKING = _l1_save
 
 print()
 if FAILS:

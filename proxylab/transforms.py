@@ -519,7 +519,7 @@ def _strip_system_sections(obj):
     return {"removed": removed} if removed else None
 
 
-# ---- TASK-REMINDER STRIP (off in code; on via start_proxy.sh) --------------
+# ---- TASK-REMINDER STRIP (rides the L2 strip level) ------------------------
 # The CLI nags "The task tools haven't been used recently..." (~421 ch ≈ 105
 # tok) every few tool-heavy turns, and each nag lands in settled history — so
 # they ACCRETE: a long clodex session carried 4+, re-shipped on every request,
@@ -533,14 +533,24 @@ def _strip_system_sections(obj):
 # bare substring test would eat conversation that merely QUOTES the text
 # (live capture: a tool_result Reading a clodex message file contained the
 # needle; deleting a tool_result also breaks tool_use pairing -> API 400).
-# Unconditional while on (no usage-gating: a gate that flips when the session
-# starts using tasks would flip prefix bytes mid-session — the anti-flap trap
-# the strip-guard latch exists for). Deterministic every turn -> byte-stable;
-# reminders debut at the tail, so stripping-from-arrival never busts a warm
-# prefix. MODEL-VISIBLE: deletes Anthropic's nudge — an agent you WANT on the
-# task list shouldn't route through a port with this on.
-STRIP_TASK_REMINDERS = os.environ.get("STRIP_TASK_REMINDERS", "0") in (
-    "1", "yes", "on", "true")
+#
+# GATE = the per-session L2 strip level (>=2), same as the other content folds
+# (fold_read_edits / edit-ack / tool-error stubbing) — NOT a process-global
+# flag. So an L2 session strips the nags; L1/L0 leave them (an agent you WANT
+# nudged toward the task list just stays below L2, or a whole-fleet run keeps
+# the nudge with STRIP_TASK_REMINDERS=0 below). This deletes Anthropic's nudge,
+# so it belongs with the other opt-in L2 simplifications, not always-on.
+# Unlike the edit-ack/tool-error riders it needs NO `busted_from` gate: nags
+# debut at the tail, so stripping-from-arrival can never ORIGINATE a warm-prefix
+# bust (the reason those riders only fire inside a thinking-strip's bust region
+# doesn't apply). Deterministic every turn -> byte-stable; no usage-gating (a
+# gate that flipped when a session started using tasks would flip prefix bytes
+# mid-session — the anti-flap trap the strip-guard latch exists for).
+# STRIP_TASK_REMINDERS is a KILL-SWITCH (default ON): the real gate is L2, but
+# set it to 0 to preserve the nudge even in L2 sessions (keep the other L2
+# folds, lose only the nag strip).
+STRIP_TASK_REMINDERS = os.environ.get("STRIP_TASK_REMINDERS", "1") not in (
+    "0", "no", "off", "false")
 _TASK_REMINDER_NEEDLE = "The task tools haven't been used recently"
 
 
@@ -556,10 +566,12 @@ def _is_task_reminder_text(text):
     return t.startswith(_TASK_REMINDER_NEEDLE)
 
 
-def _strip_task_reminders(obj):
-    """Delete task-tool nag reminders wherever they appear in messages[].
-    Returns a log dict, or None if nothing matched. Idempotent."""
-    if not STRIP_TASK_REMINDERS:
+def _strip_task_reminders(obj, agent_id=None):
+    """Delete task-tool nag reminders wherever they appear in messages[]. Runs
+    at the L2 strip level (rides `_strip_l2_enabled`, same as fold/edit-ack);
+    the STRIP_TASK_REMINDERS kill-switch can force it off even at L2. Returns a
+    log dict, or None if nothing matched / the gate is closed. Idempotent."""
+    if not (STRIP_TASK_REMINDERS and _strip_l2_enabled(obj, agent_id)):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list):

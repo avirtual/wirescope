@@ -958,12 +958,6 @@ async def handler(request: Request) -> Response:
             if strp:
                 record["system_strip"] = strp
                 changed = True
-            # Task-reminder strip: skip the CLI's accreting "task tools haven't
-            # been used" nags wherever they appear in history (model-visible).
-            trs = transforms_mod._strip_task_reminders(obj)
-            if trs:
-                record["task_reminder_strip"] = trs
-                changed = True
             # WIRESCOPE [wirescope:omit ...]: strip author-opted-out context
             # sections (# claudeMd / # userEmail) from messages[0]. Effective
             # targets merge body + spawn directives (per-agent + per-call opt-in).
@@ -1078,6 +1072,17 @@ async def handler(request: Request) -> Response:
                 record["fold_read_edits"] = fld
                 if fld.get("folded_read_bodies") or fld.get("stubbed_edit_calls") or fld.get("stubbed_edit_acks"):
                     changed = True
+            # TASK-REMINDER STRIP (part of STRIP LEVEL 2): drop the CLI's
+            # accreting "task tools haven't been used" nags wherever they
+            # appear in history. L2-gated inside the transform (rides
+            # _strip_l2_enabled, so the level directive resolved above at
+            # _strip_thinking_enabled is already in force); kill-switch
+            # STRIP_TASK_REMINDERS can force it off. No busted_from — nags
+            # arrive at the tail, so stripping them never originates a bust.
+            trs = transforms_mod._strip_task_reminders(obj, agent_id=agent_id)
+            if trs:
+                record["task_reminder_strip"] = trs
+                changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the
             # model speaks the ack; this request becomes the replayable,
