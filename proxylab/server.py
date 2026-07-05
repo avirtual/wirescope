@@ -619,6 +619,19 @@ async def handler(request: Request) -> Response:
         res = report_mod.session_report(sess, detail=detail)
         return Response(json.dumps(res, indent=2), media_type="application/json")
 
+    # GET /_bust?session=<id> — read-only cache-divergence forensics. Per main-line
+    # transition: WHERE the prefix first diverged (survived-prefix depth from the
+    # receipt + the byte-change vs the previous turn) and HOW BIG the re-write was,
+    # flagging the actionable static-prefix busts (a model swap, a date rollover)
+    # apart from routine cold-resume history rewrites. DISK-based, on-demand.
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_bust":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response(json.dumps({"error": "session required"}),
+                            status_code=400, media_type="application/json")
+        res = report_mod.bust_series(sess)
+        return Response(json.dumps(res, indent=2), media_type="application/json")
+
     # ---- timeline page: per-request cost evolution, for humans -----------------
     # GET /_timeline?session=<id> — read-only HTML render of the cost-over-time
     # dashboard (the visual companion to /_report?detail=1). DISK-based, heavy,
@@ -663,6 +676,29 @@ async def handler(request: Request) -> Response:
         # parent's pingable request nor the parent's response/usage receipts).
         # The key is the x-claude-code-agent-id when the spawn had one, else the
         # role — so concurrent same-role subagents each get their own page.
+        # ?turn=<i> — the turn NAVIGATOR: render the i-th main-line captured
+        # request (0-based, chronological) from disk, with prev/next arrows and a
+        # 'vs previous turn' cache panel (this turn's read/write + the bust locus
+        # from report.bust_series). Every request is captured, so turns are just
+        # positions in the on-disk series. Disk-based + heavy, on-demand only.
+        turn_q = request.query_params.get("turn")
+        if turn_q is not None:
+            try:
+                ti = int(turn_q)
+            except (TypeError, ValueError):
+                return Response("turn must be an integer", status_code=400,
+                                media_type="text/plain")
+            entry, t_resp, t_usage, nav = views_mod._load_request_by_index(sess, ti)
+            bust_t = None
+            if nav.get("i") is not None:
+                by_stem = {t["stem"]: t for t in report_mod.bust_series(sess)["transitions"]}
+                cur = views_mod._main_line_turns(sess)[nav["i"]]
+                bust_t = by_stem.get(cur["stem"])
+            return Response(views_mod._render_session_html(
+                                sess, entry,
+                                status_mod._status_snapshot(session=sess),
+                                resp=t_resp, usage=t_usage, nav=nav, bust_t=bust_t),
+                            media_type="text/html; charset=utf-8")
         subkey = request.query_params.get("sub") or request.query_params.get("role")
         if subkey:
             sub_entry = meta_mod._subagent_request(sess, subkey)

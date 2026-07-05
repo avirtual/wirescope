@@ -3211,6 +3211,180 @@ lp.transforms.STRIP_TASK_REMINDERS = _str_save
 lp.transforms.STRIP_L2 = _l2_save
 lp.transforms.STRIP_PRIOR_THINKING = _l1_save
 
+# --- currentDate strip: never bust the cache at a midnight rollover ----------
+# The volatile `# currentDate` / "Today's date is …" line lives inside the cached
+# claudeMd bundle; a midnight change busts the whole message prefix on resume. It
+# must be stripped out of the prefix, and — critically — the matcher must NOT
+# mis-fire on CLAUDE.md PROSE that mentions `# currentDate` in backticks (which
+# sits at an EARLIER position and, being a markdown table row with no blank-line
+# terminator, would otherwise sweep a huge chunk into the tail while the real
+# date section survives and busts the bundle — the live 2026-07-06 bug).
+_sd_save = lp.transforms.STRIP_CURRENT_DATE
+
+
+def _date_obj():
+    # claudeMd bundle carries BOTH the backtick prose `# currentDate` (a decoy at
+    # an earlier offset) AND the genuine section near the end, plus # userEmail.
+    bundle = ("<system-reminder>\n# claudeMd\n"
+              "| flag | on | Peel `# Environment`/`# currentDate` to a tail |\n"
+              "more docs with no blank lines for a long stretch " + "x" * 500 + "\n"
+              "# userEmail\nThe user's email address is a@b.c.\n"
+              "# currentDate\nToday's date is 2026-07-06.\n\n"
+              "      IMPORTANT: this may not be relevant.\n</system-reminder>")
+    return {"system": [
+                {"type": "text", "text": "You are Claude Code.",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                {"type": "text", "text": "\n# Environment\ncwd /x\n"
+                 "# Scratchpad Directory\nUUID /y\n",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": bundle}]},
+                {"role": "user", "content": [{"type": "text", "text": "go"}]}]}
+
+
+lp.transforms.STRIP_CURRENT_DATE = True
+_do = _date_obj()
+_dlog = lp.transforms._relocate_env_to_tail(_do)
+_db0 = _do["messages"][0]["content"][0]["text"]
+check("currentDate strip: genuine 'Today's date is' removed from the bundle",
+      "Today's date is" not in _db0 and _dlog.get("stripped_date") is True)
+check("currentDate strip: backtick prose `# currentDate` decoy left untouched",
+      "`# currentDate`" in _db0)
+check("currentDate strip: bundle intro (# claudeMd) + # userEmail preserved",
+      "# claudeMd" in _db0 and "# userEmail" in _db0)
+check("currentDate strip: no giant sweep — tail is just env+scratchpad, date-free",
+      _dlog["tail_chars"] < 500
+      and "Today's date is" not in _do["messages"][0]["content"][1]["text"])
+check("currentDate strip: bundle keeps its own 1h cache_control marker",
+      _do["messages"][0]["content"][0].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
+# idempotent: a second pass finds nothing volatile left
+check("currentDate strip: idempotent re-run -> None",
+      lp.transforms._relocate_env_to_tail(_do) is None)
+# strip-only (no # Environment/# Scratchpad in system): still strips + still marks
+_do2 = _date_obj()
+_do2["system"] = [_do2["system"][0]]                 # drop the env-bearing block
+_dlog2 = lp.transforms._relocate_env_to_tail(_do2)
+check("currentDate strip: strip-only bundle still stripped + cache-marked, no tail",
+      _dlog2.get("stripped_date") is True
+      and "Today's date is" not in _do2["messages"][0]["content"][0]["text"]
+      and len(_do2["messages"][0]["content"]) == 1
+      and _do2["messages"][0]["content"][0].get("cache_control") is not None)
+# legacy relocate path (STRIP_CURRENT_DATE=0): date leaves the bundle for the tail
+lp.transforms.STRIP_CURRENT_DATE = False
+_do3 = _date_obj()
+_dlog3 = lp.transforms._relocate_env_to_tail(_do3)
+check("currentDate strip=0: legacy relocate moves the date to the tail, not the bundle",
+      _dlog3.get("stripped_date") is False
+      and "Today's date is" not in _do3["messages"][0]["content"][0]["text"]
+      and "Today's date is" in _do3["messages"][0]["content"][1]["text"])
+lp.transforms.STRIP_CURRENT_DATE = _sd_save
+
+# --- bust locator (report.bust_series): cache-divergence forensics -----------
+# Synthesize a main-line session on disk and assert the engine classifies each
+# transition from the RECEIPT (warm append vs rewrite) and localizes the change:
+# a model-flavor system swap and a msg[0] date rollover are STATIC-PREFIX busts
+# (the fixable class); a warm tail-append is not a bust even though bytes grew.
+_bust_dir = os.path.join(os.environ["LOG_DIR"], "sess-bust-1")
+os.makedirs(_bust_dir, exist_ok=True)
+
+
+def _bust_body(sys2, date, n_msgs, tail="go"):
+    # a claudeMd bundle carrying the volatile date + a swappable system[2] block +
+    # a growing user/assistant history. system[1] is the marked preamble.
+    bundle = ("<system-reminder>\n# claudeMd\n" + "C" * 400
+              + "\n# userEmail\nme@x.co\n# currentDate\nToday's date is " + date
+              + ".\n</system-reminder>")
+    msgs = [{"role": "user", "content": [{"type": "text", "text": bundle}]}]
+    for k in range(n_msgs):
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": f"reply {k} " + "z" * 300}]})
+        msgs.append({"role": "user", "content": [{"type": "text", "text": f"ask {k} " + "q" * 60}]})
+    msgs.append({"role": "user", "content": [{"type": "text", "text": tail}]})
+    return {"model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "You are Claude Code.",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                       {"type": "text", "text": sys2}],
+            "tools": [{"name": "Bash", "description": "b" * 200}],
+            "messages": msgs}
+
+
+def _bust_turn(seq, ts, body, tokens):
+    base = os.path.join(_bust_dir, f"{seq:03d}-clodex-parent-opus-4-8")
+    json.dump({"summary": {"role": "parent", "n_tools": 1, "model": "claude-opus-4-8"},
+               "ts": ts, "body": body}, open(base + ".request.json", "w"))
+    json.dump({"status_code": 200, "billing": {"model": "claude-opus-4-8",
+               "tokens": tokens, "est_usd": 0.0}, "meta": {"text": "ok"}},
+              open(base + ".response.json", "w"))
+
+
+_SYS_A = "\nYou are an interactive agent.\n# Communicating with the user\nSpeak nicely." + " " * 20
+_SYS_B = "\nYou are an interactive agent.\nWrite code that reads like the surrounding." + " " * 20
+_B0 = 1_700_100_000.0
+# turn1: cold establish (everything written). turn2: warm append (big read, tiny
+# tail write). turn3: system[2] swap -> static-prefix bust (read collapses below
+# system). turn4: warm append again. turn5: msg[0] date rollover -> static-prefix
+# bust (tools+system read warm, msg[0]-> rewrites).
+_bust_turn(1, _B0, _bust_body(_SYS_A, "2026-07-05", 2),
+           {"input_tokens": 20, "output_tokens": 40,
+            "cache_read_input_tokens": 0, "cache_write_1h_tokens": 4000})
+_bust_turn(2, _B0 + 60, _bust_body(_SYS_A, "2026-07-05", 3),
+           {"input_tokens": 5, "output_tokens": 40,
+            "cache_read_input_tokens": 4000, "cache_write_1h_tokens": 300})
+_bust_turn(3, _B0 + 120, _bust_body(_SYS_B, "2026-07-05", 4),
+           {"input_tokens": 5, "output_tokens": 40,
+            "cache_read_input_tokens": 30, "cache_write_1h_tokens": 5000})
+_bust_turn(4, _B0 + 180, _bust_body(_SYS_B, "2026-07-05", 5),
+           {"input_tokens": 5, "output_tokens": 40,
+            "cache_read_input_tokens": 6000, "cache_write_1h_tokens": 300})
+_bust_turn(5, _B0 + 240, _bust_body(_SYS_B, "2026-07-06", 6),
+           {"input_tokens": 5, "output_tokens": 40,
+            "cache_read_input_tokens": 800, "cache_write_1h_tokens": 7000})
+
+_bs = lp.report.bust_series("sess-bust-1")
+_tr = {t["from_seq"]: t for t in _bs["transitions"]}
+check("bust_series: 4 transitions over 5 main-line turns",
+      _bs["count"] == 4 and len(_bs["transitions"]) == 4)
+check("bust_series: warm tail-append (turn1->2) is NOT a bust",
+      _tr[1]["bust"] is False and _tr[1]["severity"] == "append")
+check("bust_series: system[2] swap (turn2->3) is a static-prefix bust, locus=system",
+      _tr[2]["bust"] and _tr[2]["static_prefix_bust"]
+      and (_tr[2]["locus"] or {}).get("segment") == "system")
+check("bust_series: system swap surfaces the old->new snippet diff",
+      "Communicating with the user" in ((_tr[2]["locus"] or {}).get("old") or "")
+      and "Write code that reads" in ((_tr[2]["locus"] or {}).get("new") or ""))
+check("bust_series: system swap read collapsed below system (survived tools/none)",
+      (_tr[2]["survived_prefix"] or {}).get("boundary") in ("none", "tools"))
+check("bust_series: warm append after the swap (turn3->4) is NOT a bust",
+      _tr[3]["bust"] is False)
+check("bust_series: date rollover (turn4->5) is a static-prefix bust at messages[0]",
+      _tr[4]["bust"] and _tr[4]["static_prefix_bust"]
+      and (_tr[4]["locus"] or {}).get("segment") == "messages"
+      and (_tr[4]["locus"] or {}).get("index") == 0)
+check("bust_series: date rollover diff shows 2026-07-05 -> 2026-07-06",
+      "2026-07-05" in ((_tr[4]["locus"] or {}).get("old") or "")
+      and "2026-07-06" in ((_tr[4]["locus"] or {}).get("new") or ""))
+check("bust_series: exactly the two preamble changes are static-prefix busts",
+      _bs["n_static_prefix_busts"] == 2
+      and {t["from_seq"] for t in _bs["static_prefix_busts"]} == {2, 4})
+check("bust_series: worst bust is the largest write (the date rollover, w=7000)",
+      _bs["worst"]["from_seq"] == 4 and _bs["worst"]["write_tokens"] == 7000)
+check("bust_series: empty/unknown session -> zero transitions, no crash",
+      lp.report.bust_series("sess-does-not-exist")["count"] == 0)
+
+# --- session turn navigator (_load_request_by_index) -------------------------
+_nv0 = lp.views._load_request_by_index("sess-bust-1", 0)
+_nvL = lp.views._load_request_by_index("sess-bust-1", -1)     # -1 = latest
+_nvC = lp.views._load_request_by_index("sess-bust-1", 999)    # clamps to last
+check("nav: index 0 loads turn 1 with next but no prev",
+      _nv0[3]["i"] == 0 and _nv0[3]["prev"] is None and _nv0[3]["next"] == 1
+      and _nv0[3]["n"] == 5 and _nv0[0]["from_disk"] is True)
+check("nav: -1 resolves to the latest turn (i=4), no next",
+      _nvL[3]["i"] == 4 and _nvL[3]["next"] is None and _nvL[3]["prev"] == 3)
+check("nav: out-of-range index clamps to the last turn",
+      _nvC[3]["i"] == 4)
+check("nav: unknown session -> empty nav, no entry",
+      lp.views._load_request_by_index("nope", 0) == (None, None, None,
+            {"i": None, "n": 0, "prev": None, "next": None, "seq": None, "ts": None}))
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

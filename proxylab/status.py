@@ -80,6 +80,7 @@ def _identity():
             "context_skills": True,       # /_context per-skill roster + utilization
             "context_report": True,       # /_report?session= cost/efficiency report
             "context_timeline": True,     # /_report?...&detail=1 series + /_timeline HTML
+            "bust_locator": True,         # /_bust?session= cache-divergence forensics
             # prior-turn thinking strip: per-session consumer opt-in via /_strip
             # or [wirescope:strip-thinking on]. `default` = the global flag (what
             # `effective` is when no per-session override is set). When the proxy
@@ -143,6 +144,7 @@ def _identity():
             "context": "/_context",
             "report": "/_report",
             "timeline": "/_timeline",
+            "bust": "/_bust",
             "strip": "/_strip",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md

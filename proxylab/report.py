@@ -940,6 +940,298 @@ def _series(pairs):
     }
 
 
+# ---- BUST LOCATOR (disk-based cache-divergence forensics) -----------------
+# Automates the "where did the cache bust" forensics: walk main-line requests
+# chronologically and, for each transition, find the FIRST point at which the
+# cacheable prefix diverges from the previous turn — in the real cache order
+# tools -> system -> messages. A divergence UPSTREAM of the appended tail means a
+# cached prefix had to be re-written (a bust); the deeper/earlier it sits, the
+# more of the window pays the write toll. The receipt (cache_read vs
+# cache_creation tokens) gives the magnitude; the body diff gives the LOCUS.
+#
+# N-1 is used as the cache proxy for N: the real cache lineage can be an older
+# turn or a warm sibling, but the adjacent forwarded body is what changed
+# turn-to-turn and is exactly what a human diffs by hand. All comparison is on
+# cache_control-STRIPPED canonical bytes (the rolling marker hops to the new last
+# message every turn — hashing it would make an unchanged history look changed).
+_BUST_SNIP = 40                      # chars of context each side of a divergence
+
+
+def _bust_canon(node):
+    """cache_control-stripped, key-sorted JSON of a node — the shape the prompt
+    cache compares (a moved cache_control marker must NOT read as a change)."""
+    def strip(n):
+        if isinstance(n, dict):
+            return {k: strip(v) for k, v in n.items() if k != "cache_control"}
+        if isinstance(n, list):
+            return [strip(v) for v in n]
+        return n
+    return json.dumps(strip(node), sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _text_first_diff(x, y):
+    """First char index where two strings differ, with a symmetric snippet of the
+    OLD and NEW bytes around it. (len(x), None, None) if x is a pure prefix of y."""
+    n = min(len(x), len(y))
+    i = 0
+    while i < n and x[i] == y[i]:
+        i += 1
+    if i == n and len(x) == len(y):
+        return None, None, None                 # identical
+    lo = max(0, i - _BUST_SNIP)
+    return i, x[lo:i + _BUST_SNIP], y[lo:i + _BUST_SNIP]
+
+
+def _is_billing_block(b):
+    return (isinstance(b, dict) and isinstance(b.get("text"), str)
+            and b["text"].startswith("x-anthropic-billing-header"))
+
+
+def _content_first_diff(ca, cb, skip_billing=False):
+    """First divergent block between two content lists (system blocks or a
+    message's content). Returns (block_index, char_offset|None, old_snip, new_snip)
+    or None if cb's blocks are a byte-identical prefix-or-equal of ca's. The
+    volatile out-of-band billing header is skipped (never cached)."""
+    n = min(len(ca), len(cb))
+    for bi in range(n):
+        ba, bb = ca[bi], cb[bi]
+        if skip_billing and (_is_billing_block(ba) or _is_billing_block(bb)):
+            continue
+        if _bust_canon(ba) != _bust_canon(bb):
+            ta = ba.get("text") if isinstance(ba, dict) else None
+            tb = bb.get("text") if isinstance(bb, dict) else None
+            if isinstance(ta, str) and isinstance(tb, str):
+                off, sa, sb = _text_first_diff(ta, tb)
+                return bi, off, sa, sb
+            return bi, None, None, None          # non-text block changed wholesale
+    if len(cb) > n:                              # a block was appended at the tail
+        return n, None, None, None
+    return None
+
+
+def _block_label(b):
+    """Human tag for a content block, by shape + salient content markers."""
+    if not isinstance(b, dict):
+        return "text"
+    typ = b.get("type") or "text"
+    t = b.get("text") if isinstance(b.get("text"), str) else ""
+    if typ == "thinking":
+        return "thinking"
+    if typ == "tool_use":
+        return f"tool_use:{b.get('name','?')}"
+    if typ == "tool_result":
+        return "tool_result"
+    if "# claudeMd" in t:
+        return "claudeMd bundle"
+    if "Today's date is" in t or "# currentDate" in t:
+        return "currentDate"
+    if t.startswith("<system-reminder>"):
+        return "system-reminder"
+    return typ or "text"
+
+
+def _system_label(sb, i):
+    """Tag a system[i] block: the standard layout is [0]=billing header,
+    [1]='You are Claude Code' (tools+preamble marker), [2]=the harness/system
+    prompt. Fall back to the block's first line."""
+    if not (0 <= i < len(sb)) or not isinstance(sb[i], dict):
+        return f"system[{i}]"
+    t = sb[i].get("text") or ""
+    head = t.strip().splitlines()[0][:48] if t.strip() else ""
+    if _is_billing_block(sb[i]):
+        return f"system[{i}] billing-header"
+    return f"system[{i}] {head}".rstrip()
+
+
+def _prefix_marks(body):
+    """Cumulative token ESTIMATE (char/4, the _composition basis) at each cache
+    boundary of a body, in cache order: ('tools', n), ('system', n), then
+    ('messages[i]', n) for each message. Lets a receipt's exact cache_read be
+    mapped back to the deepest prefix position it could have covered — the
+    survived-prefix depth, which is the bill's own answer to 'where did it bust'
+    (independent of the N-1 text diff, which can mislead when the real cache
+    lineage isn't the adjacent forwarded turn)."""
+    marks = []
+    cum = 0
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    if tools:
+        cum += len(_bust_canon(tools)) // 4
+        marks.append(("tools", cum))
+    sysb = body.get("system") if isinstance(body.get("system"), list) else []
+    for b in sysb:
+        if not _is_billing_block(b):
+            cum += len(_bust_canon(b)) // 4
+    marks.append(("system", cum))
+    for i, m in enumerate(body.get("messages") or []):
+        cum += len(_bust_canon(m)) // 4
+        marks.append((f"messages[{i}]", cum))
+    return marks
+
+
+def _survived_prefix(read, marks, slack=1.15):
+    """Deepest cache boundary the receipt's `read` tokens could have covered (with
+    slack for the char/4 estimate). Returns (label, est_tokens) or None when even
+    the tools/system head didn't read warm."""
+    survived = None
+    for label, cum in marks:
+        if cum <= read * slack:
+            survived = (label, cum)
+        else:
+            break
+    return survived
+
+
+def _tokens_rw(tokens):
+    """(cache_read, cache_write, uncached_input, output) from a receipt's tokens."""
+    cr = (tokens or {}).get("cache_read_input_tokens") or 0
+    w5 = (tokens or {}).get("cache_write_5m_tokens") or 0
+    w1 = (tokens or {}).get("cache_write_1h_tokens") or 0
+    flat = (tokens or {}).get("cache_write_flat_tokens") or 0
+    write = w5 + w1 + (flat if not (w5 or w1) else 0)
+    inp = (tokens or {}).get("input_tokens") or 0
+    out = (tokens or {}).get("output_tokens") or 0
+    return cr, write, inp, out
+
+
+def _first_divergence(a, b):
+    """Locus of the first prefix divergence of body `b` from body `a`, in cache
+    order tools -> system -> messages. Returns a dict {segment,index,...} or None
+    (b's prefix is a byte-identical extension of a's — a pure tail append with no
+    upstream change). `appended:True` marks a divergence that is only a new tail
+    block/message (normal turn growth, NOT a bust)."""
+    # 1) tools[] (first in cache order; SORT_TOOLS keeps them order-stable)
+    ta = a.get("tools") if isinstance(a.get("tools"), list) else []
+    tb = b.get("tools") if isinstance(b.get("tools"), list) else []
+    if _bust_canon(ta) != _bust_canon(tb):
+        na = [t.get("name") for t in ta if isinstance(t, dict)]
+        nb = [t.get("name") for t in tb if isinstance(t, dict)]
+        idx = next((i for i in range(min(len(na), len(nb))) if na[i] != nb[i]),
+                   min(len(na), len(nb)))
+        return {"segment": "tools", "index": idx,
+                "label": f"tools[] changed ({len(na)}->{len(nb)} tools)",
+                "appended": False}
+    # 2) system[] (skip the volatile billing header — out-of-band, never cached)
+    sa = a.get("system") if isinstance(a.get("system"), list) else []
+    sb = b.get("system") if isinstance(b.get("system"), list) else []
+    d = _content_first_diff(sa, sb, skip_billing=True)
+    if d is not None:
+        bi, off, so, sn = d
+        return {"segment": "system", "index": bi, "char_offset": off,
+                "label": _system_label(sb, bi), "old": so, "new": sn,
+                "appended": bi >= len(sa)}
+    # 3) messages[] — first message that differs within the overlap; else the tail
+    ma = a.get("messages") if isinstance(a.get("messages"), list) else []
+    mb = b.get("messages") if isinstance(b.get("messages"), list) else []
+    n = min(len(ma), len(mb))
+    for i in range(n):
+        if _bust_canon(ma[i]) == _bust_canon(mb[i]):
+            continue
+        ca = ma[i].get("content"); cb = mb[i].get("content")
+        role = mb[i].get("role")
+        if isinstance(ca, list) and isinstance(cb, list):
+            bd = _content_first_diff(ca, cb)
+            if bd is not None:
+                bi, off, so, sn = bd
+                blk = cb[bi] if bi < len(cb) else None
+                return {"segment": "messages", "index": i, "role": role,
+                        "block": bi, "char_offset": off,
+                        "label": f"messages[{i}].{role} {_block_label(blk)}",
+                        "old": so, "new": sn, "appended": False}
+        return {"segment": "messages", "index": i, "role": role,
+                "label": f"messages[{i}].{role} changed", "appended": False}
+    if len(mb) > n:                              # only new trailing messages
+        role = mb[n].get("role") if isinstance(mb[n], dict) else None
+        return {"segment": "messages", "index": n, "role": role,
+                "label": f"messages[{n}].{role} appended", "appended": True}
+    return None
+
+
+def bust_series(session):
+    """Per-transition cache-divergence forensics for a session's MAIN line, in
+    chronological order. For each adjacent request pair it reports WHERE the
+    prefix first diverged (the locus) and HOW MUCH the receipt then re-wrote (the
+    magnitude), classifying each transition as append / partial / full-rewrite.
+    Disk-based + on-demand, like session_report/_series.
+
+    The bust flag + severity are decided by the RECEIPT (the write fraction of the
+    priced window) — the bill is ground truth for 'was there a rewrite and how
+    big'. Two loci are then attached to explain it: `survived_prefix` (the deepest
+    boundary the receipt's cache_read covered — the bill's own answer to how deep
+    the cache held) and `locus` (the first byte-change vs the previous forwarded
+    turn — the human-readable WHAT changed: a model swap, a date rollover, a
+    transform toggle). They agree on the clean cases (system swap, msg[0] date) and
+    that agreement is high confidence; a low-write_frac warm append is NOT a bust
+    even when the N-1 text diff finds a late change."""
+    pairs = [p for p in _iter_pairs(session) if p["line"] == "main" and p["ok"]]
+    transitions = []
+    prev = None
+    for idx, p in enumerate(pairs):
+        body = (p.get("req") or {}).get("body")
+        if not isinstance(body, dict):
+            prev = None
+            continue
+        if prev is None:
+            prev = p
+            continue
+        a = (prev.get("req") or {}).get("body")
+        b = body
+        cr, write, inp, out = _tokens_rw(p.get("tokens"))
+        prev_msgs = len(a.get("messages") or []) if isinstance(a, dict) else 0
+        window = cr + write + inp
+        write_frac = round(write / window, 3) if window else 0.0
+        # RECEIPT decides bust + severity (the bill is ground truth for magnitude).
+        # Data is bimodal: warm appends sit < ~0.05, real rewrites > ~0.35.
+        if write_frac < 0.15:
+            severity = "append"; bust = False
+        elif write_frac >= 0.6:
+            severity = "full-rewrite"; bust = True
+        else:
+            severity = "partial"; bust = True
+        # survived-prefix depth from the receipt (bill's own locus)
+        surv = _survived_prefix(cr, _prefix_marks(b)) if bust else None
+        survived_prefix = ({"boundary": surv[0], "est_tokens": surv[1]}
+                           if surv else ({"boundary": "none", "est_tokens": 0}
+                                         if bust else None))
+        # structural N-1 diff (what byte first changed vs the previous turn)
+        loc = _first_divergence(a, b) if (bust and isinstance(a, dict)) else None
+        # A STATIC-PREFIX bust changed the cached PREAMBLE (tools / system / the
+        # msg[0] claudeMd bundle) — the actionable, fixable class (a model swap, a
+        # date rollover), distinct from a routine cold-resume history rewrite where
+        # only the conversation tail re-wrote onto a still-warm static floor. Read
+        # from BOTH signals: the receipt survived below system, or the N-1 diff
+        # points at the preamble.
+        surv_boundary = (survived_prefix or {}).get("boundary")
+        static_prefix_bust = bool(bust and (
+            surv_boundary in ("none", "tools", "system")
+            or (loc and (loc["segment"] in ("tools", "system")
+                         or (loc["segment"] == "messages" and loc.get("index") == 0)))))
+        transitions.append({
+            "i": idx, "ts": p["ts"], "stem": p["stem"], "seq": _seq_of(p["stem"]),
+            "from_stem": prev["stem"], "from_seq": _seq_of(prev["stem"]),
+            "severity": severity, "bust": bust,
+            "quasi_full_rewrite": write_frac >= 0.6,
+            "static_prefix_bust": static_prefix_bust,
+            "read_tokens": cr, "write_tokens": write, "uncached_input": inp,
+            "window_tokens": window, "write_frac": write_frac,
+            "survived_prefix": survived_prefix,
+            "locus": loc,
+            "prev_messages": prev_msgs,
+            "cur_messages": len(b.get("messages") or []),
+        })
+        prev = p
+    busts = [t for t in transitions if t["bust"]]
+    static = [t for t in busts if t["static_prefix_bust"]]
+    worst = max(busts, key=lambda t: t["write_tokens"], default=None)
+    return {
+        "session_id": session, "basis": "on-disk-capture, main-line, chronological",
+        "count": len(transitions), "n_busts": len(busts),
+        "n_static_prefix_busts": len(static),
+        "worst": worst, "static_prefix_busts": static,
+        "busts": busts, "transitions": transitions,
+    }
+
+
 def session_report(session, detail=False):
     """Build the full report payload for a session, scanned from disk. When
     `detail` is set, also emit the per-request `series` (the /_timeline data)."""

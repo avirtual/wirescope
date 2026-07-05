@@ -313,6 +313,12 @@ details.more>summary{color:#69707d;font-size:12px}
 .tline pre{max-height:20em}
 .cmark{margin:.8em 0 .6em;border-top:2px dashed #b08a3e;color:#e5c07b;
        font-size:12px;padding-top:.15em}
+.navbar{border:1px solid #2a2e36;border-radius:4px;padding:.3em .6em;
+        background:#12151a}
+.navbar a{color:#6ab0de;text-decoration:none} .navbar a:hover{text-decoration:underline}
+.bustp{border-left-color:#e5c07b}
+.bustp pre.diff{font-size:12px;max-height:14em}
+.bustp pre.diff{color:#aab2c0}
 """
 
 _MD_HEADING_RE = re.compile(r"(?m)^#{1,3} .+$")
@@ -381,6 +387,15 @@ def _load_last_request_disk(session_id, subkey=None):
     if pick is None:
         return None, None, None
     rf, rec = pick
+    return _entry_resp_usage(rf, rec)
+
+
+def _entry_resp_usage(rf, rec):
+    """Build the (entry, resp, usage) triple from a specific capture request file
+    `rf` + its loaded record `rec` — the shared body of the cold disk view (used
+    by both the newest-turn picker and the by-turn navigator). entry.from_disk
+    badges it view-only; resp/usage are rebuilt from the paired .response.json,
+    the same shapes the in-memory _LAST_RESPONSE/_LAST_USAGE would have had."""
     try:
         ts = time.mktime(time.strptime(rec.get("ts") or "", "%Y-%m-%dT%H:%M:%S"))
     except Exception:
@@ -390,8 +405,6 @@ def _load_last_request_disk(session_id, subkey=None):
             ts = None
     entry = {"obj": rec.get("body"), "path": rec.get("path"), "ts": ts,
              "from_disk": True}
-    # the paired response capture still holds the turn's answer + receipts —
-    # same shapes the in-memory _LAST_RESPONSE/_LAST_USAGE would have had
     resp = usage = None
     rp = rf.with_name(rf.name[:-len(".request.json")] + ".response.json")
     try:
@@ -410,6 +423,48 @@ def _load_last_request_disk(session_id, subkey=None):
             usage = {**tok, "est_usd": (rrec.get("billing") or {}).get("est_usd"),
                      "ts": rts or ts}
     return entry, resp, usage
+
+
+def _main_line_turns(session_id):
+    """Chronological (restart-stable ts order) list of this session's MAIN-line
+    captured requests: [{stem, seq, ts}]. The spine for /_session turn navigation
+    — every request is captured, so 'turns' here are just positions in that
+    on-disk series (same ordering report.bust_series indexes by `i`)."""
+    from proxylab import report as report_mod            # lazy: avoid import cycle
+    out = []
+    for p in report_mod._iter_pairs(session_id):
+        if p["line"] != "main":
+            continue
+        out.append({"stem": p["stem"], "seq": report_mod._seq_of(p["stem"]),
+                    "ts": report_mod._epoch(p["ts"])})
+    return out
+
+
+def _load_request_by_index(session_id, i):
+    """Load the i-th MAIN-line captured turn (0-based, chronological) for the
+    /_session navigator. Returns (entry, resp, usage, nav) where nav carries the
+    prev/next indices + position for the arrow bar; (None, None, None, nav) when
+    the index is out of range or the capture is unreadable. i is clamped."""
+    turns = _main_line_turns(session_id)
+    n = len(turns)
+    nav = {"i": None, "n": n, "prev": None, "next": None, "seq": None, "ts": None}
+    if not n:
+        return None, None, None, nav
+    if i < 0:                              # Python-style: -1 = latest turn
+        i = n + i
+    i = max(0, min(i, n - 1))
+    t = turns[i]
+    nav.update({"i": i, "seq": t["seq"], "ts": t["ts"],
+                "prev": i - 1 if i > 0 else None,
+                "next": i + 1 if i < n - 1 else None})
+    d = core_mod.LOG_DIR / session_id
+    rf = d / (t["stem"] + ".request.json")
+    try:
+        rec = json.loads(rf.read_text())
+    except Exception:
+        return None, None, None, nav
+    entry, resp, usage = _entry_resp_usage(rf, rec)
+    return entry, resp, usage, nav
 
 
 def _flat_text(content):
@@ -618,9 +673,67 @@ def _session_boundary_note(obj):
             f'the new turn overwrites the previous one here).</p>')
 
 
-def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
+def _session_nav_html(sid, nav, bust_t):
+    """The turn-navigation arrow bar + a 'vs previous turn' cache panel for the
+    /_session navigator. `nav` = the _load_request_by_index position dict; `bust_t`
+    = this turn's transition from report.bust_series (or None on turn 0 / no
+    prior). The panel is the per-turn face of the bust locator: how this turn's
+    cache did against the one before it, and — on a bust — WHERE it diverged."""
+    e = html.escape
+    i, n = nav.get("i"), nav.get("n") or 0
+    if i is None:
+        return ""
+    def _lnk(j, label, cls=""):
+        if j is None:
+            return f'<span class="dim">{label}</span>'
+        return f'<a class="{cls}" href="/_session?session={e(sid)}&turn={j}">{label}</a>'
+    latest = ('' if nav.get("next") is None
+              else f' · <a href="/_session?session={e(sid)}">latest &raquo;&raquo;</a>')
+    seq = nav.get("seq")
+    arrows = (f'<p class="kv navbar"><span>{_lnk(nav.get("prev"), "&laquo; prev")}</span>'
+              f'<span class="dim">turn <b>{i + 1}</b> of {n}'
+              f'{f" · seq {seq}" if seq is not None else ""}</span>'
+              f'<span>{_lnk(nav.get("next"), "next &raquo;")}</span>'
+              f'<span class="dim">{e(_fmt_ago(nav.get("ts")))}{latest}</span></p>')
+    if not bust_t:
+        return arrows + ('<p class="kv"><span class="dim">turn 1 — no prior turn '
+                         'to diff against.</span></p>' if i == 0 else '')
+    # cache verdict for this transition
+    if not bust_t.get("bust"):
+        verdict = '<span class="warm">&#10003; warm append</span>'
+    elif bust_t.get("static_prefix_bust"):
+        verdict = ('<span class="bad">&#9888; static-prefix bust</span> '
+                   '<span class="dim">(the cached preamble changed — fixable)</span>')
+    else:
+        verdict = '<span class="warn">&#9889; history rewrite</span>'
+    rd, wr = bust_t.get("read_tokens") or 0, bust_t.get("write_tokens") or 0
+    wf = bust_t.get("write_frac")
+    surv = (bust_t.get("survived_prefix") or {}).get("boundary")
+    loc = bust_t.get("locus") or {}
+    panel = (f'<div class="blk bustp"><p class="kv"><span>vs seq '
+             f'{bust_t.get("from_seq")}:</span><span>{verdict}</span>'
+             f'<span>read <b class="warm">{e(_fmt_tok(rd))}</b></span>'
+             f'<span>written <b class="warn">{e(_fmt_tok(wr))}</b></span>'
+             f'<span class="dim">write frac {wf}</span>'
+             + (f'<span class="dim">cache held through <b>{e(str(surv))}</b></span>'
+                if surv else '') + '</p>')
+    if bust_t.get("bust") and loc:
+        panel += (f'<p class="kv"><span class="dim">first byte-change:</span>'
+                  f'<span><b>{e(str(loc.get("label")))}</b>'
+                  + (f' @ char {loc.get("char_offset")}' if loc.get("char_offset") is not None else '')
+                  + '</span></p>')
+        if loc.get("old") is not None or loc.get("new") is not None:
+            panel += (f'<pre class="diff">- {e(str(loc.get("old") or ""))}\n'
+                      f'+ {e(str(loc.get("new") or ""))}</pre>')
+    panel += '</div>'
+    return arrows + panel
+
+
+def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None,
+                         nav=None, bust_t=None):
     e = html.escape
     s = (snap.get("sessions") or [{}])[0]
+    nav_html = _session_nav_html(sid, nav, bust_t) if nav else ""
     if subrole:
         # Per-role subagent view: same session_id as the parent, but its own
         # model/activity. The parent's warmth/cwd belong to the parent line, so
@@ -655,6 +768,7 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
                 f'<span>model <b>{e(writer_mod._short_model(s.get("model")))}</b></span>'
                 f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
                 f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
+    head += nav_html                       # turn navigator arrows + bust panel (nav mode)
     if usage:    # token receipts from the last response (in-memory; see
                  # meta._LAST_USAGE) — what actually got read vs (re)written
         rd = usage.get("cache_read_input_tokens") or 0
@@ -853,8 +967,12 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None):
                         f'<span class="dim">{e(str(resp.get("stop_reason") or ""))}'
                         f'</span>{trunc}{_prevu(rtxt)}</div>')
         body = (bar + tools_html + "".join(sb) + "".join(rows))
+    # discovery link into the turn navigator (skip when already in nav mode — the
+    # arrow bar is already up top). turn=-1 = latest, with the vs-previous panel.
+    nav_link = ('' if nav else f' · <a href="/_session?session={e(sid)}&turn=-1">'
+                f'&#8635; step through turns</a>')
     foot = (f'<p class="dim"><a href="/_admin">&larr; sessions</a> · '
-            f'<a href="/_status?session={e(sid)}">raw json</a> · '
+            f'<a href="/_status?session={e(sid)}">raw json</a>{nav_link} · '
             f'static snapshot (reload to refresh)</p>')
     return ('<!doctype html><html><head><meta charset="utf-8">'
             f'<title>wirescope · {e((s.get("title") or sid)[:60])}</title>'
