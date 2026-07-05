@@ -62,16 +62,17 @@ def _writer_loop():
                 with path.open("a") as fh:
                     fh.write(json.dumps(data, ensure_ascii=False) + "\n")
             elif kind == "ledger":  # hash+touch the prefix-warmth ledger off-thread
-                obj, usage = data
-                rec = proxylab.warmth._record_warmth(obj, usage)
+                obj, usage, is_main = data
+                rec = proxylab.warmth._record_warmth(obj, usage, is_main=is_main)
                 if rec is not None:
                     segs = rec.get("segments") or {}
                     seg_s = ("".join(f" {k}={v['hash'][:6]}"
                                      for k, v in segs.items())) if segs else ""
+                    bust_s = f" BUST={rec['bust_class']}" if rec.get("bust_class") else ""
                     print(f"[warmth] {rec['hash'][:12]} ttl={rec['ttl']}s "
                           f"{'PING' if rec['ping'] else 'turn'} "
                           f"warm_on_arrival={rec['warm_on_arrival']} "
-                          f"(ledger={rec['ledger_size']}){seg_s}", flush=True)
+                          f"(ledger={rec['ledger_size']}){seg_s}{bust_s}", flush=True)
                     if path is not None:
                         path.write_text(json.dumps(rec, indent=2, ensure_ascii=False))
             else:  # "json" — serialize off the event loop, in this thread
@@ -111,11 +112,13 @@ def _enqueue_append(path: Path, obj):
     _WRITE_Q.put((path, "append", obj))
 
 
-def _enqueue_ledger(path, obj, usage):
+def _enqueue_ledger(path, obj, usage, is_main=True):
     """Hand the (post-transform) request body + response usage to the writer
     thread, which hashes the cacheable prefix and refreshes the warmth ledger.
-    `path` (a <stem>.warmth.json) is written too when WARMTH_LOG_FILE is on."""
-    _WRITE_Q.put((path, "ledger", (obj, usage)))
+    `path` (a <stem>.warmth.json) is written too when WARMTH_LOG_FILE is on.
+    `is_main` gates the session-head advance + bust classification (main line
+    only — subagents share the parent's session_id)."""
+    _WRITE_Q.put((path, "ledger", (obj, usage, is_main)))
 
 
 def _enqueue_meta(session_id, **fields):

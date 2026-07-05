@@ -170,6 +170,10 @@ r3 = lp._record_warmth(cr_t3, {"cache_creation_input_tokens": 200})
 check("a turn on a lapsed prior head counts as a cold resume",
       r3["cold_resume"] is True and r3["cold_resumes"] == 1
       and lp.cold_resumes("sess-cr-1") == 1)
+# the same lapse is ALSO a real bust of class `lapse` (byte-identical prefix,
+# cache went cold — the bust classifier subsumes the old cold-resume notion).
+check("a cold resume is classified as a `lapse` bust",
+      r3["bust_class"] == "lapse")
 
 # Lapse again with a fresh, longer prefix -> resume #2 (counter accumulates).
 cr_t4 = {**cr, "messages": cr["messages"] + [msg("user", "more " * 10)]}
@@ -185,12 +189,20 @@ check("the cold-resume counter accumulates across lapses",
 check("cold_resumes() is 0 for an unknown session (no fiction)",
       lp.cold_resumes("sess-cr-ghost") == 0)
 
-# /_status carries the per-session counter
+# /_status carries the per-session real-bust rollup (supersedes cold_resumes:
+# two lapses here -> busts.by_class.lapse == 2, each tagged fault=environment).
 lp._upsert_session_meta("sess-cr-1", cwd="/tmp/cr", model="claude-fable-5")
 _cr_snap = [s for s in lp._status_snapshot(session="sess-cr-1")["sessions"]
             if s["session_id"] == "sess-cr-1"]
-check("status snapshot exposes cold_resumes",
-      len(_cr_snap) == 1 and _cr_snap[0]["cold_resumes"] == 2)
+check("status snapshot exposes the bust rollup (lapse x2), not cold_resumes",
+      len(_cr_snap) == 1 and "cold_resumes" not in _cr_snap[0]
+      and _cr_snap[0]["busts"]["by_class"]["lapse"] == 2
+      and _cr_snap[0]["busts"]["total"] == 2
+      and _cr_snap[0]["busts"]["actionable"] == 0)
+check("bust rollup folds fault/fix_hint into each class for the consumer",
+      _cr_snap[0]["busts"]["classes"][0]["fault"] == "environment"
+      and "keep-warm" in _cr_snap[0]["busts"]["classes"][0]["fix_hint"]
+      and _cr_snap[0]["busts"]["last_bust"]["class"] == "lapse")
 
 # /_end = a MARKER since 2026-06-11, not a delete: one-shot `claude -p` runs
 # fire SessionEnd the instant their answer lands; the debug state must survive.
@@ -3384,6 +3396,98 @@ check("nav: out-of-range index clamps to the last turn",
 check("nav: unknown session -> empty nav, no entry",
       lp.views._load_request_by_index("nope", 0) == (None, None, None,
             {"i": None, "n": 0, "prev": None, "next": None, "seq": None, "ts": None}))
+
+# --- LIVE bust classifier (_record_warmth -> session_bust -> bust_summary) -----
+# The per-request twin of report.bust_series: classify each turn's cache event
+# from the RECEIPT + prior head hashes (no body retention). Covers all five
+# classes, the write-frac append gate, and the main-line-only head guard.
+_bc_pure = lp.warmth._classify_bust
+check("classify: warm append (big read, tiny write) is not a bust",
+      _bc_pure(100000, 500, 5, prior=("T", "S", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+check("classify: first turn (no prior head) is not a bust",
+      _bc_pure(0, 9000, 20, prior=None,
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+check("classify: tools change -> tools (total bust, first in cache order)",
+      _bc_pure(0, 8000, 20, prior=("T0", "S", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "tools")
+check("classify: system change (tools same) -> system",
+      _bc_pure(30, 8000, 20, prior=("T", "S0", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "system")
+check("classify: messages[0] change (tools+sys same) -> preamble",
+      _bc_pure(2000, 8000, 20, prior=("T", "S", "M0"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "preamble")
+check("classify: static prefix identical + not lapsed -> conversation (our bug)",
+      _bc_pure(3000, 8000, 20, prior=("T", "S", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) == "conversation")
+check("classify: static prefix identical + lapsed -> lapse (time-caused)",
+      _bc_pure(0, 8000, 20, prior=("T", "S", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=True) == "lapse")
+check("classify: content-divergence wins over lapse when both present",
+      _bc_pure(0, 8000, 20, prior=("T0", "S", "M"),
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=True) == "tools")
+check("classify: write_frac just under the gate -> append, not a bust",
+      _bc_pure(9000, 1400, 100, prior=("T", "S", "M0"),   # 1400/10500 = 0.133
+               cur_tools="T", cur_sys="S", cur_msg0="M", lapsed=False) is None)
+
+
+def _bc_body(sys2, date, nmsgs, sid="sess-bc"):
+    bundle = ("<system-reminder>\n# claudeMd\n" + "C" * 400
+              + "\n# userEmail\nme@x.co\n# currentDate\nToday's date is " + date
+              + ".\n</system-reminder>")
+    m = [{"role": "user", "content": [{"type": "text", "text": bundle}]}]
+    for k in range(nmsgs):
+        m.append({"role": "assistant", "content": [{"type": "text", "text": f"r{k} " + "z" * 300}]})
+        m.append({"role": "user", "content": [{"type": "text", "text": f"a{k} " + "q" * 60}]})
+    m.append({"role": "user", "content": [{"type": "text", "text": "go"}]})
+    # realistic TWO-marker system layout (preamble + a trailing marked block), so
+    # the cumulative `system` segment hash covers a middle system-prompt swap.
+    return {"model": "claude-opus-4-8",
+            "system": [{"type": "text", "text": "You are Claude Code.",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}},
+                       {"type": "text", "text": sys2},
+                       {"type": "text", "text": "[wirescope] tail.",
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "tools": [{"name": "Bash", "description": "b" * 200}],
+            "messages": m,
+            "metadata": {"user_id": json.dumps({"session_id": sid})}}
+
+
+def _bc_rec(body, read, created, inp=10, is_main=True):
+    return lp._record_warmth(body, {"cache_read_input_tokens": read,
+                                    "cache_creation_input_tokens": created,
+                                    "input_tokens": inp}, is_main=is_main)
+
+
+_BSA = "\nYou are an interactive agent.\n# Communicating\nSpeak." + " " * 20
+_BSB = "\nYou are an interactive agent.\nWrite code." + " " * 20
+_r1 = _bc_rec(_bc_body(_BSA, "2026-07-05", 2), 0, 4000)          # first: no bust
+_r2 = _bc_rec(_bc_body(_BSA, "2026-07-05", 3), 4000, 300)        # warm append
+_r3 = _bc_rec(_bc_body(_BSB, "2026-07-05", 4), 30, 5000)         # system swap
+_r4 = _bc_rec(_bc_body(_BSB, "2026-07-05", 5), 6000, 300)        # warm append
+_r5 = _bc_rec(_bc_body(_BSB, "2026-07-06", 6), 2000, 7000)       # date rollover
+check("live classifier: turn sequence -> [None, None, system, None, preamble]",
+      [_r1["bust_class"], _r2["bust_class"], _r3["bust_class"],
+       _r4["bust_class"], _r5["bust_class"]] == [None, None, "system", None, "preamble"])
+_bcs = lp.warmth.bust_summary("sess-bc")
+check("live classifier: session_bust rollup counts system + preamble (2 total)",
+      _bcs["total"] == 2 and _bcs["by_class"]["system"] == 1
+      and _bcs["by_class"]["preamble"] == 1 and _bcs["actionable"] == 2)
+check("live classifier: last_bust is the date rollover (preamble, 7000 written)",
+      _bcs["last_bust"]["class"] == "preamble"
+      and _bcs["last_bust"]["write_tokens"] == 7000
+      and _bcs["last_bust"]["fault"] == "content")
+# main-line gate: a subagent turn (is_main=False) sharing the sid must NOT count
+# nor clobber the head (which would manufacture a false bust on the next main turn)
+_pre_sub = lp.warmth.bust_summary("sess-bc")["total"]
+_bc_rec(_bc_body(_BSA, "2026-07-06", 12, sid="sess-bc"), 0, 9000, is_main=False)
+check("live classifier: a subagent turn does not count as a bust (main-line gate)",
+      lp.warmth.bust_summary("sess-bc")["total"] == _pre_sub)
+_r6 = _bc_rec(_bc_body(_BSB, "2026-07-06", 7), 6000, 300)        # main turn resumes clean
+check("live classifier: the next main turn after a subagent is unaffected (append)",
+      _r6["bust_class"] is None)
+check("bust_summary: unknown / never-busted session -> None",
+      lp.warmth.bust_summary("sess-bc-ghost") is None)
 
 print()
 if FAILS:

@@ -200,12 +200,15 @@ def _render_admin_html(snap, host="", show=60):
         # parent's (sub turns never overwrite it).
         subs = s.get("sub_agents") or []
         mainlbl = ' <span class="badge">main</span>' if subs else ""
-        # cold-resume count: each is a full prefix re-write at the premium —
-        # a bursty session that keeps lapsing between turns is paying it over.
-        nres = s.get("cold_resumes") or 0
-        resumeb = (f' <span class="badge warn" title="resumed from a cold cache '
-                   f'{nres}× — each a full prefix re-write at the write premium">'
-                   f'&#8635;{nres}</span>' if nres else "")
+        # real-bust chip: per-class cumulative count, each a write that landed
+        # UPSTREAM of the prior cache end (a full/partial prefix re-write at the
+        # premium). Tooltip breaks it down by class; supersedes the old
+        # cold-resume badge (lapse is now just one of the five classes).
+        bs = s.get("busts") or {}
+        nb = bs.get("total") or 0
+        _btip = "; ".join(f"{c['count']} {c['class']}" for c in (bs.get("classes") or []))
+        resumeb = (f' <span class="badge warn" title="{e(_btip)} — each a prefix '
+                   f're-write at the write premium">&#9889;{nb}</span>' if nb else "")
         # Link per-instance (sub=<agent-id|role>); prefer the author-declared
         # [agent: <name>] label, fall back to role; a short agent-id chip
         # disambiguates concurrent same-role subagents at a glance.

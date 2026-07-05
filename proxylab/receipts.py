@@ -74,9 +74,12 @@ def anthropic(blob, *, n, ts, agent, role, model, session_id, session_key,
         # response cached + stamp now/ttl). obj is the forwarded
         # (post-transform) body = exactly what the backend addressed.
         if warmth_mod.WARMTH_LEDGER and isinstance(obj, dict):
+            # is_main gates the session-head advance + real-bust classification to
+            # the routed main line (subagents share the parent's session_id and
+            # would otherwise clobber the head / manufacture false busts).
             writer_mod._enqueue_ledger(
                 (out_dir / f"{stem}.warmth.json") if warmth_mod.WARMTH_LOG_FILE else None,
-                obj, usage)
+                obj, usage, is_main=(not side_call and role in ("parent", "unknown")))
     else:  # count_tokens — plain JSON, not SSE
         try:
             ct = json.loads(blob.decode("utf-8", "replace"))
