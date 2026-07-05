@@ -958,6 +958,12 @@ async def handler(request: Request) -> Response:
             if strp:
                 record["system_strip"] = strp
                 changed = True
+            # Task-reminder strip: skip the CLI's accreting "task tools haven't
+            # been used" nags wherever they appear in history (model-visible).
+            trs = transforms_mod._strip_task_reminders(obj)
+            if trs:
+                record["task_reminder_strip"] = trs
+                changed = True
             # WIRESCOPE [wirescope:omit ...]: strip author-opted-out context
             # sections (# claudeMd / # userEmail) from messages[0]. Effective
             # targets merge body + spawn directives (per-agent + per-call opt-in).

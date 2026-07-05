@@ -519,6 +519,86 @@ def _strip_system_sections(obj):
     return {"removed": removed} if removed else None
 
 
+# ---- TASK-REMINDER STRIP (off in code; on via start_proxy.sh) --------------
+# The CLI nags "The task tools haven't been used recently..." (~421 ch ≈ 105
+# tok) every few tool-heavy turns, and each nag lands in settled history — so
+# they ACCRETE: a long clodex session carried 4+, re-shipped on every request,
+# with zero Task* calls ever following (the nag only fires in sessions that
+# don't use tasks). Skip the block entirely on encounter. Two wire shapes:
+#   1. mid-conversation `role:"system"` message (opus-4.8/fable form) whose
+#      text STARTS with the needle -> drop the whole message;
+#   2. a `<system-reminder>`-wrapped text block inside a user message (classic
+#      form) that is ENTIRELY the reminder -> drop just that block.
+# The match is anchored to the block head on reminder-shaped content only — a
+# bare substring test would eat conversation that merely QUOTES the text
+# (live capture: a tool_result Reading a clodex message file contained the
+# needle; deleting a tool_result also breaks tool_use pairing -> API 400).
+# Unconditional while on (no usage-gating: a gate that flips when the session
+# starts using tasks would flip prefix bytes mid-session — the anti-flap trap
+# the strip-guard latch exists for). Deterministic every turn -> byte-stable;
+# reminders debut at the tail, so stripping-from-arrival never busts a warm
+# prefix. MODEL-VISIBLE: deletes Anthropic's nudge — an agent you WANT on the
+# task list shouldn't route through a port with this on.
+STRIP_TASK_REMINDERS = os.environ.get("STRIP_TASK_REMINDERS", "0") in (
+    "1", "yes", "on", "true")
+_TASK_REMINDER_NEEDLE = "The task tools haven't been used recently"
+
+
+def _is_task_reminder_text(text):
+    """True iff `text` IS the task nag (anchored; optionally system-reminder-
+    wrapped). Never matches mere quotation mid-content."""
+    if not isinstance(text, str):
+        return False
+    t = text.strip()
+    if t.startswith("<system-reminder>"):
+        inner = t[len("<system-reminder>"):].strip()
+        return inner.startswith(_TASK_REMINDER_NEEDLE) and t.endswith("</system-reminder>")
+    return t.startswith(_TASK_REMINDER_NEEDLE)
+
+
+def _strip_task_reminders(obj):
+    """Delete task-tool nag reminders wherever they appear in messages[].
+    Returns a log dict, or None if nothing matched. Idempotent."""
+    if not STRIP_TASK_REMINDERS:
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list):
+        return None
+    dropped_msgs = dropped_blocks = chars = 0
+    keep = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            keep.append(m)
+            continue
+        c = m.get("content")
+        # shape 1: mid-conversation system message, string (or single-text) body
+        if m.get("role") == "system":
+            txt = c if isinstance(c, str) else (
+                c[0].get("text") if (isinstance(c, list) and len(c) == 1
+                                     and isinstance(c[0], dict)
+                                     and c[0].get("type") == "text") else None)
+            if _is_task_reminder_text(txt):
+                dropped_msgs += 1
+                chars += len(txt)
+                continue
+        # shape 2: a wrapped text block inside a user message's block list
+        if m.get("role") == "user" and isinstance(c, list):
+            hits = [b for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                    and _is_task_reminder_text(b.get("text"))]
+            # never empty a message (invalid wire) — sole-block nag stays put
+            if hits and len(hits) < len(c):
+                m["content"] = [b for b in c if b not in hits]
+                dropped_blocks += len(hits)
+                chars += sum(len(b.get("text") or "") for b in hits)
+        keep.append(m)
+    if not (dropped_msgs or dropped_blocks):
+        return None
+    obj["messages"] = keep
+    return {"system_msgs": dropped_msgs, "user_blocks": dropped_blocks,
+            "chars": chars}
+
+
 # ---- WIRESCOPE `[wirescope:omit ...]` — strip context sections from msgs[0] -
 # Honors `[wirescope:omit claudemd,useremail]` (see WIRESCOPE.md): the proxy
 # strips the named `# <Section>` blocks out of the <system-reminder> in the first

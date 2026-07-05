@@ -3138,6 +3138,58 @@ check("/_context: strip_prior_edit_acks panel surfaces the L2 ack reclaim",
       and _pea_panel["would_strip"] is True)
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
 
+# --- STRIP_TASK_REMINDERS: skip the CLI's accreting task-tool nag blocks -------
+_str_save = lp.transforms.STRIP_TASK_REMINDERS
+lp.transforms.STRIP_TASK_REMINDERS = True
+_NAG = ("The task tools haven't been used recently. If you're working on tasks "
+        "that would benefit from tracking progress, consider using TaskCreate...")
+
+
+def _nag_msgs():
+    return [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        # shape 1: mid-conversation system message (opus-4.8/fable form)
+        {"role": "system", "content": _NAG},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "ls"}}]},
+        # shape 2: wrapped block riding a tool_result user message (classic form)
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b1", "content": "ok"},
+            {"type": "text", "text": f"<system-reminder>\n{_NAG}\n</system-reminder>"}]},
+        # quotation inside a tool_result — must NEVER be touched
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "b2", "name": "Read", "input": {"file_path": "/m"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b2",
+             "content": f"the file quotes: {_NAG}"}]},
+    ]
+
+
+_no = {"messages": _nag_msgs()}
+_nr = lp.transforms._strip_task_reminders(_no)
+check("strip_task_reminders: drops the system-message form whole",
+      _nr and _nr["system_msgs"] == 1
+      and not any(m.get("role") == "system" for m in _no["messages"]))
+check("strip_task_reminders: drops the wrapped user block, keeps its tool_result",
+      _nr["user_blocks"] == 1
+      and [b["type"] for b in _no["messages"][3]["content"]] == ["tool_result"])
+check("strip_task_reminders: a tool_result QUOTING the needle is untouched",
+      _no["messages"][-1]["content"][0]["content"].startswith("the file quotes:"))
+check("strip_task_reminders: idempotent re-run -> None",
+      lp.transforms._strip_task_reminders(_no) is None)
+# a sole-block nag must not empty its message (invalid wire) — left in place
+_sole = {"messages": [
+    {"role": "user", "content": [
+        {"type": "text", "text": f"<system-reminder>\n{_NAG}\n</system-reminder>"}]}]}
+check("strip_task_reminders: sole-block nag stays (never empties a message)",
+      lp.transforms._strip_task_reminders(_sole) is None
+      and len(_sole["messages"][0]["content"]) == 1)
+lp.transforms.STRIP_TASK_REMINDERS = False
+check("strip_task_reminders: no-op while the flag is off",
+      lp.transforms._strip_task_reminders({"messages": _nag_msgs()}) is None)
+lp.transforms.STRIP_TASK_REMINDERS = _str_save
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

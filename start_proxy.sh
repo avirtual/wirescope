@@ -91,6 +91,11 @@ export WS_OMIT_DEFAULT="${WS_OMIT_DEFAULT-useremail}"
 # genuine design session re-admits per-agent with [wirescope:keep-mcp claude_design];
 # STRIP_MCP_SERVERS= disables entirely.
 export STRIP_MCP_SERVERS="${STRIP_MCP_SERVERS-claude_design}"
+# Skip the CLI's accreting "task tools haven't been used recently" nag blocks
+# (~105 tok each, they pile up in settled history; measured 4+ per long clodex
+# session, 0% Task-uptake after them). Model-visible: deletes Anthropic's nudge —
+# run an agent you WANT using the task list with STRIP_TASK_REMINDERS=0.
+export STRIP_TASK_REMINDERS="${STRIP_TASK_REMINDERS-1}"
 
 # Refuse to double-bind the port.
 if lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
