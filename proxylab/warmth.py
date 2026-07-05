@@ -97,15 +97,22 @@ store_mod.register_schema(
     # _sys_full_hash / _classify_bust. (The marked-segment hashes stay in
     # session_head.sys_hash for cross-session warmth sharing — different job.)
     "ALTER TABLE session_head ADD COLUMN sysfull_hash TEXT",
+    # message count (2026-07-06): the session's last-seen len(messages[]). Normal
+    # turns only GROW it; a sharp contraction on the same session (unchanged static
+    # prefix) is a /compact collapsing the thread to a summary — the signal that
+    # splits a benign `compact` from a `conversation` flap. Additive; old rows -> NULL.
+    "ALTER TABLE session_head ADD COLUMN msg_count INTEGER",
     # REAL-BUST counter (2026-07-06): per-session cumulative count of turns whose
     # write landed UPSTREAM of the prior cache end (previously-cached tokens
     # invalidated + re-paid at the write premium) — NOT the normal tail-append
     # write every turn pays. Classified by WHERE the prefix first diverged, in
     # cache order: tools (total bust) / system (near-total) / preamble (messages[0])
-    # / conversation (rare mid-history — usually an L2 transform flapping = our bug)
-    # / lapse (cache timed out, byte-identical bytes, time-caused → keep-warm, not
-    # peelable). The counter is the live per-request twin of report.bust_series;
+    # / conversation (mid-history turn edited IN PLACE — usually an L2 transform
+    # flapping = our bug) / compact (history contracted to a summary — expected,
+    # benign) / lapse (cache timed out, byte-identical bytes, time-caused → keep-warm,
+    # not peelable). The counter is the live per-request twin of report.bust_series;
     # /_bust serves the on-demand byte-level drill-down from disk. Owned by warmth.
+    # `compact` column added additively after the fact -> old DBs migrate it in.
     "CREATE TABLE IF NOT EXISTS session_bust ("
     "session_id TEXT PRIMARY KEY, "
     "tools INTEGER NOT NULL DEFAULT 0, "
@@ -113,7 +120,8 @@ store_mod.register_schema(
     "preamble INTEGER NOT NULL DEFAULT 0, "
     "conversation INTEGER NOT NULL DEFAULT 0, "
     "lapse INTEGER NOT NULL DEFAULT 0, "
-    "last_class TEXT, last_ts REAL, last_write_tokens INTEGER)")
+    "last_class TEXT, last_ts REAL, last_write_tokens INTEGER)",
+    "ALTER TABLE session_bust ADD COLUMN compact INTEGER NOT NULL DEFAULT 0")
 
 
 def _warmth_rows(hashes):
@@ -222,11 +230,21 @@ def _sys_full_hash(obj):
 # write_frac >= this is a real bust. Data is bimodal (warm appends < ~0.05, real
 # rewrites > ~0.35); 0.15 sits in the empty valley, matching report.bust_series.
 BUST_WRITE_FRAC = float(os.environ.get("BUST_WRITE_FRAC", "0.15"))
+# A history CONTRACTION to <= this fraction of the prior message count marks a
+# `compact` (vs a `conversation` flap): normal turns only GROW the message array
+# (+~2/turn), so a sharp drop on the same session (same static prefix) is a
+# /compact or auto-compact collapsing the thread to a summary — an EXPECTED,
+# benign rewrite, not our bug. Validated on a real capture: a compact went 349->4
+# messages (0.01); a transform flap grew +2/+3 while editing one mid-history turn.
+# 0.5 leaves wide margin (a task-reminder strip only drops 1-2 messages, and never
+# upstream, so it never reaches this branch anyway).
+BUST_COMPACT_MSG_RATIO = float(os.environ.get("BUST_COMPACT_MSG_RATIO", "0.5"))
 # class -> (fault, fix_hint). fault drives clodex's chip color/severity (semantics
 # in the payload, not hardcoded client-side — a new class needs no clodex change):
 #   self        = our own bug (an L2 transform edited a settled prior turn) — LOUD
 #   content     = a byte in the injected context changed — fixable by a peel/strip
-#   environment = the cache timed out — fixable by keep-warm (hold/ping), not a peel
+#   environment = not our code + no per-turn fix: the cache timed out (keep-warm),
+#                 or the history was deliberately compacted (expected, nothing to fix)
 _BUST_FAULT = {
     "tools":        ("content", "tools[] changed upstream — a tool-set edit or an "
                                 "MCP connector (re)attaching; stabilize/trim the roster"),
@@ -234,22 +252,25 @@ _BUST_FAULT = {
                                 "/model swap leaving a stale prompt; pin the model/prompt"),
     "preamble":     ("content", "messages[0] (claudeMd / userEmail / currentDate / "
                                 "scratchpad) changed — peel the volatile line to the tail"),
-    "conversation": ("self",    "a settled prior turn was edited — likely an L2 transform "
-                                "flapping (fold / thinking-strip / task-reminder); check the latch"),
+    "conversation": ("self",    "a settled prior turn was edited in place — an L2 transform "
+                                "flapping (fold / thinking-strip / edit-ack); check the latch"),
+    "compact":      ("environment", "the history was compacted (/compact or auto-compact) — "
+                                "an expected one-time contraction to a summary, not a leak; "
+                                "no per-turn fix"),
     "lapse":        ("environment", "the cache lapsed (idle > TTL) and re-wrote the whole "
                                 "prefix — arm a keep-warm hold or ping to hold it"),
 }
 
 
 def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_sysfull,
-                   cur_msg0, lapsed):
+                   cur_msg0, cur_msgs, lapsed):
     """Classify this turn's cache event against the prior session_head row.
-    `prior` = (tools_hash, sys_hash, sysfull_hash, msg0_hash) of the last head, or
-    None on the session's first turn (an initial cold start is NOT a bust). Returns
-    a class in {tools, system, preamble, conversation, lapse} or None (normal
-    append / not a bust). Most-upstream divergence wins (it dominates the cache
-    cost), matching the canonical order tools -> system -> messages[0] -> deeper; a
-    lapsed head with an unchanged static prefix is the time-caused `lapse`.
+    `prior` = (tools_hash, sys_hash, sysfull_hash, msg0_hash, msg_count) of the last
+    head, or None on the session's first turn (an initial cold start is NOT a bust).
+    Returns a class in {tools, system, preamble, conversation, compact, lapse} or
+    None (normal append / not a bust). Most-upstream divergence wins (it dominates
+    the cache cost), matching the canonical order tools -> system -> messages[0] ->
+    deeper.
 
     The `tools` hash is the CUMULATIVE first-marker segment (_segment_hashes:
     tools + the 'You are Claude Code' preamble) — a tools[] edit moves it. For the
@@ -261,7 +282,15 @@ def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_sysfull
     injection, or any layout with the system prompt past the final marker) is still
     a system-region bust — folding the full array in files it as `system`, never a
     false `conversation` (which renders loud/self and would blame the wrong
-    subsystem). /_bust's disk diff stays the byte-exact ground truth."""
+    subsystem). /_bust's disk diff stays the byte-exact ground truth.
+
+    When the static prefix (tools + full system + msg0) is byte-identical, the write
+    landed DEEPER (in the history), and we split three ways: a sharp message-count
+    CONTRACTION (cur_msgs <= prior * BUST_COMPACT_MSG_RATIO) is a `compact` (normal
+    turns only grow, so a collapse to a summary is the only thing that shrinks the
+    array — expected, benign); else a LAPSED head is the time-caused `lapse` (cache
+    died, bytes re-sent); else a settled mid-history turn actually changed in place
+    = `conversation` (content — usually one of OUR L2 transforms flapping)."""
     window = (read or 0) + (created or 0) + (inp or 0)
     if window <= 0:
         return None
@@ -269,7 +298,7 @@ def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_sysfull
         return None                          # tail-append write, not a real bust
     if prior is None:
         return None                          # first turn = initial cold start
-    p_tools, p_sys, p_sysfull, p_msg0 = prior
+    p_tools, p_sys, p_sysfull, p_msg0, p_msgs = prior
     if p_tools is not None and p_tools != cur_tools:
         return "tools"
     if (p_sys is not None and p_sys != cur_sys) or \
@@ -277,10 +306,13 @@ def _classify_bust(read, created, inp, *, prior, cur_tools, cur_sys, cur_sysfull
         return "system"
     if p_msg0 is not None and p_msg0 != cur_msg0:
         return "preamble"
-    # static prefix (tools + full system + msg0) is byte-identical to the prior
-    # head: the write landed deeper. A lapsed head means the bytes were fine but
-    # the cache went cold (time-caused); an unlapsed head means a settled
-    # mid-history message actually changed (content — usually one of our transforms).
+    # static prefix identical: the write landed in the HISTORY. A sharp contraction
+    # = a compact (checked FIRST — it's a definite content event, more specific than
+    # a coincident idle lapse); else a lapsed head = time-caused lapse; else a
+    # settled mid-history turn changed in place = conversation (our transform).
+    if (p_msgs and cur_msgs is not None
+            and cur_msgs <= p_msgs * BUST_COMPACT_MSG_RATIO):
+        return "compact"
     return "lapse" if lapsed else "conversation"
 
 
@@ -492,7 +524,9 @@ def cold_resumes(session):
         return 0
 
 
-_BUST_CLASSES = ("tools", "system", "preamble", "conversation", "lapse")
+# display + column order; compact and lapse are the two non-actionable
+# (fault=environment) classes and sit last.
+_BUST_CLASSES = ("tools", "system", "preamble", "conversation", "compact", "lapse")
 
 
 def bust_summary(session):
@@ -504,13 +538,13 @@ def bust_summary(session):
     (subagents never advance the head); survives restarts (session_bust table)."""
     if not session:
         return None
+    cols = ", ".join(_BUST_CLASSES)          # class counters, in canonical order
     try:
         con = store_mod.db()
         with store_mod.LOCK:
             r = con.execute(
-                "SELECT tools, system, preamble, conversation, lapse, "
-                "last_class, last_ts, last_write_tokens FROM session_bust "
-                "WHERE session_id=?", (session,)).fetchone()
+                f"SELECT {cols}, last_class, last_ts, last_write_tokens "
+                "FROM session_bust WHERE session_id=?", (session,)).fetchone()
     except Exception:
         return None
     if not r:
@@ -519,19 +553,22 @@ def bust_summary(session):
     total = sum(by_class.values())
     if total <= 0:
         return None
+    lc, lt, lw = r[len(_BUST_CLASSES)], r[len(_BUST_CLASSES) + 1], r[len(_BUST_CLASSES) + 2]
     # non-zero classes, biggest-first, each carrying its own fault + fix_hint so
     # the consumer renders severity/colour from the data, not a hardcoded map.
     classes = [{"class": c, "count": by_class[c],
                 "fault": _BUST_FAULT[c][0], "fix_hint": _BUST_FAULT[c][1]}
                for c in sorted(by_class, key=lambda c: -by_class[c]) if by_class[c]]
     last = None
-    if r[5]:
-        last = {"class": r[5], "ts": r[6], "write_tokens": int(r[7] or 0),
-                "fault": _BUST_FAULT[r[5]][0], "fix_hint": _BUST_FAULT[r[5]][1]}
+    if lc:
+        last = {"class": lc, "ts": lt, "write_tokens": int(lw or 0),
+                "fault": _BUST_FAULT[lc][0], "fix_hint": _BUST_FAULT[lc][1]}
+    # actionable = the busts a code/config change could have prevented (a self flap
+    # or a content divergence). The two fault=environment classes are NOT
+    # actionable: `lapse` (keep-warm territory) and `compact` (expected contraction).
+    actionable = total - by_class["lapse"] - by_class["compact"]
     return {"total": total, "by_class": by_class, "classes": classes,
-            # the actionable subset = everything except a plain idle lapse; a
-            # `self`/`content` bust is a code/config problem, `lapse` is keep-warm.
-            "actionable": total - by_class["lapse"], "last_bust": last}
+            "actionable": actionable, "last_bust": last}
 
 
 def _cold_ping_decision(obj):
@@ -611,6 +648,7 @@ def _record_warmth(obj, usage, is_main=True):
         head_advance = bool(sid and not ping and is_main)
         cur_msg0 = _msg0_hash(obj) if head_advance else None
         cur_sysfull = _sys_full_hash(obj) if head_advance else None
+        cur_msgs = len(msgs) if head_advance else None
         inp = (usage or {}).get("input_tokens") or 0
         with store_mod.LOCK:
             # COLD-RESUME detection (before we restamp). A real turn whose
@@ -627,16 +665,16 @@ def _record_warmth(obj, usage, is_main=True):
             if head_advance:
                 prev = con.execute(
                     "SELECT hash, cold_resumes, tools_hash, sys_hash, msg0_hash, "
-                    "sysfull_hash FROM session_head WHERE session_id=?",
+                    "sysfull_hash, msg_count FROM session_head WHERE session_id=?",
                     (sid,)).fetchone()
                 if prev:
                     pe = con.execute("SELECT expires_at FROM warmth WHERE hash=?",
                                      (prev[0],)).fetchone()
                     resumed = (not pe) or (pe[0] <= now)
                     new_resumes = (prev[1] or 0) + (1 if resumed else 0)
-                    # (tools_hash, sys_hash, sysfull_hash, msg0_hash) — the order
-                    # _classify_bust unpacks its `prior` tuple in.
-                    prior_seg = (prev[2], prev[3], prev[5], prev[4])
+                    # (tools_hash, sys_hash, sysfull_hash, msg0_hash, msg_count) —
+                    # the order _classify_bust unpacks its `prior` tuple in.
+                    prior_seg = (prev[2], prev[3], prev[5], prev[4], prev[6])
             con.executemany("INSERT INTO warmth(hash, stamped_at, ttl, expires_at) "
                             "VALUES(?,?,?,?) ON CONFLICT(hash) DO UPDATE SET "
                             "stamped_at=excluded.stamped_at, ttl=excluded.ttl, "
@@ -654,7 +692,7 @@ def _record_warmth(obj, usage, is_main=True):
                     cur_tools=(segs.get("tools") or {}).get("hash"),
                     cur_sys=(segs.get("system") or {}).get("hash"),
                     cur_sysfull=cur_sysfull,
-                    cur_msg0=cur_msg0, lapsed=resumed)
+                    cur_msg0=cur_msg0, cur_msgs=cur_msgs, lapsed=resumed)
                 if bust_class:
                     con.execute(
                         f"INSERT INTO session_bust(session_id, {bust_class}, "
@@ -666,17 +704,18 @@ def _record_warmth(obj, usage, is_main=True):
                         (sid, bust_class, now, created))
                 con.execute("INSERT INTO session_head(session_id, hash, updated_at, "
                             "tools_hash, sys_hash, msg0_hash, sysfull_hash, "
-                            "cold_resumes) VALUES(?,?,?,?,?,?,?,?) "
+                            "msg_count, cold_resumes) VALUES(?,?,?,?,?,?,?,?,?) "
                             "ON CONFLICT(session_id) DO UPDATE SET "
                             "hash=excluded.hash, updated_at=excluded.updated_at, "
                             "tools_hash=excluded.tools_hash, sys_hash=excluded.sys_hash, "
                             "msg0_hash=excluded.msg0_hash, "
                             "sysfull_hash=excluded.sysfull_hash, "
+                            "msg_count=excluded.msg_count, "
                             "cold_resumes=excluded.cold_resumes",
                             (sid, h, now,
                              (segs.get("tools") or {}).get("hash"),
                              (segs.get("system") or {}).get("hash"),
-                             cur_msg0, cur_sysfull, new_resumes))
+                             cur_msg0, cur_sysfull, cur_msgs, new_resumes))
             con.commit()
             size = con.execute("SELECT COUNT(*) FROM warmth").fetchone()[0]
     except Exception as e:

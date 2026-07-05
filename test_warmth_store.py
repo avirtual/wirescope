@@ -3404,12 +3404,17 @@ check("nav: unknown session -> empty nav, no entry",
 _bc_pure = lp.warmth._classify_bust
 
 
-# prior head tuple is (tools, sys_marked, sysfull, msg0); cur_* mirror it. The
-# helper defaults every current hash to the unchanged sentinel so each case only
-# names the ONE hash it perturbs (and its prior counterpart).
-def _cls(read, created, inp, *, prior, t="T", s="S", sf="SF", m="M", lapsed=False):
+# prior head tuple is (tools, sys_marked, sysfull, msg0, msg_count); cur_* mirror
+# it. The helper defaults every current hash to the unchanged sentinel + a
+# non-contracting message count (cur_msgs=200 vs prior 100), so each case names
+# only the ONE thing it perturbs. A 4-tuple prior is padded with prior msg_count
+# 100 for back-compat with the hash-only cases.
+def _cls(read, created, inp, *, prior, t="T", s="S", sf="SF", m="M",
+         cur_msgs=200, lapsed=False):
+    if prior is not None and len(prior) == 4:
+        prior = (*prior, 100)                # pad prior msg_count for hash-only cases
     return _bc_pure(read, created, inp, prior=prior, cur_tools=t, cur_sys=s,
-                    cur_sysfull=sf, cur_msg0=m, lapsed=lapsed)
+                    cur_sysfull=sf, cur_msg0=m, cur_msgs=cur_msgs, lapsed=lapsed)
 
 
 _ALL = ("T", "S", "SF", "M")     # a prior head byte-identical to the current one
@@ -3428,10 +3433,17 @@ check("classify: past-marker system change (only sysfull differs) -> system",
       _cls(30, 8000, 20, prior=("T", "S", "SF0", "M")) == "system")
 check("classify: messages[0] change (tools+sys same) -> preamble",
       _cls(2000, 8000, 20, prior=("T", "S", "SF", "M0")) == "preamble")
-check("classify: static prefix identical + not lapsed -> conversation (our bug)",
-      _cls(3000, 8000, 20, prior=_ALL) == "conversation")
+check("classify: static prefix identical + grew + not lapsed -> conversation (flap)",
+      _cls(3000, 8000, 20, prior=_ALL, cur_msgs=102) == "conversation")
 check("classify: static prefix identical + lapsed -> lapse (time-caused)",
-      _cls(0, 8000, 20, prior=_ALL, lapsed=True) == "lapse")
+      _cls(0, 8000, 20, prior=_ALL, cur_msgs=102, lapsed=True) == "lapse")
+check("classify: sharp message-count contraction -> compact (benign, not a flap)",
+      # prior 100 msgs -> 3 (<=0.5*100): a /compact collapse, NOT a settled-turn edit
+      _cls(2000, 8000, 20, prior=_ALL, cur_msgs=3) == "compact")
+check("classify: compact wins over a coincident lapse (contraction is definite)",
+      _cls(2000, 8000, 20, prior=_ALL, cur_msgs=3, lapsed=True) == "compact")
+check("classify: a modest count drop (not past the ratio) stays conversation",
+      _cls(3000, 8000, 20, prior=_ALL, cur_msgs=98) == "conversation")   # 98 > 0.5*100
 check("classify: content-divergence wins over lapse when both present",
       _cls(0, 8000, 20, prior=("T0", "S", "SF", "M"), lapsed=True) == "tools")
 check("classify: write_frac just under the gate -> append, not a bust",
@@ -3520,6 +3532,22 @@ check("live classifier: a past-marker system-block change classifies as `system`
       _rt1["bust_class"] is None and _rt2["bust_class"] is None
       and _rt3["bust_class"] == "system"
       and lp.warmth.bust_summary("sess-bc-tail")["by_class"]["conversation"] == 0)
+
+# live compact path (clodex's cry-wolf concern): a big history that CONTRACTS to a
+# summary must classify `compact` (benign, fault=environment, excluded from
+# `actionable`), NOT a loud `conversation` self-flap. Same static prefix throughout.
+_cc1 = _bc_rec(_bc_body(_BSA, "2026-07-05", 40, sid="sess-bc-cmp"), 0, 8000)     # establish 82 msgs
+_cc2 = _bc_rec(_bc_body(_BSA, "2026-07-05", 41, sid="sess-bc-cmp"), 8000, 300)   # grow -> append
+_cc3 = _bc_rec(_bc_body(_BSA, "2026-07-05", 1, sid="sess-bc-cmp"), 3000, 4000)   # collapse -> compact
+check("live classifier: a history contraction classifies as `compact`, not conversation",
+      _cc1["bust_class"] is None and _cc2["bust_class"] is None
+      and _cc3["bust_class"] == "compact")
+_ccs = lp.warmth.bust_summary("sess-bc-cmp")
+check("live classifier: compact is counted but NOT actionable (fault=environment)",
+      _ccs["by_class"]["compact"] == 1 and _ccs["by_class"]["conversation"] == 0
+      and _ccs["total"] == 1 and _ccs["actionable"] == 0
+      and _ccs["last_bust"]["class"] == "compact"
+      and _ccs["last_bust"]["fault"] == "environment")
 
 print()
 if FAILS:
