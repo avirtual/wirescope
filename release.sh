@@ -40,5 +40,12 @@ printf '%s %s %s\n' "$VERSION" \
   > "releases/$VERSION/RELEASE"
 ln -sfn "$VERSION" releases/current
 
+# Publish so other machines building from GitHub can see the release
+# (v0.6.14 once lived only on this machine — a remote clodex stayed on .13).
+# Non-fatal: offline shouldn't block a local cut, but say so loudly.
+if ! git push origin HEAD "$VERSION"; then
+  echo "WARNING: push failed — $VERSION exists only locally. Run: git push origin main $VERSION" >&2
+fi
+
 echo "release $VERSION cut -> releases/$VERSION (releases/current updated)"
 echo "deploy it on :7800 with:  ./run_release.sh"
