@@ -1147,6 +1147,42 @@ def _first_divergence(a, b):
     return None
 
 
+def _transition_class(bust, loc, prev_msgs, cur_msgs, ratio):
+    """Derive the bust CLASS (warmth._BUST_CLASSES vocabulary) for a /_bust
+    transition from its byte-diff locus, mirroring warmth._classify_bust's
+    precedence (tools -> system -> preamble -> compact -> lapse -> conversation)
+    so the disk-forensics view and the live /_status.busts counter speak the same
+    language — the consumer reads one class vocab + one _BUST_FAULT map, never
+    re-derives fault client-side. Returns None for a non-bust.
+
+    The two engines differ in what they SEE (this one diffs the captured bytes
+    N-1; the live one compares stored prefix hashes), so on the deep-history
+    split they use different but aligned signals: the live classifier has the
+    prior head's lapse state, while here an in-place edit of a settled message
+    (`appended:False`) is our transform flapping = `conversation`, whereas a
+    high-write transition whose only byte change is a new tail (`appended:True`,
+    or no diff at all) is the cache having lapsed and re-shipped the prefix
+    unchanged = `lapse`."""
+    if not bust:
+        return None
+    contraction = bool(prev_msgs and cur_msgs is not None
+                       and cur_msgs <= prev_msgs * ratio)
+    if loc is None:                    # receipt flagged a rewrite but the bytes
+        return "compact" if contraction else "lapse"   # are a clean extension
+    seg = loc.get("segment")
+    if seg == "tools":
+        return "tools"
+    if seg == "system":
+        return "system"
+    if seg == "messages":
+        if loc.get("index") == 0:
+            return "preamble"          # msg[0] = the claudeMd/userEmail bundle
+        if contraction:
+            return "compact"
+        return "lapse" if loc.get("appended") else "conversation"
+    return None
+
+
 def bust_series(session):
     """Per-transition cache-divergence forensics for a session's MAIN line, in
     chronological order. For each adjacent request pair it reports WHERE the
@@ -1163,6 +1199,7 @@ def bust_series(session):
     transform toggle). They agree on the clean cases (system swap, msg[0] date) and
     that agreement is high confidence; a low-write_frac warm append is NOT a bust
     even when the N-1 text diff finds a late change."""
+    from . import warmth as warmth_mod          # lazy: fault map + compact ratio
     pairs = [p for p in _iter_pairs(session) if p["line"] == "main" and p["ok"]]
     transitions = []
     prev = None
@@ -1206,18 +1243,32 @@ def bust_series(session):
             surv_boundary in ("none", "tools", "system")
             or (loc and (loc["segment"] in ("tools", "system")
                          or (loc["segment"] == "messages" and loc.get("index") == 0)))))
+        cur_msgs = len(b.get("messages") or [])
+        # class + fault + fix_hint, pulled from warmth's shared _BUST_FAULT so a
+        # consumer (clodex's popover) renders per-turn severity/colour without
+        # re-implementing the classifier; restart_between (the capture seq reset
+        # to a lower value between the two turns = the proxy restarted) marks the
+        # benign deploy/restart case — a content bust that is a one-time tax and
+        # self-heals next turn, so the consumer can label it instead of alarming.
+        cls = _transition_class(bust, loc, prev_msgs, cur_msgs,
+                                warmth_mod.BUST_COMPACT_MSG_RATIO)
+        fault, fix_hint = (warmth_mod._BUST_FAULT.get(cls) or (None, None)
+                           if cls else (None, None))
+        cur_seq, from_seq = _seq_of(p["stem"]), _seq_of(prev["stem"])
         transitions.append({
-            "i": idx, "ts": p["ts"], "stem": p["stem"], "seq": _seq_of(p["stem"]),
-            "from_stem": prev["stem"], "from_seq": _seq_of(prev["stem"]),
+            "i": idx, "ts": p["ts"], "stem": p["stem"], "seq": cur_seq,
+            "from_stem": prev["stem"], "from_seq": from_seq,
             "severity": severity, "bust": bust,
             "quasi_full_rewrite": write_frac >= 0.6,
             "static_prefix_bust": static_prefix_bust,
+            "class": cls, "fault": fault, "fix_hint": fix_hint,
+            "restart_between": bool(cur_seq < from_seq),
             "read_tokens": cr, "write_tokens": write, "uncached_input": inp,
             "window_tokens": window, "write_frac": write_frac,
             "survived_prefix": survived_prefix,
             "locus": loc,
             "prev_messages": prev_msgs,
-            "cur_messages": len(b.get("messages") or []),
+            "cur_messages": cur_msgs,
         })
         prev = p
     busts = [t for t in transitions if t["bust"]]
