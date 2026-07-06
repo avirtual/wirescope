@@ -204,6 +204,60 @@ check("bust rollup folds fault/fix_hint into each class for the consumer",
       and "keep-warm" in _cr_snap[0]["busts"]["classes"][0]["fix_hint"]
       and _cr_snap[0]["busts"]["last_bust"]["class"] == "lapse")
 
+# --- deploy-tax attribution: a bust that STRADDLES a proxy restart -------------
+# A content bust on the first main-line turn after the proxy booted (its prior
+# head was written by the PREVIOUS process, updated_at < core._START_TS) is the
+# one-time deploy/vendor-bump re-cache, not an in-session regression. It's a
+# permanent on-disk fact, so without attribution it amber-flags the session for
+# life on every upgrade. session_bust.{class}_restart counts it separately so a
+# glance-level chip gates on actionable_excl_restart (0 => calm).
+rst = {"model": "claude-fable-5",
+       "system": [{"type": "text", "text": "You are Claude Code, deploy-tax v1."}],
+       "messages": [msg("user", "deploy-tax probe alpha " * 20),
+                    msg("assistant", "deploy-tax reply " * 20),
+                    msg("user", "deploy-tax probe gamma " * 20)],
+       "metadata": {"user_id": json.dumps({"session_id": "sess-deploy-1"})}}
+# Turn 1: establish the head (initial cold start, no bust).
+lp._record_warmth({**rst, "messages": rst["messages"][:1]},
+                  {"cache_creation_input_tokens": 100})
+# Simulate a restart: bump _START_TS past the head we just wrote, so the next
+# turn's prior head reads as "written by a previous process".
+_saved_start = lp.core._START_TS
+lp.core._START_TS = time.time() + 100
+# Turn 2: CHANGE the system prompt (a deploy would) -> a `system` content bust,
+# and it straddles the (simulated) restart.
+rst_v2 = {**rst, "system": [{"type": "text",
+                             "text": "You are Claude Code, deploy-tax v2 CHANGED."}],
+          "messages": rst["messages"][:2]}
+r_dep = lp._record_warmth(rst_v2, {"cache_creation_input_tokens": 1000,
+                                   "cache_read_input_tokens": 10})
+lp.core._START_TS = _saved_start          # restore before anything else runs
+check("a system bust straddling a restart is classified `system`",
+      r_dep["bust_class"] == "system")
+lp._upsert_session_meta("sess-deploy-1", cwd="/tmp/dep", model="claude-fable-5")
+_dep = [s for s in lp._status_snapshot(session="sess-deploy-1")["sessions"]
+        if s["session_id"] == "sess-deploy-1"][0]["busts"]
+check("the deploy-tax bust is attributed to restart_between, not left actionable",
+      _dep["by_class"]["system"] == 1 and _dep["by_restart"]["system"] == 1
+      and _dep["actionable"] == 1              # legacy field still counts it
+      and _dep["actionable_excl_restart"] == 0)  # ...the deploy-aware one doesn't
+_dep_sys = next(c for c in _dep["classes"] if c["class"] == "system")
+check("per-class restart_between rides classes[] for the chip's count>restart gate",
+      _dep_sys["count"] == 1 and _dep_sys["restart_between"] == 1
+      and _dep_sys["fault"] == "content")
+# Turn 3: a REAL in-session system bust (no restart) -> count exceeds restart,
+# so actionable_excl_restart goes positive = the chip should light up.
+rst_v3 = {**rst, "system": [{"type": "text",
+                             "text": "You are Claude Code, deploy-tax v3 midswap."}],
+          "messages": rst["messages"][:2]}
+lp._record_warmth(rst_v3, {"cache_creation_input_tokens": 1000,
+                           "cache_read_input_tokens": 10})
+_dep2 = [s for s in lp._status_snapshot(session="sess-deploy-1")["sessions"]
+         if s["session_id"] == "sess-deploy-1"][0]["busts"]
+check("a real (non-restart) content bust lifts actionable_excl_restart above 0",
+      _dep2["by_class"]["system"] == 2 and _dep2["by_restart"]["system"] == 1
+      and _dep2["actionable_excl_restart"] == 1)
+
 # /_end = a MARKER since 2026-06-11, not a delete: one-shot `claude -p` runs
 # fire SessionEnd the instant their answer lands; the debug state must survive.
 e = lp._end_session("sess-test-1", reason="clear")
