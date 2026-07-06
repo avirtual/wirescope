@@ -691,9 +691,23 @@ async def handler(request: Request) -> Response:
             entry, t_resp, t_usage, nav = views_mod._load_request_by_index(sess, ti)
             bust_t = None
             if nav.get("i") is not None:
-                by_stem = {t["stem"]: t for t in report_mod.bust_series(sess)["transitions"]}
-                cur = views_mod._main_line_turns(sess)[nav["i"]]
+                series = report_mod.bust_series(sess)
+                by_stem = {t["stem"]: t for t in series["transitions"]}
+                turns = views_mod._main_line_turns(sess)
+                cur = turns[nav["i"]]
                 bust_t = by_stem.get(cur["stem"])
+                # Forensic jumps: nearest real cache-bust either side of this
+                # turn (skips the warm-append turns a step-walk plods through).
+                # bust_series filters p["ok"] while _main_line_turns doesn't, so
+                # the two index spaces can diverge — map bust STEMS back to
+                # turn-navigator indices (the space &turn= addresses).
+                stem_to_i = {t["stem"]: j for j, t in enumerate(turns)}
+                bi = sorted(stem_to_i[t["stem"]] for t in series["busts"]
+                            if t["stem"] in stem_to_i)
+                ci = nav["i"]
+                nav["prev_bust"] = max((j for j in bi if j < ci), default=None)
+                nav["next_bust"] = min((j for j in bi if j > ci), default=None)
+                nav["n_busts"] = len(bi)
             return Response(views_mod._render_session_html(
                                 sess, entry,
                                 status_mod._status_snapshot(session=sess),

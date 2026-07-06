@@ -319,6 +319,11 @@ details.more>summary{color:#69707d;font-size:12px}
 .navbar{border:1px solid #2a2e36;border-radius:4px;padding:.3em .6em;
         background:#12151a}
 .navbar a{color:#6ab0de;text-decoration:none} .navbar a:hover{text-decoration:underline}
+.navbar a.bustjump{color:#e5c07b;font-weight:600}
+.naventry{margin:.2em 0 .6em}
+.naventry a{color:#e5c07b;text-decoration:none;border:1px solid #3a3320;
+        border-radius:4px;padding:.15em .5em;background:#1a1710}
+.naventry a:hover{text-decoration:underline}
 .bustp{border-left-color:#e5c07b}
 .bustp pre.diff{font-size:12px;max-height:14em}
 .bustp pre.diff{color:#aab2c0}
@@ -693,9 +698,20 @@ def _session_nav_html(sid, nav, bust_t):
     latest = ('' if nav.get("next") is None
               else f' · <a href="/_session?session={e(sid)}">latest &raquo;&raquo;</a>')
     seq = nav.get("seq")
+    # Forensic jumps: skip the warm-append turns and land on the nearest
+    # cache-BUST transition (populated by the server from report.bust_series).
+    # These are the turns worth reading — a step-by-step walk mostly traverses
+    # boring warm appends. None when there's no bust in that direction.
+    pj, nj = nav.get("prev_bust"), nav.get("next_bust")
+    nb = nav.get("n_busts") or 0
+    bust_count = (f'<span class="dim">· <b class="warn">{nb}</b> '
+                  f'bust{"s" if nb != 1 else ""}</span>' if nb else
+                  '<span class="dim">· all warm</span>')
     arrows = (f'<p class="kv navbar"><span>{_lnk(nav.get("prev"), "&laquo; prev")}</span>'
+              f'<span>{_lnk(pj, "&#9198; prev bust", "bustjump")}</span>'
               f'<span class="dim">turn <b>{i + 1}</b> of {n}'
-              f'{f" · seq {seq}" if seq is not None else ""}</span>'
+              f'{f" · seq {seq}" if seq is not None else ""} {bust_count}</span>'
+              f'<span>{_lnk(nj, "next bust &#9197;", "bustjump")}</span>'
               f'<span>{_lnk(nav.get("next"), "next &raquo;")}</span>'
               f'<span class="dim">{e(_fmt_ago(nav.get("ts")))}{latest}</span></p>')
     if not bust_t:
@@ -772,6 +788,13 @@ def _render_session_html(sid, entry, snap, resp=None, usage=None, subrole=None,
                 f'<span>cwd <b>{e(s.get("cwd") or "?")}</b></span>'
                 f'<span class="dim">last seen {e(_fmt_ago(s.get("last_seen")))}</span></p>')
     head += nav_html                       # turn navigator arrows + bust panel (nav mode)
+    if not nav and not subrole:
+        # TOP-of-page entry into the turn navigator, so the forensic controls
+        # aren't buried in the footer (you'd have to scroll the whole transcript
+        # to find them). turn=-1 = latest turn WITH the arrow bar + bust jumps.
+        head += ('<p class="naventry">'
+                 f'<a href="/_session?session={e(sid)}&turn=-1">'
+                 '&#8635; step through turns &#183; jump to cache busts</a></p>')
     if usage:    # token receipts from the last response (in-memory; see
                  # meta._LAST_USAGE) — what actually got read vs (re)written
         rd = usage.get("cache_read_input_tokens") or 0
