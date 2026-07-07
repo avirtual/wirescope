@@ -1006,6 +1006,18 @@ async def handler(request: Request) -> Response:
         # still run (they only read obj). One guard instead of N per-feature 0s.
         if obj and not transforms_mod.PASSTHROUGH:
             changed = False
+            # SIDE-CALL MODEL DOWNSHIFT: rewrite the model of one-shot
+            # WebFetch-summarize / WebSearch utility calls (the CLI ships them
+            # on the session's MAIN model — a fetched page as uncached input at
+            # fable rates). Cache-safe: these bodies carry no cache_control.
+            # First in the chain so the rewrite is visible to capture/billing
+            # and to the beta-header strip at forward time below.
+            scd = transforms_mod._sidecall_downshift(obj)
+            if scd:
+                record["sidecall_downshift"] = scd
+                changed = True
+                print(f"[sidecall] #{n} {agent} {scd['kind']} downshift "
+                      f"{scd['from_model']} -> {scd['to_model']}", flush=True)
             appended, reason = transforms_mod._decide_injection(obj)
             if appended:
                 orig = transforms_mod._inject_into_last_user(obj, appended, transforms_mod.INJECT_SEP)
@@ -1306,6 +1318,17 @@ async def handler(request: Request) -> Response:
     # ---- forward upstream; tee the response stream to a .sse file ----
     fwd_headers = {k: v for k, v in request.headers.items() if k.lower() not in core_mod._HOP}
     fwd_headers["accept-encoding"] = "identity"  # force uncompressed so we can read the SSE
+    # Downshifted side-call: drop beta tokens the target model may not support
+    # (defensive — context-1m is unsupported on haiku; the body rewrite happened
+    # up in the transform chain, this is its header half. SIDECALL_BETA_STRIP).
+    if "sidecall_downshift" in record and transforms_mod.SIDECALL_BETA_STRIP:
+        _beta = fwd_headers.get("anthropic-beta")
+        if _beta:
+            _kept = [t.strip() for t in _beta.split(",")
+                     if t.strip() and t.strip() not in transforms_mod.SIDECALL_BETA_STRIP]
+            fwd_headers["anthropic-beta"] = ",".join(_kept)
+            record["sidecall_downshift"]["beta_stripped"] = sorted(
+                set(t.strip() for t in _beta.split(",")) - set(_kept))
     # Stash this (post-transform) request so POST /_ping?session= can replay it.
     # Only the MAIN LINE (parent agent) is the session's durable, pingable
     # request: a subagent, title side-call, or quota probe shares the session_id
