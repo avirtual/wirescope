@@ -1059,13 +1059,26 @@ def _strip_mcp_tools(obj, agent_id=None):
 # Both are single-shot and carry ZERO cache_control -> rewriting `model` is
 # cache-safe (no prefix lineage) and history-safe (the CLI consumes only the
 # response text; nothing re-enters the transcript under the wrong model).
-# SIDECALL_MODEL=<model-id> opts in (e.g. claude-haiku-4-5-20251001); default
-# off. `output_config` (fable-only effort key) is dropped alongside; the server
+# DEFAULT ON -> claude-sonnet-5 (operator decision 2026-07-07: sonnet keeps
+# digest quality for research-critical searches at 1/3 fable input price;
+# a fable-capability digester is never warranted for page summarization).
+# Only fires when the incoming model is MORE expensive than everything cheap —
+# i.e. it never UPSHIFTS: a session already on haiku/sonnet is left alone
+# (model == target short-circuits; _MODEL_RANK guards the haiku case).
+# Override with SIDECALL_MODEL=<model-id>; kill with SIDECALL_MODEL=off.
+# `output_config` (fable-only effort key) is dropped alongside; the server
 # strips `context-1m-2025-08-07` from the forwarded anthropic-beta header
 # (SIDECALL_BETA_STRIP) since the target model may not support the 1M beta.
 # Decline-on-doubt: any thinking key, >1 message, any cache_control, or an
 # unrecognized shape -> untouched.
-SIDECALL_MODEL = os.environ.get("SIDECALL_MODEL", "").strip()
+SIDECALL_MODEL = os.environ.get("SIDECALL_MODEL", "claude-sonnet-5").strip()
+if SIDECALL_MODEL.lower() in ("0", "no", "off", "false"):
+    SIDECALL_MODEL = ""
+# Cheaper-than ordering so the downshift never upshifts a cheap session's
+# side-call (haiku session + sonnet target would be a price INCREASE).
+# Unlisted models (incl. dated variants) rank as expensive -> eligible;
+# matching is by substring on the family name.
+_SIDECALL_RANK = ("haiku", "sonnet", "opus", "fable")
 # beta tokens to drop from the forwarded header when the downshift fired
 SIDECALL_BETA_STRIP = frozenset(
     t for t in re.split(r"[,\s]+", os.environ.get(
@@ -1129,15 +1142,28 @@ def _sidecall_kind(obj):
     return None
 
 
+def _sidecall_rank(model):
+    """Price-family rank of a model id (higher = pricier); unknown families
+    rank above everything listed so they stay downshift-eligible."""
+    low = (model or "").lower()
+    for i, fam in enumerate(_SIDECALL_RANK):
+        if fam in low:
+            return i
+    return len(_SIDECALL_RANK)
+
+
 def _sidecall_downshift(obj):
     """Rewrite the model of a recognized WebFetch/WebSearch utility side-call
     to SIDECALL_MODEL. Returns a log dict {kind, from_model, to_model,
-    dropped} or None (gate off / not a side-call / already at target)."""
+    dropped} or None (gate off / not a side-call / already at target /
+    would not be a downshift)."""
     if not SIDECALL_MODEL or not isinstance(obj, dict):
         return None
     model = obj.get("model")
     if not model or model == SIDECALL_MODEL:
         return None
+    if _sidecall_rank(model) <= _sidecall_rank(SIDECALL_MODEL):
+        return None                     # never upshift (e.g. haiku session)
     kind = _sidecall_kind(obj)
     if kind is None:
         return None

@@ -3730,6 +3730,80 @@ shutil_rm = __import__("shutil").rmtree
 shutil_rm(_pr_new, ignore_errors=True)
 (_pr_ns / "new-probe.request.json").unlink()
 
+# ---- SIDE-CALL MODEL DOWNSHIFT (SIDECALL_MODEL) ----------------------------
+# Default = claude-sonnet-5 (code default, no env needed). The two utility-call
+# shapes rewrite; everything else — real turns, cheap sessions, cache-marked or
+# thinking bodies — is untouched.
+
+def _mk_webfetch(model="claude-fable-5"):
+    return {"model": model, "max_tokens": 64000, "stream": True,
+            "output_config": {"effort": "high"},
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=x"},
+                       {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "\nWeb page content:\n---\nstuff\n---\n\nWhat is this?"}]}]}
+
+def _mk_websearch(model="claude-fable-5"):
+    return {"model": model, "max_tokens": 64000, "stream": True,
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+            "tool_choice": {"type": "auto"},
+            "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=x"},
+                       {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."},
+                       {"type": "text", "text": "You are an assistant for performing a web search tool use"}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Perform a web search for the query: foo"}]}]}
+
+check("sidecall: default target is sonnet (on without env)",
+      lp.transforms.SIDECALL_MODEL == "claude-sonnet-5")
+
+_scf = _mk_webfetch()
+_r = lp.transforms._sidecall_downshift(_scf)
+check("sidecall: webfetch fable->sonnet, output_config dropped",
+      _r and _r["kind"] == "webfetch" and _scf["model"] == "claude-sonnet-5"
+      and "output_config" not in _scf and _r["dropped"] == ["output_config"])
+
+_scs = _mk_websearch()
+_r = lp.transforms._sidecall_downshift(_scs)
+check("sidecall: websearch fable->sonnet",
+      _r and _r["kind"] == "websearch" and _scs["model"] == "claude-sonnet-5")
+
+check("sidecall: haiku session never upshifted",
+      lp.transforms._sidecall_downshift(_mk_webfetch("claude-haiku-4-5-20251001")) is None)
+check("sidecall: sonnet session untouched (already at family)",
+      lp.transforms._sidecall_downshift(_mk_webfetch("claude-sonnet-5")) is None)
+
+_ncm = _mk_webfetch()
+_ncm["messages"][0]["content"][0]["cache_control"] = {"type": "ephemeral"}
+check("sidecall: any cache_control declines",
+      lp.transforms._sidecall_downshift(_ncm) is None)
+_nth = _mk_webfetch()
+_nth["thinking"] = {"type": "adaptive"}
+check("sidecall: thinking key declines",
+      lp.transforms._sidecall_downshift(_nth) is None)
+_n2m = _mk_webfetch()
+_n2m["messages"].append({"role": "assistant", "content": "hi"})
+check("sidecall: >1 message (real conversation) declines",
+      lp.transforms._sidecall_downshift(_n2m) is None)
+_nrt = _mk_webfetch()
+_nrt["messages"][0]["content"][0]["text"] = "Please summarize this file"
+check("sidecall: non-matching first text declines",
+      lp.transforms._sidecall_downshift(_nrt) is None)
+
+# ---- display_name from named-spawn agent-id (clodex ask 2026-07-07) --------
+check("agent-id label: named spawn name extracted, blobs/absent -> None",
+      lp.meta._agent_id_label("stock-diligence-FIG@session-2bcc26b4") == "stock-diligence-FIG"
+      and lp.meta._agent_id_label("a1b2c3d4-e5f6-7890-abcd-ef1234567890@s") is None
+      and lp.meta._agent_id_label(None) is None)
+lp.meta._note_subagent("sess-dnlabel", "subagent", "m1",
+                       agent_id="probe-x@session-ff")
+check("named spawn populates display_name from agent-id (directive absent)",
+      lp.meta._SUBAGENTS["sess-dnlabel"]["probe-x@session-ff"]["display_name"] == "probe-x")
+lp.meta._note_subagent("sess-dnlabel", "subagent", "m1",
+                       agent_id="probe-x@session-ff", display_name="Custom")
+check("directive display_name still wins over the agent-id fallback",
+      lp.meta._SUBAGENTS["sess-dnlabel"]["probe-x@session-ff"]["display_name"] == "Custom")
+lp.meta._SUBAGENTS.pop("sess-dnlabel", None)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
