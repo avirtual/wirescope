@@ -81,6 +81,8 @@ def _identity():
             "context_report": True,       # /_report?session= cost/efficiency report
             "context_timeline": True,     # /_report?...&detail=1 series + /_timeline HTML
             "bust_locator": True,         # /_bust?session= cache-divergence forensics
+            "prune": True,                # /_prune capture-dir retention (GET readout
+                                          # + POST two-tier prune; see INTEGRATION.md)
             "cost_by_line": True,         # per-agent-line cost split: cost.main_est_usd
                                           # + sub_agents[].est_usd (+ /_report scope.agents)
             # prior-turn thinking strip: per-session consumer opt-in via /_strip
@@ -148,6 +150,7 @@ def _identity():
             "timeline": "/_timeline",
             "bust": "/_bust",
             "strip": "/_strip",
+            "prune": "/_prune",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
     }

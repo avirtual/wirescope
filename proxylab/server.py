@@ -30,6 +30,7 @@ from proxylab import fold as fold_mod
 from proxylab import hold as hold_mod
 from proxylab import meta as meta_mod
 from proxylab import pinger as pinger_mod
+from proxylab import prune as prune_mod
 from proxylab import receipts as receipts_mod
 from proxylab import report as report_mod
 from proxylab import restore as restore_mod
@@ -631,6 +632,44 @@ async def handler(request: Request) -> Response:
                             status_code=400, media_type="application/json")
         res = report_mod.bust_series(sess)
         return Response(json.dumps(res, indent=2), media_type="application/json")
+
+    # ---- capture-dir retention -------------------------------------------------
+    # GET /_prune — free size readout: where the disk went + what the default
+    # cutoffs would reclaim (one fs walk, nothing deleted). POST /_prune?
+    # older_than=30d[&tier=receipts|full][&scope=sessions|no-session|all]
+    # [&dry_run=1] — execute a prune pass. older_than is REQUIRED (destructive
+    # endpoint, no implicit default) and floored at 1h; warm/held sessions and
+    # anything with recent activity are never touched (proxylab/prune.py).
+    # Action-endpoint convention: 400 only for malformed input; outcome in body.
+    if request.url.path.rstrip("/") == "/_prune":
+        if request.method == "GET":
+            return Response(json.dumps(prune_mod.prune_scan(), indent=2),
+                            media_type="application/json")
+        if request.method == "POST":
+            q = request.query_params
+            age = prune_mod._parse_age(q.get("older_than"))
+            if age is None or age < prune_mod._MIN_AGE_S:
+                return Response(json.dumps(
+                    {"error": "older_than required (e.g. 30d / 12h), min 1h"}),
+                    status_code=400, media_type="application/json")
+            tier = q.get("tier") or "receipts"
+            scope = q.get("scope") or "all"
+            if tier not in ("receipts", "full") or scope not in (
+                    "sessions", "no-session", "all"):
+                return Response(json.dumps(
+                    {"error": "tier in {receipts,full}; "
+                              "scope in {sessions,no-session,all}"}),
+                    status_code=400, media_type="application/json")
+            dry = q.get("dry_run") in ("1", "yes", "true")
+            res = prune_mod.prune(age, tier=tier, scope=scope, dry_run=dry)
+            if not dry:
+                print(f"[prune] tier={tier} scope={scope} "
+                      f"older_than={q.get('older_than')} -> "
+                      f"{res['files_deleted']} files / "
+                      f"{res['bytes_reclaimed'] / 1e6:.1f} MB reclaimed "
+                      f"({res['sessions_pruned']} sessions)", flush=True)
+            return Response(json.dumps(res, indent=2),
+                            media_type="application/json")
 
     # ---- timeline page: per-request cost evolution, for humans -----------------
     # GET /_timeline?session=<id> — read-only HTML render of the cost-over-time

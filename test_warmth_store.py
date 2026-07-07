@@ -3662,6 +3662,74 @@ check("by_line survives restart via the existing _session.json restore path",
       abs(lp._SESSION_TOTALS["sess-byline-2"]["by_line"]["a1sub"]["est_usd"] - 4.0) < 1e-6)
 del lp._SESSION_TOTALS["sess-byline-1"], lp._SESSION_TOTALS["sess-byline-2"]
 
+# --- /_prune: capture-dir retention (two-tier: bodies vs receipts) ----------------
+# The heavy files (request bodies + SSE) and the valuable ones (billing receipts)
+# are different files: tier=receipts collapses an old session to receipts (its
+# /_report pricing survives), tier=full removes it; warm/held/recent never touched.
+check("prune: age parser (30d / 12h / raw seconds / garbage)",
+      lp.prune._parse_age("30d") == 30 * 86400 and lp.prune._parse_age("12h") == 43200
+      and lp.prune._parse_age("3600") == 3600.0 and lp.prune._parse_age("soon") is None)
+
+_pr_root = pathlib.Path(os.environ["LOG_DIR"])
+_pr_old_t = time.time() - 40 * 86400
+def _mk_capture_dir(name, old):
+    d = _pr_root / name
+    d.mkdir(exist_ok=True)
+    (d / "001-x-parent-m-000000.request.json").write_bytes(b"x" * 1000)
+    (d / "001-x-parent-m-000000.response.sse").write_bytes(b"x" * 500)
+    (d / "001-x-parent-m-000000.response.json").write_bytes(b"x" * 100)
+    (d / "_session.json").write_bytes(b"{}")
+    if old:
+        for f in d.iterdir():
+            os.utime(f, (_pr_old_t, _pr_old_t))
+    return d
+_pr_old = _mk_capture_dir("sess-prune-old", old=True)
+_pr_new = _mk_capture_dir("sess-prune-new", old=False)
+_pr_ns = _pr_root / "_no-session"
+_pr_ns.mkdir(exist_ok=True)
+(_pr_ns / "old-probe.request.json").write_bytes(b"x" * 300)
+os.utime(_pr_ns / "old-probe.request.json", (_pr_old_t, _pr_old_t))
+(_pr_ns / "new-probe.request.json").write_bytes(b"x" * 300)
+
+_ps = lp.prune.prune_scan()
+check("prune scan: sizes split bodies vs receipts; old session is reclaimable",
+      _ps["ok"] and _ps["sessions"]["count"] >= 2
+      and _ps["reclaimable"]["bodies"]["sessions"] == 1
+      and _ps["reclaimable"]["bodies"]["bytes"] == 1500
+      and _ps["reclaimable"]["no_session"]["files"] == 1)
+
+_pd = lp.prune.prune(30 * 86400, tier="receipts", scope="sessions", dry_run=True)
+check("prune dry-run: reports the reclaim, deletes nothing",
+      _pd["dry_run"] and _pd["sessions_pruned"] == 1 and _pd["bytes_reclaimed"] == 1500
+      and (_pr_old / "001-x-parent-m-000000.request.json").exists())
+
+_pr_held = _mk_capture_dir("sess-prune-held", old=True)
+lp._arm_hold("sess-prune-held", "arm", 2.0)
+_pw = lp.prune.prune(30 * 86400, tier="receipts", scope="sessions", dry_run=False)
+check("prune tier=receipts: bodies deleted, receipts kept; held+recent skipped",
+      _pw["sessions_pruned"] == 1 and _pw["skipped"]["held"] == 1
+      and not (_pr_old / "001-x-parent-m-000000.request.json").exists()
+      and not (_pr_old / "001-x-parent-m-000000.response.sse").exists()
+      and (_pr_old / "001-x-parent-m-000000.response.json").exists()
+      and (_pr_old / "_session.json").exists()
+      and (_pr_new / "001-x-parent-m-000000.request.json").exists()
+      and (_pr_held / "001-x-parent-m-000000.request.json").exists())
+check("prune: receipts-only dir is a no-op on a second receipts pass",
+      lp.prune.prune(30 * 86400, tier="receipts", scope="sessions",
+                     dry_run=False)["sessions_pruned"] == 0)
+
+_pf = lp.prune.prune(30 * 86400, tier="full", scope="all", dry_run=False,
+                     protect=False)   # protect=False = the CLI path: held dir goes too
+check("prune tier=full + protect=False (CLI): old dirs + old no-session files go",
+      not _pr_old.exists() and not _pr_held.exists() and _pr_new.exists()
+      and not (_pr_ns / "old-probe.request.json").exists()
+      and (_pr_ns / "new-probe.request.json").exists())
+with lp._HOLD_LOCK:
+    lp._HOLD_STATE.pop("sess-prune-held", None)   # don't leak into later checks
+shutil_rm = __import__("shutil").rmtree
+shutil_rm(_pr_new, ignore_errors=True)
+(_pr_ns / "new-probe.request.json").unlink()
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
