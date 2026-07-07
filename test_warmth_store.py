@@ -3603,6 +3603,65 @@ check("live classifier: compact is counted but NOT actionable (fault=environment
       and _ccs["last_bust"]["class"] == "compact"
       and _ccs["last_bust"]["fault"] == "environment")
 
+# --- per-line cost decomposition (by_line: main vs each subagent instance) -------
+# _accumulate(line=) bumps a per-line sub-bucket inside the session totals, so
+# /_status // /_admin can answer "where did this research run's money go" per
+# subagent without a disk scan. Whole-session totals stay the top-level numbers.
+_bl_bill_main = lp._billing("messages", model_resolved="claude-fable-5",
+                            usage_final={"input_tokens": 100_000, "output_tokens": 0,
+                                         "cache_read_input_tokens": 0,
+                                         "cache_creation_input_tokens": 0})
+_bl_bill_sub = lp._billing("messages", model_resolved="claude-fable-5",
+                           usage_final={"input_tokens": 200_000, "output_tokens": 0,
+                                        "cache_read_input_tokens": 0,
+                                        "cache_creation_input_tokens": 0})
+lp.billing._accumulate(_bl_bill_main, "sess-byline-1", line="main")
+lp.billing._accumulate(_bl_bill_sub, "sess-byline-1", line="a1sub")
+lp.billing._accumulate(_bl_bill_sub, "sess-byline-1", line="a1sub")
+_blt = lp._SESSION_TOTALS["sess-byline-1"]
+check("by_line: session totals stay the whole tree (main + subs)",
+      _blt["requests"] == 3
+      and abs(_blt["est_usd"] - (1.0 + 2.0 + 2.0)) < 1e-6)
+check("by_line: each line buckets its own share",
+      abs(_blt["by_line"]["main"]["est_usd"] - 1.0) < 1e-6
+      and _blt["by_line"]["main"]["requests"] == 1
+      and abs(_blt["by_line"]["a1sub"]["est_usd"] - 4.0) < 1e-6
+      and _blt["by_line"]["a1sub"]["requests"] == 2)
+lp.billing._accumulate(_bl_bill_main, "sess-byline-1")   # line=None (codex path)
+check("by_line: line=None adds no bucket (total still counts it)",
+      set(_blt["by_line"]) == {"main", "a1sub"} and _blt["requests"] == 4)
+
+# /_status surfacing: sub_agents[].est_usd (keyed by the same instance key) +
+# cost.main_est_usd (the main line's own share, so sub rows visibly sum up)
+lp._upsert_session_meta("sess-byline-1", cwd="/tmp/bl", model="claude-fable-5")
+lp._note_subagent("sess-byline-1", "researcher", "claude-fable-5",
+                  agent_id="a1sub", now=time.time())
+_bls = lp._status_snapshot(session="sess-byline-1")["sessions"][0]
+check("status: sub_agents rows carry the instance's own est_usd",
+      abs(_bls["sub_agents"][0]["est_usd"] - 4.0) < 1e-6)
+check("status: cost carries whole-tree total AND the main line's share",
+      abs(_bls["cost"]["est_usd"] - 6.0) < 1e-6
+      and abs(_bls["cost"]["main_est_usd"] - 1.0) < 1e-6)
+_bl_html = lp._render_admin_html(lp._status_snapshot(session="sess-byline-1"))
+check("admin: sub row renders its cost share; cost cell shows the main share",
+      "$4.0000" in _bl_html and "main $1.0000" in _bl_html)
+
+# an instance with no billed traffic yet reads est_usd=None, not 0/KeyError
+lp._note_subagent("sess-byline-1", "fresh-sub", "claude-fable-5",
+                  agent_id="a2new", now=time.time() + 1)
+_bls2 = lp._status_snapshot(session="sess-byline-1")["sessions"][0]
+check("status: a not-yet-billed subagent reads est_usd=None",
+      next(sa for sa in _bls2["sub_agents"] if sa["key"] == "a2new")["est_usd"] is None)
+
+# restart-amnesia: by_line rides the _session.json snapshot -> restore .update()
+(pathlib.Path(os.environ["LOG_DIR"]) / "sess-byline-2").mkdir(exist_ok=True)
+(pathlib.Path(os.environ["LOG_DIR"]) / "sess-byline-2" / "_session.json").write_text(
+    json.dumps(json.loads(json.dumps(_blt))))
+lp._restore_totals()
+check("by_line survives restart via the existing _session.json restore path",
+      abs(lp._SESSION_TOTALS["sess-byline-2"]["by_line"]["a1sub"]["est_usd"] - 4.0) < 1e-6)
+del lp._SESSION_TOTALS["sess-byline-1"], lp._SESSION_TOTALS["sess-byline-2"]
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

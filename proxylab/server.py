@@ -1336,6 +1336,7 @@ async def handler(request: Request) -> Response:
                 receipts_mod.anthropic(
                     blob, n=n, ts=ts, agent=agent, role=role, model=model,
                     session_id=session_id, session_key=session_key, obj=obj,
+                    agent_header_id=agent_id,
                     title_call=title_call, side_call=side_call, is_messages=is_messages,
                     routed=(m is not None), out_dir=out_dir, stem=stem,
                     status_code=up.status_code, resp_headers=dict(up.headers),
