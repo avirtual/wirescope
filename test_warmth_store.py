@@ -3804,6 +3804,177 @@ check("directive display_name still wins over the agent-id fallback",
       lp.meta._SUBAGENTS["sess-dnlabel"]["probe-x@session-ff"]["display_name"] == "Custom")
 lp.meta._SUBAGENTS.pop("sess-dnlabel", None)
 
+# ---- PIN_SETTLED_BREAKPOINT (settled-boundary cache anchor, 2026-07-07) ----
+_CC = {"type": "ephemeral", "ttl": "1h"}
+
+
+def _tool_result_msg():
+    return {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "out"}]}
+
+
+def _mk_pin_obj(n_hist_turns=2, sys_markers=2, msg0_marker=True, tail_marker=True):
+    """A CLI-shaped request: system markers + msg0 marker + rolling tail marker,
+    history turns, then a current turn with a trailing tool loop (so the settled
+    boundary sits BELOW the tail)."""
+    o = {"model": "claude-fable-5",
+         "system": [{"type": "text", "text": "preamble"},
+                    {"type": "text", "text": "prose",
+                     "cache_control": dict(_CC)} if sys_markers >= 1 else
+                    {"type": "text", "text": "prose"}],
+         "messages": []}
+    if sys_markers >= 2:
+        o["system"].append({"type": "text", "text": "env", "cache_control": dict(_CC)})
+    m0 = msg("user", "first prompt")
+    if msg0_marker:
+        m0["content"][0]["cache_control"] = dict(_CC)
+    o["messages"].append(m0)
+    for i in range(n_hist_turns):
+        o["messages"].append(msg("assistant", f"answer {i}"))
+        o["messages"].append(msg("user", f"prompt {i}"))
+    # current turn: boundary user msg is the LAST real user turn, then tool loop
+    o["messages"].append(msg("assistant", "working"))
+    o["messages"].append(_tool_result_msg())
+    o["messages"].append(msg("assistant", "more"))
+    tail = _tool_result_msg()
+    if tail_marker:
+        tail["content"][-1]["cache_control"] = dict(_CC)
+    o["messages"].append(tail)
+    return o
+
+
+def _pin_of(o):
+    """(anchor_block_marker, msg0_marker) after a pin run, for asserts."""
+    msgs = o["messages"]
+    b = lp.transforms._settled_boundary(msgs)
+    a = lp.transforms._settled_boundary(msgs, upto=b)
+    return (msgs[a]["content"][-1].get("cache_control"),
+            msgs[0]["content"][0].get("cache_control"))
+
+check("settled boundary: shared detector finds last real user turn",
+      lp.transforms._settled_boundary(_mk_pin_obj()["messages"]) == 4)
+check("pin anchor: upto= finds the last SETTLED user turn (one boundary back)",
+      lp.transforms._settled_boundary(_mk_pin_obj()["messages"], upto=4) == 2)
+import inspect  # noqa: E402
+for _fn in (lp.transforms._strip_prior_thinking,
+            lp.transforms._strip_prior_edit_acks,
+            lp.transforms._strip_prior_tool_errors):
+    _src = inspect.getsource(_fn)
+    check(f"{_fn.__name__} uses the SHARED boundary detector (no inline recompute)",
+          "_settled_boundary(msgs)" in _src and "max((i for" not in _src)
+_src2 = inspect.getsource(lp.transforms._pin_settled_breakpoint)
+check("pin uses the SHARED boundary detector",
+      "_settled_boundary(msgs)" in _src2)
+
+# 4/4 budget (2 sys + msg0 + tail) -> MIGRATE the msg0 marker to the anchor
+_o = _mk_pin_obj()
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin at 4/4 budget migrates the msg0 marker to the settled anchor",
+      _r and _r["pinned"] and _r["mode"] == "migrated" and _r["donor_msg_idx"] == 0
+      and _r["anchor_idx"] == 2 and _r["boundary_idx"] == 4
+      and _pin_of(_o)[0] == _CC and _pin_of(_o)[1] is None)
+check("pin migration keeps total marker count at 4",
+      len(lp.transforms._cache_markers(_o)) == 4)
+check("pin inherits the donor's ttl", _r["ttl"] == "1h")
+
+# 3/4 budget (no msg0 marker) -> ADD a fresh marker, mirror prevailing ttl
+_o = _mk_pin_obj(msg0_marker=False)
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin at 3/4 budget adds a fresh marker (no donor popped)",
+      _r and _r["pinned"] and _r["mode"] == "added"
+      and _r["donor_msg_idx"] is None and _pin_of(_o)[0] == _CC)
+check("pin add lands at 4 total markers",
+      len(lp.transforms._cache_markers(_o)) == 4)
+
+# TURN TRANSITION (the case the pin exists for): request ends at the fresh
+# user prompt (tail = last real user turn, CLI rolling marker on it) -> the
+# anchor is the PREVIOUS turn's user msg, and the pin must land there
+_o = _mk_pin_obj()
+_o["messages"] = _o["messages"][:5]        # ends at the new turn's user msg
+_o["messages"][4]["content"][-1]["cache_control"] = dict(_CC)  # CLI tail marker
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin fires at a turn transition, anchoring the PREVIOUS turn's boundary",
+      _r and _r["pinned"] and _r["anchor_idx"] == 2 and _r["boundary_idx"] == 4
+      and _o["messages"][2]["content"][-1].get("cache_control"))
+
+# anchor already marked (client rolls two message markers) -> decline
+_o = _mk_pin_obj()
+_o["messages"][2]["content"][-1]["cache_control"] = dict(_CC)
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin declines already_marked when the anchor carries a marker",
+      _r and not _r["pinned"] and _r["reason"] == "already_marked")
+
+# anchor == msg0 (second turn of a session): msg0's last block unmarked -> pin
+_o = _mk_pin_obj(n_hist_turns=1, msg0_marker=False)
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin anchors msg0's last block on the second turn (anchor == 0)",
+      _r and _r["pinned"] and _r["anchor_idx"] == 0 and _r["boundary_idx"] == 2)
+
+# single-turn: nothing settled
+check("pin skips a single-turn request (boundary <= 0)",
+      lp.transforms._pin_settled_breakpoint(
+          {"messages": [msg("user", "hi")]}) is None)
+
+# zero client markers: never originate caching
+_o = _mk_pin_obj(sys_markers=0, msg0_marker=False, tail_marker=False)
+_o["system"] = [{"type": "text", "text": "preamble"}]
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin declines when the client shipped no markers at all",
+      _r and not _r["pinned"] and _r["reason"] == "no_client_markers")
+
+# budget full, no message donor below boundary -> decline (never steal system)
+_o = _mk_pin_obj(msg0_marker=False)
+_o["system"].append({"type": "text", "text": "x", "cache_control": dict(_CC)})
+_o["system"].append({"type": "text", "text": "y", "cache_control": dict(_CC)})
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin declines budget_full_no_donor rather than stealing a system marker",
+      _r and not _r["pinned"] and _r["reason"] == "budget_full_no_donor"
+      and sum(1 for r, _, _ in lp.transforms._cache_markers(_o) if r == "system") == 4)
+
+# string-content anchor (THE common case: the CLI rewrites its block-form tail
+# prompt to a bare string once it's history) -> convert to block form + pin
+_o = _mk_pin_obj()
+_o["messages"][2] = {"role": "user", "content": "plain string prompt"}
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin converts a string anchor to block form and pins it",
+      _r and _r["pinned"] and _r["converted_string"]
+      and _o["messages"][2]["content"] == [
+          {"type": "text", "text": "plain string prompt",
+           "cache_control": _CC}])
+
+# decline paths never mutate: a string anchor + budget full + no donor must
+# leave the string shape untouched
+_o = _mk_pin_obj(msg0_marker=False)
+_o["messages"][2] = {"role": "user", "content": "plain string prompt"}
+_o["system"].append({"type": "text", "text": "x", "cache_control": dict(_CC)})
+_o["system"].append({"type": "text", "text": "y", "cache_control": dict(_CC)})
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin decline leaves a string anchor unconverted (no mutation on decline)",
+      _r and not _r["pinned"] and _r["reason"] == "budget_full_no_donor"
+      and _o["messages"][2]["content"] == "plain string prompt")
+
+# genuinely unmarkable: list content whose last block isn't a dict
+_o = _mk_pin_obj()
+_o["messages"][2]["content"] = [{"type": "text", "text": "x"}, 5]
+_r = lp.transforms._pin_settled_breakpoint(_o)
+check("pin declines a malformed anchor (last block not a dict)",
+      _r and not _r["pinned"] and _r["reason"] == "unmarkable_content")
+
+# idempotent: second run sees the pin as already_marked... (marker now at
+# boundary's last block) — re-run must not add another or pop anything else
+_o = _mk_pin_obj()
+lp.transforms._pin_settled_breakpoint(_o)
+_r2 = lp.transforms._pin_settled_breakpoint(_o)
+check("pin is idempotent (second run declines already_marked, count stable)",
+      _r2 and not _r2["pinned"] and _r2["reason"] == "already_marked"
+      and len(lp.transforms._cache_markers(_o)) == 4)
+
+# kill switch
+lp.transforms.PIN_SETTLED_BREAKPOINT = False
+check("pin is a no-op while the flag is off",
+      lp.transforms._pin_settled_breakpoint(_mk_pin_obj()) is None)
+lp.transforms.PIN_SETTLED_BREAKPOINT = True
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

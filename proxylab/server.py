@@ -561,7 +561,7 @@ async def handler(request: Request) -> Response:
             level = int(q.get("level")) if q.get("level") is not None else None
         except (TypeError, ValueError):
             level = None
-        import bake_session
+        from proxylab import bake_session
         res = bake_session.compact_file(path, expect_session=sess)
         res["session"] = sess
         res["requested_level"] = level
@@ -1184,6 +1184,23 @@ async def handler(request: Request) -> Response:
             if trs:
                 record["task_reminder_strip"] = trs
                 changed = True
+            # PIN SETTLED BREAKPOINT: anchor a cache_control marker on the last
+            # SETTLED user boundary (one real-user turn before the current) so
+            # a turn-boundary shed or a resume re-anchors at the still-warm
+            # settled prefix — an exact match with the entry the previous
+            # turn-start request cached — instead of collapsing to msg0
+            # (marker placement only — cache_control is metadata, not
+            # hashed content; never busts). Runs AFTER every message-mutating
+            # transform (task-reminder strip DELETES messages -> indices shift)
+            # so the boundary is computed on the final list. Skipped when the
+            # cold-compact strip just reclaimed the message markers — re-adding
+            # one would re-spend the write premium that strip exists to save.
+            if not (scc and scc.get("removed_message_markers")):
+                psb = transforms_mod._pin_settled_breakpoint(obj, agent_id=agent_id)
+                if psb:
+                    record["pin_settled_breakpoint"] = psb
+                    if psb.get("pinned"):
+                        changed = True
             # HOLD-WARM: /warm-cache sentinel turn -> arm/disarm + inject the
             # echo instruction; the turn then forwards like any other (the
             # model speaks the ack; this request becomes the replayable,

@@ -1943,6 +1943,19 @@ def _is_real_user_turn(m):
     return False
 
 
+def _settled_boundary(msgs, upto=None):
+    """THE settled/current-turn boundary: index of the last real user turn
+    (everything strictly before it is completed prior history; everything at/
+    after it is the CURRENT turn). Single source of truth shared by every
+    prior-turn strip AND the settled-breakpoint pin (which anchors one boundary
+    EARLIER via `upto` — the last real user turn of the settled region) — they
+    MUST agree, or the pin lands inside the volatile region and silently
+    reverts resume anchoring to the msg0 collapse. Never inline this
+    computation. `upto`: consider only indices strictly below it."""
+    it = enumerate(msgs) if upto is None else enumerate(msgs[:upto])
+    return max((i for i, m in it if _is_real_user_turn(m)), default=-1)
+
+
 def _msg_thinking_chars(m):
     """Thinking-block chars (text/redacted-data + signature) in a message — the
     full wire footprint a strip removes."""
@@ -1994,7 +2007,7 @@ def _strip_prior_thinking(obj, agent_id=None):
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
+    last_user = _settled_boundary(msgs)
     if last_user <= 0:
         return None                       # no prior turn before the current one
     prior = msgs[:last_user]
@@ -2090,7 +2103,7 @@ def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
+    last_user = _settled_boundary(msgs)
     if last_user <= 0:
         return None
     edit_ids = _edit_result_ids(msgs)
@@ -2157,7 +2170,7 @@ def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = max((i for i, m in enumerate(msgs) if _is_real_user_turn(m)), default=-1)
+    last_user = _settled_boundary(msgs)
     if last_user <= 0:
         return None
     # Pass 1 (user side): stub error result bodies in the busted region; collect
@@ -2224,6 +2237,140 @@ def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
             "stubbed_failed_calls": stubbed_calls, "touched_messages": touched_msgs,
             "stripped_chars": stripped_chars, "rode_bust_from": busted_from,
             "boundary_idx": last_user, "total_messages": len(msgs)}
+
+
+# ---- PIN SETTLED BREAKPOINT (cache-anchor placement, default ON) -----------
+# The CLI's message-region breakpoints are msg0 + the rolling tail. When the
+# suffix diverges >~hit-check-window blocks past the last still-valid entry
+# (turn-boundary thinking shed on a long tool loop, or a resume whose transcript
+# sheds the in-flight loop), the API's automatic hit-check behind each marker
+# can't reach the still-warm settled prefix and the read collapses to msg0
+# (measured: 18k anchored vs 127k available, clodex d51a-class resume bust).
+# Fix is pure MARKER PLACEMENT: pin a breakpoint on the ANCHOR message = the
+# last real user turn of the SETTLED region — i.e. one real-user boundary
+# BEFORE the current turn's (both derived from the shared `_settled_boundary`
+# detector the prior-turn strips use, so pin and strips cannot disagree). Why
+# the PENULTIMATE boundary and not the last: at a turn transition (and on
+# resume) the last real user turn IS the fresh tail — the CLI's rolling marker
+# already sits there, but the request then carries NO breakpoint at the
+# previous turn's boundary, which is exactly where the still-valid entry sits:
+# every turn's FIRST request ends at its user prompt, so its rolling tail
+# marker cached prefix[..u_k] — the maximal prefix that stays byte-valid after
+# the loop's thinking is shed. Pinning u_k on every turn-(k+1) request makes
+# that an EXACT entry match (no hit-check window needed), turn after turn,
+# regardless of loop length. Within a turn the anchor is fixed (byte-stable);
+# strips only touch assistant blocks above it, never the user message itself.
+# cache_control is placement METADATA, not hashed content (warmth's
+# _canon_message strips it too) — moving a marker never busts anything; only
+# content edits do. Zero-risk in a way the strips never were.
+# BUDGET (<=4): with relocate's CLAUDE.md-bundle marker the wire often runs
+# 4/4 (sys x2 + msg0 bundle + tail) — then MIGRATE the earliest prior-history
+# message marker (the msg0/bundle anchor) instead of adding: the pin's
+# cumulative prefix covers everything that marker covered, and the worst-case
+# fallback merely shifts from the msg0 entry to the system[2] entry (~3k less)
+# while the common case gains the full settled read. Never steals a system
+# marker (cross-instance sharing anchors) or the rolling tail (live-loop
+# chaining). Declines: string-content anchor (rewriting the shape isn't
+# byte-neutral), zero client markers (don't originate caching the client chose
+# not to have), budget full with no message donor below the anchor.
+PIN_SETTLED_BREAKPOINT = os.environ.get("PIN_SETTLED_BREAKPOINT", "1") not in (
+    "0", "no", "off", "false")
+_CACHE_BREAKPOINT_BUDGET = 4
+
+
+def _cache_markers(obj):
+    """Every cache_control-marked block in the request as (region, index,
+    block) tuples, in canonical cache order tools -> system -> messages."""
+    out = []
+    for region in ("tools", "system"):
+        seq = obj.get(region)
+        if isinstance(seq, list):
+            for i, b in enumerate(seq):
+                if isinstance(b, dict) and b.get("cache_control"):
+                    out.append((region, i, b))
+    msgs = obj.get("messages")
+    if isinstance(msgs, list):
+        for i, m in enumerate(msgs):
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, list):
+                for blk in c:
+                    if isinstance(blk, dict) and blk.get("cache_control"):
+                        out.append(("messages", i, blk))
+    return out
+
+
+def _pin_settled_breakpoint(obj, agent_id=None):
+    """Pin a cache_control breakpoint on the last content block of the ANCHOR
+    message — the last real user turn of the settled region, one boundary
+    before the current turn's (see block comment above). Runs LAST among the
+    message transforms so the anchor is computed on the final message list (the
+    task-reminder strip deletes whole messages -> indices shift). Returns a log
+    dict (`pinned` True/False + reason) or None (disabled / nothing settled)."""
+    if not PIN_SETTLED_BREAKPOINT or not isinstance(obj, dict):
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    boundary = _settled_boundary(msgs)
+    if boundary <= 0:
+        return None                       # single-turn: nothing settled to anchor
+    anchor = _settled_boundary(msgs, upto=boundary)
+    if anchor < 0:
+        return None                       # first turn after msg0: msg0 markers cover it
+    tgt = msgs[anchor]
+    c = tgt.get("content")
+    # THE COMMON CASE is a bare-STRING anchor: the CLI sends a user prompt as
+    # a marked text BLOCK while it's the tail, then rewrites it to a string
+    # once it's history (wire-proven T2/T3, 2026-07-07). cache_control needs
+    # block form, so we convert (below, only once the pin is certain — decline
+    # paths must not mutate). Safe in BOTH canonicalization worlds: if the API
+    # hashes string == [{type:text}] the conversion is identity-neutral; if it
+    # doesn't, the CLI's own block->string rewrite busted at the anchor every
+    # turn anyway and the conversion RESTORES byte-identity with the entry the
+    # turn-start request wrote (tail block; cache_control is stripped from the
+    # canonical form). Deterministic every request -> shape stable across our
+    # forwarded stream.
+    needs_convert = isinstance(c, str) and bool(c)
+    if not needs_convert and (
+            not isinstance(c, list) or not c or not isinstance(c[-1], dict)):
+        return {"pinned": False, "reason": "unmarkable_content",
+                "anchor_idx": anchor, "boundary_idx": boundary,
+                "total_messages": len(msgs)}
+    if not needs_convert and c[-1].get("cache_control"):
+        # anchor already carries a marker (a client that rolls TWO message
+        # markers, or msg0-as-anchor with the CLI/relocate marker on it)
+        return {"pinned": False, "reason": "already_marked",
+                "anchor_idx": anchor, "boundary_idx": boundary,
+                "total_messages": len(msgs)}
+    markers = _cache_markers(obj)
+    if not markers:
+        return {"pinned": False, "reason": "no_client_markers",
+                "anchor_idx": anchor, "boundary_idx": boundary,
+                "total_messages": len(msgs)}
+    donor_idx = None
+    if len(markers) >= _CACHE_BREAKPOINT_BUDGET:
+        donor = next(((r, i, b) for r, i, b in markers
+                      if r == "messages" and i < anchor), None)
+        if donor is None:
+            return {"pinned": False, "reason": "budget_full_no_donor",
+                    "anchor_idx": anchor, "boundary_idx": boundary,
+                    "markers_total": len(markers), "total_messages": len(msgs)}
+        cc = donor[2].pop("cache_control")   # migrate: same count, better placement
+        donor_idx = donor[1]
+        mode = "migrated"
+    else:
+        # fresh slot: mirror the prevailing ttl (API forbids 1h AFTER 5m; CLI
+        # requests share one ttl in practice) — copy the last marker's.
+        cc = dict(markers[-1][2]["cache_control"])
+        mode = "added"
+    if needs_convert:
+        tgt["content"] = [{"type": "text", "text": c}]
+    tgt["content"][-1]["cache_control"] = cc
+    return {"pinned": True, "mode": mode, "anchor_idx": anchor,
+            "boundary_idx": boundary, "donor_msg_idx": donor_idx,
+            "ttl": cc.get("ttl"), "converted_string": needs_convert,
+            "markers_total": len(markers) + (1 if mode == "added" else 0),
+            "total_messages": len(msgs)}
 
 
 def _patch_tool_descriptions(obj):

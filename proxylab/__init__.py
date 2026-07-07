@@ -23,7 +23,7 @@ Dependency rules that keep growth sane (enforce in review):
 """
 import importlib
 
-_MODULES = ("core", "store", "codex", "transforms", "canary", "writer",
+_MODULES = ("bake_session", "core", "store", "codex", "transforms", "canary", "writer",
             "warmth", "subs", "meta", "pinger", "hold", "billing",
             "receipts", "report", "prune", "restore", "status", "views",
             "server")
