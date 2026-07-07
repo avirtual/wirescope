@@ -1141,6 +1141,21 @@ async def handler(request: Request) -> Response:
             # ~1400-turn loss, so when thinking didn't strip (spt None/declined) we
             # pass busted_from=None and it collapses nothing. Current turn untouched.
             busted_from = spt.get("earliest_idx") if (spt and spt.get("stripped")) else None
+            # RIDER LATCH (v0.6.26): once a session's riders are latched
+            # full-range they fire on EVERY request like fold — deterministic
+            # replay, so baked resumes (no prior thinking -> spt no-ops) still
+            # re-produce the stubbed bytes the warm lineage carries instead of
+            # shipping raw acks and busting from the first old stub. Cold-gated
+            # establishment inside the helper; until latched the free-rider
+            # busted_from behavior is unchanged.
+            _sid_for_riders = (writer_mod._session_ids(obj) or [None])[0]
+            rider_from, rider_reason = transforms_mod._rider_full_range(
+                obj, _sid_for_riders, agent_id=agent_id)
+            if rider_from is not None:
+                busted_from = rider_from
+            if rider_reason:
+                record["rider_gate"] = {"reason": rider_reason,
+                                        "full_range": rider_from is not None}
             sea = transforms_mod._strip_prior_edit_acks(
                 obj, agent_id=agent_id, busted_from=busted_from)
             if sea:

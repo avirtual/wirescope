@@ -3975,6 +3975,121 @@ check("pin is a no-op while the flag is off",
       lp.transforms._pin_settled_breakpoint(_mk_pin_obj()) is None)
 lp.transforms.PIN_SETTLED_BREAKPOINT = True
 
+# ---- RIDER LATCH (L2 riders full-range, v0.6.26) ----------------------------
+# The bake-exposed gate bug: post-bake requests carry no prior thinking, the
+# thinking strip no-ops, and without the latch the riders skip -> raw acks ship
+# against the stub-carrying warm prefix -> conversation bust every restart.
+
+def _mk_rider_obj(sid, raw_ack=True):
+    """L2 session shape: settled history containing an edit tool_use + its
+    (raw or stubbed) success ack, then a current turn."""
+    ack = ("The file /tmp/x.py has been updated successfully." if raw_ack
+           else lp.transforms.EDIT_ACK_MARKER)
+    return {"model": "claude-fable-5",
+            "metadata": {"user_id": json.dumps({"session_id": sid})},
+            "messages": [
+                msg("user", "please edit the file"),
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "Edit",
+                     "input": {"file_path": "/tmp/x.py", "old_string": "a" * 200,
+                               "new_string": "b" * 200}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": ack}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+                msg("user", "now the current turn"),
+            ]}
+
+_SID_R = "sess-rider-1"
+lp.transforms._STRIP_OVERRIDE[_SID_R] = 2          # L2 session
+lp.transforms._STRIP_GUARD_LATCH[_SID_R] = True    # thinking latched-strip
+
+# not latched + raw ack in history + prefix WARM -> decline, don't latch
+_o = _mk_rider_obj(_SID_R)
+_h = lp.transforms._prefix_hashes(_o)
+_con = lp.store.db()                               # a prefix containing msg2 is warm
+with lp.store.LOCK:
+    _con.execute("INSERT OR REPLACE INTO warmth(hash, stamped_at, ttl, expires_at) "
+                 "VALUES(?,?,?,?)", (_h[3], time.time(), 300, time.time() + 300))
+    _con.commit()
+_bf, _why = lp.transforms._rider_full_range(_o, _SID_R)
+check("rider gate declines on a warm raw-ack prefix (no latch, no bust)",
+      _bf is None and _why == "rider_warm_no_latch"
+      and _SID_R not in lp.transforms._RIDER_LATCH)
+
+# same session, prefix cold -> establish the latch, full range
+_con = lp.store.db()
+with lp.store.LOCK:
+    _con.execute("DELETE FROM warmth")
+    _con.commit()
+_bf, _why = lp.transforms._rider_full_range(_o, _SID_R)
+check("rider gate latches from cold and goes full-range",
+      _bf == 0 and _why == "rider_cold_latch"
+      and lp.transforms._RIDER_LATCH.get(_SID_R))
+
+# latched -> full range every request, no warmth query needed
+_bf, _why = lp.transforms._rider_full_range(_mk_rider_obj(_SID_R), _SID_R)
+check("latched rider gate returns full-range unconditionally",
+      _bf == 0 and _why == "rider_latched")
+
+# the latch survives a simulated restart (fresh dict, reload from store)
+lp.transforms._RIDER_LATCH.clear()
+lp.restore._restore_rider_latches()
+check("rider latch survives restart (persisted + restored)",
+      lp.transforms._RIDER_LATCH.get(_SID_R) is True)
+
+# full-range busted_from=0 makes the ack strip fire with NO thinking strip:
+# the exact post-bake scenario
+_o = _mk_rider_obj(_SID_R)
+_res = lp.transforms._strip_prior_edit_acks(_o, busted_from=0)
+check("post-bake scenario: ack strip fires full-range without a thinking bust",
+      _res and _res["collapsed_edit_acks"] == 1
+      and _o["messages"][2]["content"][0]["content"] == lp.transforms.EDIT_ACK_MARKER)
+
+# already-stubbed history -> byte-neutral no-op latch (free establishment)
+_SID_R2 = "sess-rider-2"
+lp.transforms._STRIP_OVERRIDE[_SID_R2] = 2
+lp.transforms._STRIP_GUARD_LATCH[_SID_R2] = True
+_o = _mk_rider_obj(_SID_R2, raw_ack=False)
+_bf, _why = lp.transforms._rider_full_range(_o, _SID_R2)
+check("fully-stubbed history latches byte-neutrally (no warmth gate needed)",
+      _bf == 0 and _why == "rider_latched_neutral"
+      and lp.transforms._RIDER_LATCH.get(_SID_R2))
+
+# L1 session never latches riders
+_SID_R3 = "sess-rider-3"
+lp.transforms._STRIP_OVERRIDE[_SID_R3] = 1
+lp.transforms._STRIP_GUARD_LATCH[_SID_R3] = True
+_bf, _why = lp.transforms._rider_full_range(_mk_rider_obj(_SID_R3), _SID_R3)
+check("L1 session never rider-latches",
+      _bf is None and _SID_R3 not in lp.transforms._RIDER_LATCH)
+
+# thinking not latched-strip -> no stub lineage -> decline
+_SID_R4 = "sess-rider-4"
+lp.transforms._STRIP_OVERRIDE[_SID_R4] = 2
+_bf, _why = lp.transforms._rider_full_range(_mk_rider_obj(_SID_R4), _SID_R4)
+check("no thinking-strip latch -> rider gate declines (no stub lineage)",
+      _bf is None and _why == "no_strip_latch")
+
+# level change drops the rider latch (demote/re-promote safety)
+lp.transforms._strip_thinking_set_override(_SID_R, 1)
+check("level change drops the rider latch",
+      _SID_R not in lp.transforms._RIDER_LATCH)
+lp.transforms._RIDER_LATCH[_SID_R2] = True
+lp.transforms._strip_thinking_set_override(_SID_R2, None)
+check("override clear drops the rider latch too",
+      _SID_R2 not in lp.transforms._RIDER_LATCH)
+
+# sweep cleanup
+lp.transforms._RIDER_LATCH["sess-rider-5"] = True
+lp.transforms._persist_rider_latch("sess-rider-5")
+lp.transforms._ws_forget("sess-rider-5")
+lp.transforms._RIDER_LATCH.clear()
+lp.restore._restore_rider_latches()
+check("_ws_forget drops the rider latch from memory and store",
+      "sess-rider-5" not in lp.transforms._RIDER_LATCH)
+for _s in (_SID_R, _SID_R2, _SID_R3, _SID_R4):
+    lp.transforms._ws_forget(_s)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")

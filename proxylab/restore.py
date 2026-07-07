@@ -225,6 +225,25 @@ def _restore_strip_guard_latches():
         return 0
 
 
+def _restore_rider_latches():
+    """Reload per-session rider latches BEFORE the first post-restart turn — the
+    whole point of the latch is surviving exactly this moment: the first resumed
+    request after a bake has no prior thinking, so without the latch the riders
+    would skip and ship raw acks against the stub-carrying warm prefix."""
+    try:
+        from proxylab import transforms as transforms_mod
+        con = store_mod.db()
+        with store_mod.LOCK:
+            rows = con.execute("SELECT session_id FROM rider_latch "
+                               "WHERE owner=?", (store_mod.OWNER,)).fetchall()
+        for (sid,) in rows:
+            transforms_mod._RIDER_LATCH[sid] = True
+        return len(rows)
+    except Exception as e:
+        print(f"[restore] rider_latches failed: {e}", flush=True)
+        return 0
+
+
 def _restore_state():
     now = time.time()
     _RESTORED["holds"] = _restore_holds(now)
@@ -234,10 +253,12 @@ def _restore_state():
     _RESTORED["ended"] = _restore_ended()
     _RESTORED["strip_overrides"] = _restore_strip_overrides()
     _RESTORED["strip_guard_latches"] = _restore_strip_guard_latches()
+    _RESTORED["rider_latches"] = _restore_rider_latches()
     print(f"[restore] holds={_RESTORED['holds']} "
           f"last_requests={_RESTORED['last_requests']} (auth-less until live "
           f"traffic) totals={'reloaded' if _RESTORED['totals'] else 'fresh'} "
           f"session_totals={_RESTORED['session_totals']} "
           f"cwd_known={_RESTORED['cwd_done']} "
           f"strip_overrides={_RESTORED['strip_overrides']} "
-          f"strip_guard_latches={_RESTORED['strip_guard_latches']}", flush=True)
+          f"strip_guard_latches={_RESTORED['strip_guard_latches']} "
+          f"rider_latches={_RESTORED['rider_latches']}", flush=True)
