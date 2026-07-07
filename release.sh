@@ -23,6 +23,12 @@ if git rev-parse -q --verify "refs/tags/$VERSION" >/dev/null; then
   exit 1
 fi
 
+# A release should tell its story: warn (don't block) when CHANGELOG.md has
+# no entry for the version being cut.
+if ! grep -q "^## $VERSION\b" CHANGELOG.md 2>/dev/null; then
+  echo "WARNING: CHANGELOG.md has no '## $VERSION' entry — add one (top of file) so the release is self-describing." >&2
+fi
+
 # Gate on the offline test suites.
 echo "running test suites…"
 python3 test_warmth_store.py >/dev/null
