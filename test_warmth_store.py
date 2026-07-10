@@ -3277,6 +3277,94 @@ lp.transforms.STRIP_TASK_REMINDERS = _str_save
 lp.transforms.STRIP_L2 = _l2_save
 lp.transforms.STRIP_PRIOR_THINKING = _l1_save
 
+# --- STRIP_FILEMOD_DIFFS: excise the out-of-band file-modified diff payloads ---
+# Keeps the "Note: <path> was modified ..." NOTIFICATION, excises the numbered
+# diff (median ~2k tok). Two dialects; L2-gated; size-gated; never touches
+# tool_result. Save + restore the level flags (test objects carry no session_id).
+_fmd_save = lp.transforms.STRIP_FILEMOD_DIFFS
+_fmd_min_save = lp.transforms.STRIP_FILEMOD_MIN_CHARS
+_fmd_l2_save = lp.transforms.STRIP_L2
+_fmd_l1_save = lp.transforms.STRIP_PRIOR_THINKING
+lp.transforms.STRIP_FILEMOD_DIFFS = True
+lp.transforms.STRIP_FILEMOD_MIN_CHARS = 300
+lp.transforms.STRIP_L2 = True
+lp.transforms.STRIP_PRIOR_THINKING = True
+_FM_PREAMBLE = ("Note: /proj/docs/messaging.md was modified, either by the user "
+                "or by a linter. This change was intentional, so make sure to "
+                "take it into account as you proceed (ie. don't revert it unless "
+                "the user asks you to). Don't tell the user this, since they are "
+                "already aware. Here are the relevant changes (shown with line "
+                "numbers):\n")
+_FM_DIFF = "".join(f"{i}\tline {i} of the diff payload here\n" for i in range(1, 40))
+_FM_SR = f"<system-reminder>\n{_FM_PREAMBLE}{_FM_DIFF}</system-reminder>"
+# bundled role:system: note SANDWICHED between agent roster and skills roster
+_FM_SYS = ("The following agent types are no longer available:\n- x\n\n"
+           f"{_FM_PREAMBLE}{_FM_DIFF}\n"
+           "The following skills are available for use with the Skill tool:\n\n"
+           "- warm-cache: keep the cache warm")
+
+
+def _fm_msgs():
+    return [
+        {"role": "user", "content": "hello"},
+        # dialect 2: bundled system string (note sandwiched before skills roster)
+        {"role": "system", "content": _FM_SYS},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/m"}}]},
+        # dialect 1: standalone <system-reminder> block riding a tool_result msg
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "r1", "content": "ok"},
+            {"type": "text", "text": _FM_SR}]},
+        # a tool_result QUOTING the note must NEVER be touched
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r2", "name": "Read", "input": {"file_path": "/n"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "r2",
+             "content": f"the file quotes: {_FM_PREAMBLE}{_FM_DIFF}"}]},
+    ]
+
+
+_fm = {"messages": _fm_msgs()}
+_fr = lp.transforms._strip_filemod_diffs(_fm)
+_sys_after = _fm["messages"][1]["content"]
+_sr_after = _fm["messages"][3]["content"][1]["text"]
+check("strip_filemod_diffs: excises both dialects (notes=2)",
+      _fr and _fr["notes"] == 2 and _fr["chars"] > 0)
+check("strip_filemod_diffs: keeps the notification, drops the diff (dialect 2)",
+      "was modified, either by the user" in _sys_after
+      and "1\tline 1 of the diff" not in _sys_after
+      and "39\tline 39" not in _sys_after)
+check("strip_filemod_diffs: preserves ambient sections around the note (roster+skills)",
+      "The following agent types are no longer available" in _sys_after
+      and "The following skills are available" in _sys_after)
+check("strip_filemod_diffs: dialect-1 keeps wrapper + notification, drops diff",
+      _sr_after.startswith("<system-reminder>")
+      and _sr_after.rstrip().endswith("</system-reminder>")
+      and "was modified, either by the user" in _sr_after
+      and "1\tline 1 of the diff" not in _sr_after)
+check("strip_filemod_diffs: a tool_result QUOTING the note is untouched",
+      _fm["messages"][-1]["content"][0]["content"].startswith("the file quotes:")
+      and "39\tline 39" in _fm["messages"][-1]["content"][0]["content"])
+check("strip_filemod_diffs: idempotent re-run -> None",
+      lp.transforms._strip_filemod_diffs(_fm) is None)
+# size gate: a tiny (< min) diff is left in place
+_tiny = {"messages": [{"role": "system",
+         "content": f"{_FM_PREAMBLE}1\ta\n2\tb\n"}]}
+check("strip_filemod_diffs: sub-threshold diff left in place",
+      lp.transforms._strip_filemod_diffs(_tiny) is None)
+# L1 (below L2) and the kill-switch both leave the diff intact
+lp.transforms.STRIP_L2 = False
+check("strip_filemod_diffs: L1 (below L2) leaves the diff in place",
+      lp.transforms._strip_filemod_diffs({"messages": _fm_msgs()}) is None)
+lp.transforms.STRIP_L2 = True
+lp.transforms.STRIP_FILEMOD_DIFFS = False
+check("strip_filemod_diffs: kill-switch off at L2 preserves the diff",
+      lp.transforms._strip_filemod_diffs({"messages": _fm_msgs()}) is None)
+lp.transforms.STRIP_FILEMOD_DIFFS = _fmd_save
+lp.transforms.STRIP_FILEMOD_MIN_CHARS = _fmd_min_save
+lp.transforms.STRIP_L2 = _fmd_l2_save
+lp.transforms.STRIP_PRIOR_THINKING = _fmd_l1_save
+
 # --- currentDate strip: never bust the cache at a midnight rollover ----------
 # The volatile `# currentDate` / "Today's date is …" line lives inside the cached
 # claudeMd bundle; a midnight change busts the whole message prefix on resume. It
