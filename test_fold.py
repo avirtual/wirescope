@@ -23,11 +23,16 @@ from proxylab import fold
 from proxylab import transforms as transforms_mod
 
 
-# Fold is STRIP LEVEL 3 — enable a session by setting the strip override to 3
-# (the in-memory path; no DB write, no directive needed). Cleanup drops the memo
+# Fold is EXPERIMENTAL (demoted from production L2 2026-07-12): the suite runs
+# with the env gate forced ON so the mechanics stay covered; the gate itself is
+# tested in test_disabled_below_l3. Per-session enablement = strip override >= 2
+# (in-memory path; no DB write, no directive needed). Cleanup drops the memo
 # maps AND the strip override/latch so tests stay isolated.
+fold.FOLD_EXPERIMENTAL = True
+
+
 def _enable_fold(sid):
-    transforms_mod._STRIP_OVERRIDE[sid] = 2   # fold is part of L2 (>=2)
+    transforms_mod._STRIP_OVERRIDE[sid] = 2   # fold needs L2 (>=2) + env gate
 
 
 def _cleanup(sid):
@@ -324,8 +329,17 @@ def test_disabled_below_l3():
         assert fold.fold_read_edits(mk()) is None, f"fold must be off at level {lvl}"
     _cleanup("S-off"); _enable_fold("S-off")
     assert fold.fold_read_edits(mk()) is not None, "fold must be on at level 2"
+    # EXPERIMENTAL demotion (2026-07-12): with the env gate OFF, fold declines
+    # even at L2 — production L2 is riders-only.
+    _cleanup("S-off"); _enable_fold("S-off")
+    fold.FOLD_EXPERIMENTAL = False
+    try:
+        assert fold.fold_read_edits(mk()) is None, \
+            "fold must be off at L2 when FOLD_EXPERIMENTAL is off"
+    finally:
+        fold.FOLD_EXPERIMENTAL = True
     _cleanup("S-off")
-    print("ok  fold off at levels 0/1, on at 2")
+    print("ok  fold off at levels 0/1, on at 2 (only with FOLD_EXPERIMENTAL)")
 
 
 # --------------------------------------------------------------- replay tests
