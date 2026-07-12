@@ -5,7 +5,7 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
-## unreleased (dev tree; HOLD deploy until the aware-vs-blind A/B completes — no :7800 restarts mid-experiment)
+## v0.6.29 — 2026-07-12
 
 - **Body directives are whole-line column-1 only (directive protocol v1.1)** — documenting the syntax no longer invokes it. Live incident (clodex, 2026-07-12): a treatment-arm append-prompt carried literal teaching examples (`[wirescope:tools Read,Grep,Glob]`); the old unanchored body scan applied them to that very agent — roster 31→1, which also removed its Agent tool and with it the spawner hint. A false match doesn't just delete text, it EXECUTES the verb. Fix: `_ws_body_pairs` and `_ws_strip_directives` now honor/remove exactly whole-line column-1 directive lines (strip == parse by construction; `_WS_DIRECTIVE_RE` deleted); inline/indented/backticked mentions are content — not invoked, NOT stripped, they stay on the wire. Matches the strict-head spawn parse and clodex's own column-1 intent convention; quoting escape = indent or backticks. Wire-shape audit confirmed the real CLI ships the billing header as its own system block and agent .md bodies as their own blocks, so all documented (own-line) directives keep working; breaking only for a mid-line body directive, never the documented form. WIRESCOPE.md bumped to v1.1. Byte-shape note: sessions whose system text carries inline directive-ish mentions will re-anchor once on deploy (previously those strings were subn'd out).
 
