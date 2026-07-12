@@ -255,19 +255,22 @@ def _genuine_subagent(obj, agent_id=None):
 # Opt-in directives an agent author writes into the agent .md BODY (the only
 # author-controlled text that reaches system[], since the CLI drops frontmatter
 # and never sends an agent name). Form: `[wirescope:<directive> <value>]`, one
-# per line. The distinctive `wirescope:` prefix (v1; was the shorter `ws:`)
-# makes an incidental collision in curated text vanishingly unlikely — important
-# because the proxy SILENTLY STRIPS its own tags, and a false match would delete
-# real content.
+# per line, WHOLE-LINE AT COLUMN 1 — a directive mentioned inline in prose, a
+# backticked example, or an indented quote is CONTENT, never a directive (and
+# is left on the wire). The distinctive prefix alone proved insufficient: a
+# prompt that DOCUMENTED the syntax (`[wirescope:tools Read,Grep,Glob]` as a
+# teaching example) got INVOKED against that very agent under the old
+# unanchored scan — collapsed its roster 31->1, which also cost it its spawn
+# tool and thus the spawner hint (live incident 2026-07-12). A false match
+# doesn't just delete text, it EXECUTES the verb; anchoring is the fix (same
+# convention as the strict-head spawn parse, and as clodex's own column-1
+# intent rule). To quote a directive safely: indent it or wrap it in backticks.
 # Body directives are parsed from the system prompt; spawn directives (below)
 # from the strict head of the spawn-prompt block. Unknown directives are
 # silently ignored -> additive forever.
-_WS_DIRECTIVE_RE = re.compile(
-    r"\[wirescope:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]", re.IGNORECASE)
-# A WHOLE-LINE directive: the entire (stripped) line is exactly one directive.
-# Used for the strict-head spawn-prompt parse, where only a leading run of pure
-# directive lines is honored (so a `[wirescope:...]` buried in prompt prose, a
-# quoted transcript, or pasted data is NOT a directive).
+# A WHOLE-LINE directive: the entire line is exactly one directive (trailing
+# whitespace tolerated via rstrip at the call sites; leading whitespace is NOT
+# — indentation is the quoting escape).
 _WS_LINE_RE = re.compile(
     r"^\[wirescope:([a-z][a-z0-9-]*)(?:[ \t]+([^\]\n]*))?\]$", re.IGNORECASE)
 
@@ -287,10 +290,16 @@ WS_SPAWN_DIRECTIVES = os.environ.get(
 
 def _ws_directive_pairs(text):
     """Ordered [(directive(lowercased), value(str, trimmed))] for every
-    `[wirescope:...]` in `text` (duplicates kept, in order) — the form the action
-    resolver needs (one target may carry several verbs across lines)."""
-    return [(m.group(1).lower(), (m.group(2) or "").strip())
-            for m in _WS_DIRECTIVE_RE.finditer(text)]
+    WHOLE-LINE column-1 `[wirescope:...]` line in `text` (duplicates kept, in
+    order) — the form the action resolver needs (one target may carry several
+    verbs across lines). Inline/indented/backticked mentions are content, not
+    directives (see _WS_LINE_RE)."""
+    out = []
+    for raw in text.splitlines():
+        m = _WS_LINE_RE.match(raw.rstrip())
+        if m:
+            out.append((m.group(1).lower(), (m.group(2) or "").strip()))
+    return out
 
 
 def _ws_body_pairs(obj):

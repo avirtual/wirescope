@@ -785,10 +785,26 @@ check("per-instance page labels by role + agent-id, renders that instance's ctx"
 # --- wirescope [wirescope:agent-name <label>] display label from the subagent body -------
 # The wire carries no agent name; an author surfaces one with a `[wirescope:agent-name
 # NAME]` directive in the .md body. Present -> shown; absent -> falls back to role.
-check("[wirescope:agent-name] parses from body; absent -> None",
+check("[wirescope:agent-name] parses from a whole-line body directive; absent -> None",
       lp._subagent_marker_name({"system": [{"type": "text",
-          "text": "blah [wirescope:agent-name probe-delta] You are probe-delta"}]}) == "probe-delta"
+          "text": "[wirescope:agent-name probe-delta]\nYou are probe-delta"}]}) == "probe-delta"
       and lp._subagent_marker_name({"system": [{"type": "text", "text": "no marker here"}]}) is None)
+# THE 2026-07-12 FOOTGUN: documenting the syntax must not invoke it. Inline
+# mentions, backticked examples and indented quotes are content, not directives
+# — neither parsed NOR stripped (they stay on the wire).
+check("inline [wirescope:...] in prose is NOT a directive (documenting != invoking)",
+      lp._subagent_marker_name({"system": [{"type": "text",
+          "text": "blah [wirescope:agent-name probe-delta] You are probe-delta"}]}) is None
+      and lp._ws_directives({"system": [{"type": "text",
+          "text": "e.g. `[wirescope:tools Read,Grep,Glob]` trims the roster"}]}) == {}
+      and lp._ws_directives({"system": [{"type": "text",
+          "text": "  [wirescope:omit claudemd]"}]}) == {})
+_qobj = {"system": [{"type": "text",
+         "text": "Example:\n  [wirescope:omit claudemd]\nand `[wirescope:tools Read]` inline."}]}
+check("strip leaves quoted/indented directive mentions on the wire (strip == parse)",
+      lp.transforms._ws_strip_directives(_qobj) is None
+      and "[wirescope:omit claudemd]" in _qobj["system"][0]["text"]
+      and "[wirescope:tools Read]" in _qobj["system"][0]["text"])
 check("directives parse only from system body, never message content (no forging)",
       lp._ws_directives({"system": [{"type": "text", "text": "[wirescope:agent-name realname]"}],
                          "messages": [{"role": "user",
@@ -808,7 +824,7 @@ check("[wirescope:agent-name] rejects unsubstituted <placeholder>, keeps real na
           "text": "[wirescope:agent-name John]"}]}) == "John")
 nsid = "5fb9eba7-eeee-ffff-0000-111111111111"
 lp._capture_session_meta(nsid,
-    {"system": [{"type": "text", "text": _cbh + "[wirescope:agent-name probe-delta]\nYou are probe-delta"}],
+    {"system": [{"type": "text", "text": _cbh + "\n[wirescope:agent-name probe-delta]\nYou are probe-delta"}],
      "messages": [{"role": "user", "content": "DELTA-CTX"}]},
     "claude-opus-4-8", role="subagent", agent_id="ad00d00d00d00d00d")
 lp._WRITE_Q.join()
@@ -831,7 +847,7 @@ _reminder = ("<system-reminder>\nAs you answer, you can use the following contex
              "# claudeMd\nContents of CLAUDE.md:\nMARKER-CLAUDEMD body line\n"
              "# userEmail\nThe user's email address is x@y.com\n</system-reminder>")
 def _omit_obj():
-    return {"system": [{"type": "text", "text": _cbh + "[wirescope:omit claudemd,useremail]\nYou are a probe"}],
+    return {"system": [{"type": "text", "text": _cbh + "\n[wirescope:omit claudemd,useremail]\nYou are a probe"}],
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": _reminder},
                 {"type": "text", "text": "<system-reminder>\n# currentDate\nToday\n</system-reminder>"},
@@ -879,7 +895,7 @@ check("after the drop, the separate currentDate block + prompt remain (shifted u
       "# currentDate" in _content[0]["text"] and "do the task" in _content[1]["text"])
 # a reminder that KEEPS a section (currentDate via keep) is NOT dropped; and the
 # message-level cache breakpoint is re-anchored onto the new first block.
-_ccobj = {"system": [{"type": "text", "text": _cbh + "[wirescope:omit claudemd,useremail]\nx"}],
+_ccobj = {"system": [{"type": "text", "text": _cbh + "\n[wirescope:omit claudemd,useremail]\nx"}],
           "messages": [{"role": "user", "content": [
               {"type": "text", "cache_control": {"type": "ephemeral"},
                "text": _reminder},
@@ -933,7 +949,9 @@ check("display_name from the pre-strip server param survives a stripped obj",
 # frozen at spawn, so it is NOT injectable by mid-conversation content; only the
 # leading run of pure directive lines is honored. Gated by WS_SPAWN_DIRECTIVES.
 def _spawn_obj(prompt, body=""):
-    return {"system": [{"type": "text", "text": _cbh + body + "You are a probe"}],
+    # real wire: the billing header is its own line/block, body directives
+    # start their own lines (whole-line column-1 rule)
+    return {"system": [{"type": "text", "text": _cbh + "\n" + body + "You are a probe"}],
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": _reminder},
                 {"type": "text", "text": "<system-reminder>\n# currentDate\nT\n</system-reminder>"},
@@ -1006,7 +1024,7 @@ check("spawn replace overrides a body omit (precedence spawn > body)",
 check("replace on an absent/unknown section is a safe logged miss",
       (lambda r: r is not None and r["replaced"] == [] and "bogus" in r["missed"])(
           lp.transforms._ws_omit({"system": [{"type": "text",
-              "text": _cbh + "[wirescope:replace bogus hi]\nYou are a probe"}],
+              "text": _cbh + "\n[wirescope:replace bogus hi]\nYou are a probe"}],
               "messages": [{"role": "user", "content": [
                   {"type": "text", "text": _reminder}]}]})))
 check("action resolver: replace beats omit, keep cancels (per source order)",
@@ -1026,7 +1044,7 @@ check("omit target list: comma, comma+space, and mixed whitespace all equivalent
 check("space-separated omit actually strips both sections (end to end)",
       (lambda r: r is not None and set(r["omitted"]) == {"claudemd", "useremail"})(
           lp.transforms._ws_omit({"system": [{"type": "text",
-              "text": _cbh + "[wirescope:omit claudemd useremail]\nYou are a probe"}],
+              "text": _cbh + "\n[wirescope:omit claudemd useremail]\nYou are a probe"}],
               "messages": [{"role": "user", "content": [
                   {"type": "text", "text": _reminder}]}]})))
 lp.transforms.WS_OMIT = False
@@ -1163,7 +1181,7 @@ check("denylist removes only the named tools, keeps the rest",
       and {t["name"] for t in _td["tools"]} == {"Read", "Edit", "Grep"})
 # precedence: a spawn keep-tools overrides a body strip-tools
 _tp = {"system": [{"type": "text",
-                   "text": _cbh + "[wirescope:strip-tools Bash]\nYou are a probe"}],
+                   "text": _cbh + "\n[wirescope:strip-tools Bash]\nYou are a probe"}],
        "metadata": {"user_id": json.dumps({"session_id": "sess-tp"})},
        "tools": [{"name": n} for n in ("Read", "Bash", "Edit")],
        "messages": [{"role": "user", "content": [

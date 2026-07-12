@@ -1,4 +1,4 @@
-# Wirescope Directive Protocol (`wirescope:`) — v1
+# Wirescope Directive Protocol (`wirescope:`) — v1.1
 
 The wire carries **no** settable identity or context-suppression controls for a Claude Code subagent: the CLI drops the agent's frontmatter and only built-in Explore/Plan can shed `# claudeMd` (nothing sheds `# userEmail`).
 Wirescope reconstructs those missing knobs as **opt-in directives**, which the proxy reads and acts on at the wire.
@@ -11,6 +11,7 @@ This is the canonical grammar. The proxy owns it; consumers adhere.
 If you author `.claude/agents/*.md` files (or spawn agents through the proxy), this is the whole contract.
 
 > **v1 changes from v0:** the directive prefix was renamed `ws:` → `wirescope:` (a distinctive prefix so an incidental bracketed token can't be mistaken for a directive and silently deleted), and **spawn-position directives**, a **`keep`** verb, and a **`replace`** verb were added. v0's `[ws:...]` is no longer recognized.
+> **v1.1 (2026-07-12):** body directives are now honored **whole-line at column 1 only** (spawn-head directives always were). An inline/indented/backticked `[wirescope:...]` is content — not invoked, not stripped. Breaking only for a body directive written mid-line, which was never the documented form.
 
 ## Grammar
 
@@ -20,19 +21,20 @@ If you author `.claude/agents/*.md` files (or spawn agents through the proxy), t
 
 - `<directive>` — lowercase, `[a-z][a-z0-9-]*`.
 - `<value>` — everything up to the closing `]`, trimmed. Lists (e.g. `omit`/`keep` targets) are **comma- and/or whitespace-separated** — `claudemd,useremail`, `claudemd, useremail`, and `claudemd useremail` are all equivalent (liberal parse, so the most natural naive syntax works).
-- One directive per line.
+- One directive per line, **whole-line at column 1**: the entire line must be exactly one directive, starting at the first character. An indented directive, a backticked example, or a `[wirescope:...]` mentioned inline in prose is **content, not a directive** — neither invoked nor stripped.
+- **To quote a directive safely** (documentation, teaching examples): indent it or wrap it in backticks.
 - **Unknown directives are ignored** (logged once). A newer directive on an older proxy degrades to a no-op — additive forever, never a hard break.
 - Absent directive ⇒ unchanged behavior. Everything here is opt-in.
 
-### Why the distinctive prefix
-The proxy **strips its own directive lines before forwarding** (see below), so a false match would *silently delete real content*.
-The long, distinctive `wirescope:` token makes an incidental collision in agent docs, code snippets, or a quoted transcript vanishingly unlikely.
-(The strip is free regardless of length — directives never reach the model — so there is no cost to the longer token.)
+### Why the distinctive prefix AND the whole-line anchor
+The proxy **strips its own directive lines before forwarding** (see below), and it *acts* on what it parses — so a false match doesn't just delete text, it **executes the verb**.
+The long, distinctive `wirescope:` token makes an incidental collision unlikely, but distinctiveness alone proved insufficient: a prompt that *documented* the syntax with a literal `[wirescope:tools Read,Grep,Glob]` example got that directive **applied to the very agent carrying the prompt** (tool roster collapsed 31→1; live incident 2026-07-12).
+Hence the whole-line column-1 anchor (v1.1): documenting ≠ invoking. The strip removes exactly the lines the parser honors, so quoted mentions stay on the wire.
 
 ## Two placements
 
 ### Body directives — a property of the agent type
-Written **anywhere in the agent `.md` body**.
+Written **on their own lines in the agent `.md` body** (whole-line rule above; by convention at the top).
 The agent definition's **frontmatter never reaches the wire** — verified in the CLI source: only the `.md` *body* is injected, verbatim, as a `system[]` block.
 A body directive therefore lands in `system[]`, is **parsed only from the system prompt** (never message content), and is **cache-constant per agent type** (every spawn of one agent hashes the same system prefix → zero within-type cache cost).
 Nothing a user, tool result, or quoted transcript types into the conversation can forge a body directive.

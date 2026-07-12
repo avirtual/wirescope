@@ -1457,12 +1457,26 @@ def _ws_omit(obj, agent_id=None):
             "dropped_blocks": dropped}
 
 
+def _ws_strip_lines(text):
+    """Remove exactly the WHOLE-LINE column-1 `[wirescope:...]` directive lines
+    from `text` — the same set _ws_directive_pairs honors, so strip == parse by
+    construction (a mention the parser treats as content stays on the wire).
+    Returns (new_text, n_removed)."""
+    lines = text.split("\n")
+    kept = [l for l in lines
+            if not writer_mod._WS_LINE_RE.match(l.rstrip())]
+    return "\n".join(kept), len(lines) - len(kept)
+
+
 def _ws_strip_directives(obj):
-    """Remove every `[wirescope:...]` directive from the system text blocks before
-    forwarding. The proxy has already READ and ACTED on them (agent-name captured
-    for display, omit applied to messages[0]); they are proxy control lines, so
-    the MODEL must never see them and they shouldn't cost prefix tokens. Always
-    runs (not WS_OMIT-gated) — the proxy consumes its own directives regardless of
+    """Remove every honored `[wirescope:...]` directive LINE from the system text
+    blocks before forwarding. The proxy has already READ and ACTED on them
+    (agent-name captured for display, omit applied to messages[0]); they are proxy
+    control lines, so the MODEL must never see them and they shouldn't cost prefix
+    tokens. WHOLE-LINE only, mirroring the parse: an inline/indented/backticked
+    mention was never a directive, so it is real content and STAYS on the wire
+    (the old unanchored subn deleted quoted examples from prose). Always runs
+    (not WS_OMIT-gated) — the proxy consumes its own directives regardless of
     whether a given verb is honored. Deterministic per agent type, so the stripped
     system prefix stays cache-constant (and equals the no-directive body). Returns
     {stripped, blocks} or None. Whitespace left behind is lightly tidied."""
@@ -1473,13 +1487,13 @@ def _ws_strip_directives(obj):
             if not (isinstance(b, dict) and isinstance(b.get("text"), str)
                     and "[wirescope:" in b["text"]):
                 continue
-            new, n = writer_mod._WS_DIRECTIVE_RE.subn("", b["text"])
+            new, n = _ws_strip_lines(b["text"])
             if n:
                 b["text"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
                 total += n
                 blocks.append(bi)
     elif isinstance(sys, str) and "[wirescope:" in sys:
-        new, n = writer_mod._WS_DIRECTIVE_RE.subn("", sys)
+        new, n = _ws_strip_lines(sys)
         if n:
             obj["system"] = re.sub(r"[ \t]*\n{3,}", "\n\n", new)
             total, blocks = n, [0]
