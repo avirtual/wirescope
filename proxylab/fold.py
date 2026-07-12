@@ -69,8 +69,30 @@ _FOLD_EDIT_NAMES = frozenset({"Edit"})
 
 # Byte-stable stubs for a folded edit's two halves (envelope kept for pairing /
 # API validity; only the heavy args/ack body is replaced). Constants => stable.
-FOLD_CALL_STUB = {"_folded": "edit applied to the Read above"}
-FOLD_RESULT_STUB = "ok"
+#
+# STUB WORDING IS LOAD-BEARING (2026-07-12 A/B, ab-beta 296da85b vs ab-gamma
+# 91054c1e): the v1 stubs ({"_folded": "edit applied to the Read above"} / "ok")
+# broke the model's edit-from-memory discipline — settled edit INPUTS are the
+# model's memory of what it wrote, and bare "ok" dropped the CLI's own "no need
+# to Read it back" assurance with nothing vouching for context currency. Result:
+# Read/Edit ratio 0.84 vs 0.32-0.40 in every non-fold arm, +62% requests, +31%
+# USD — the fold's savings repaid several times over. Plus 3 cases of the model
+# IMITATING the terse call stub as a fresh Edit input -> InputValidationError.
+# v2 stubs therefore (a) assert explicitly that the folded Read above already
+# shows the post-edit content (restoring the assurance the ack-stub deleted),
+# and (b) self-describe as history-elision, not a callable shape. Still
+# constants => per-pair bytes stable, warmth semantics unchanged; the flip
+# itself re-cuts warm L2 prefixes once (deploy between sessions).
+FOLD_CALL_STUB = {
+    "_folded": "This edit's parameters were elided from replayed history; "
+    "its change IS already applied and reflected in the Read result above, "
+    "which shows the file's current content. This stub is not a valid Edit "
+    "input — new Edit calls always need file_path/old_string/new_string."
+}
+FOLD_RESULT_STUB = (
+    "File updated. The Read result above has been refreshed to show this "
+    "file's current post-edit content — no need to Read it back."
+)
 
 # A `cat -n` line: optional leading pad, an integer, a TAB, then the content.
 _NUM_LINE = re.compile(r"^\s*(\d+)\t(.*)$")
