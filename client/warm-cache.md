@@ -1,5 +1,5 @@
 ---
-description: Keep this session's prompt cache warm for N hours after your last interaction (requires the local wirescope; "off" or 0 disarms)
+description: Keep this session's prompt cache warm for N hours after your last interaction ("off" or 0 disarms)
 argument-hint: <hours|off>
 ---
 

@@ -1353,6 +1353,41 @@ check("earlier system markers untouched by the migration",
 lp.transforms.WS_SPAWNER_HINT = False
 check("spawner hint is off by default -> no-op",
       lp.transforms._ws_spawner_hint(_spawner_obj()) is None)
+
+# --- per-agent /_hint override (A/B invisibility gate) ---------------------------
+# Route-keyed override beats the global in BOTH directions; clear falls back;
+# persisted + reloadable (an arm must survive a proxy restart un-flipped).
+lp.transforms._HINT_OVERRIDE.clear()
+lp.transforms.WS_SPAWNER_HINT = True
+lp.transforms._hint_set_override("ab-control", False)
+check("hint override OFF beats global ON (the clueless control arm)",
+      lp.transforms._ws_spawner_hint(_spawner_obj(), agent="ab-control") is None)
+check("other agents on the same port still get the global-ON hint",
+      lp.transforms._ws_spawner_hint(_spawner_obj(), agent="ab-optimized") is not None)
+lp.transforms.WS_SPAWNER_HINT = False
+lp.transforms._hint_set_override("ab-optimized", True)
+check("hint override ON beats global OFF (opt one agent in)",
+      lp.transforms._ws_spawner_hint(_spawner_obj(), agent="ab-optimized") is not None)
+check("agent=None (unrouted) can't match an override -> global applies",
+      lp.transforms._ws_spawner_hint(_spawner_obj(), agent=None) is None)
+check("clear drops the override -> global default applies again",
+      lp.transforms._hint_set_override("ab-optimized", None) is None
+      and lp.transforms._ws_spawner_hint(_spawner_obj(), agent="ab-optimized") is None)
+_hint_row = lp.store.db().execute(
+    "SELECT enabled FROM hint_override WHERE owner=? AND agent=?",
+    (lp.store.OWNER, "ab-control")).fetchone()
+check("hint override persists to SQLite (owner-scoped row, enabled=0)",
+      _hint_row is not None and _hint_row[0] == 0)
+lp.transforms._HINT_OVERRIDE.clear()                        # simulate a restart
+check("restore reloads hint overrides (arm can't flip across a restart)",
+      lp.restore._restore_hint_overrides() >= 1
+      and lp.transforms._HINT_OVERRIDE.get("ab-control") == 0)
+lp.transforms._hint_set_override("ab-control", None)
+check("clear also deletes the persisted row",
+      lp.store.db().execute(
+          "SELECT 1 FROM hint_override WHERE owner=? AND agent=?",
+          (lp.store.OWNER, "ab-control")).fetchone() is None)
+lp.transforms._HINT_OVERRIDE.clear()
 lp.transforms.WS_SPAWNER_HINT = _save_hint
 
 # --- _classify_role: billing-header cc_is_subagent backstop ----------------------

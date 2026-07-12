@@ -206,6 +206,25 @@ def _restore_strip_overrides():
         return 0
 
 
+def _restore_hint_overrides():
+    """Reload per-agent spawner-hint overrides BEFORE the first post-restart
+    turn, so an A/B arm's hint state can't flip mid-experiment (a flip would
+    also reshape the marked system prefix -> warm bust). Same durability
+    rationale as strip_overrides; keyed by agent route name, not session."""
+    try:
+        from proxylab import transforms as transforms_mod
+        con = store_mod.db()
+        with store_mod.LOCK:
+            rows = con.execute("SELECT agent, enabled FROM hint_override "
+                               "WHERE owner=?", (store_mod.OWNER,)).fetchall()
+        for ag, enabled in rows:
+            transforms_mod._HINT_OVERRIDE[ag] = int(enabled)
+        return len(rows)
+    except Exception as e:
+        print(f"[restore] hint_overrides failed: {e}", flush=True)
+        return 0
+
+
 def _restore_strip_guard_latches():
     """Reload per-session strip-guard latches BEFORE the first post-restart turn,
     so the guard keeps its sticky decision instead of recomputing the ratio and
@@ -252,6 +271,7 @@ def _restore_state():
     _RESTORED["cwd_done"] = _restore_cwd_done()
     _RESTORED["ended"] = _restore_ended()
     _RESTORED["strip_overrides"] = _restore_strip_overrides()
+    _RESTORED["hint_overrides"] = _restore_hint_overrides()
     _RESTORED["strip_guard_latches"] = _restore_strip_guard_latches()
     _RESTORED["rider_latches"] = _restore_rider_latches()
     print(f"[restore] holds={_RESTORED['holds']} "

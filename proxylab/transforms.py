@@ -859,6 +859,61 @@ _WS_HINT_TEXT = (
 # directive target token -> the `# <Section>` heading it removes
 _WS_OMIT_TARGETS = {"claudemd": "# claudeMd", "useremail": "# userEmail"}
 
+# PER-AGENT SPAWNER-HINT OVERRIDE (/_hint): agent ROUTE name (the <name> in
+# /agent/<name>/…) -> 0/1, overriding WS_SPAWNER_HINT for just that agent's
+# traffic. THE A/B INVISIBILITY GATE: the hint is the lone model-visible
+# proxy-authored text in the whole protocol, so on=0 makes wirescope fully
+# invisible to that agent's model while capture/billing/warmth observability
+# still runs — the "clueless" control arm of an aware-vs-stock experiment
+# (on=1 is the mirror: opt ONE agent in on a port whose global default is off).
+# Keyed by ROUTE name, NOT session_id: the route exists BEFORE the first
+# request (the consumer names it in the base URL, so the arm can be configured
+# before launch) and survives /clear id-rotation — an arm keeps its identity
+# for the whole experiment. Deliberately NOT dropped by the session sweeper
+# (_ws_forget is session-keyed) for the same reason; persisted owner-scoped so
+# a proxy restart can't flip an arm mid-experiment (same durability rationale
+# as strip_override). Set it BEFORE the arm's first turn: flipping mid-session
+# reshapes the marked system prefix -> one warm-prefix bust.
+_HINT_OVERRIDE = {}
+
+store_mod.register_schema(
+    "CREATE TABLE IF NOT EXISTS hint_override ("
+    "owner TEXT NOT NULL, agent TEXT NOT NULL, "
+    "enabled INTEGER NOT NULL, set_at REAL NOT NULL, "
+    "PRIMARY KEY (owner, agent))")
+
+
+def _hint_set_override(agent, on):
+    """Set (0/1) or clear (None) the per-agent spawner-hint override, mirrored
+    to SQLite (reload lives in restore._restore_hint_overrides). Returns the
+    new override value (None = cleared -> global default applies). A store
+    failure degrades to in-memory-only, same as the strip-override twins."""
+    if on is None:
+        _HINT_OVERRIDE.pop(agent, None)
+        try:
+            con = store_mod.db()
+            with store_mod.LOCK:
+                con.execute("DELETE FROM hint_override WHERE owner=? AND agent=?",
+                            (store_mod.OWNER, agent))
+                con.commit()
+        except Exception as e:
+            print(f"[hint] row delete failed for {agent}: {e}", flush=True)
+        return None
+    val = 1 if on else 0
+    _HINT_OVERRIDE[agent] = val
+    try:
+        con = store_mod.db()
+        with store_mod.LOCK:
+            con.execute(
+                "INSERT INTO hint_override(owner, agent, enabled, set_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(owner, agent) DO UPDATE SET "
+                "enabled=excluded.enabled, set_at=excluded.set_at",
+                (store_mod.OWNER, agent, val, time.time()))
+            con.commit()
+    except Exception as e:
+        print(f"[hint] persist failed for {agent}: {e}", flush=True)
+    return val
+
 
 # A reminder SECTION header is `# ` + a lowercase camelCase key (claudeMd,
 # userEmail, currentDate, … — the CLI generates them from internal camelCase
@@ -1453,7 +1508,16 @@ def _ws_strip_spawn_directives(obj):
     return {"stripped": n}
 
 
-def _ws_spawner_hint(obj):
+def _hint_enabled(agent):
+    """Effective spawner-hint state for an agent route: the per-agent /_hint
+    override wins; no override -> the global WS_SPAWNER_HINT default. `agent`
+    None (unroutable/ext traffic) can't carry an override -> global."""
+    if agent is not None and agent in _HINT_OVERRIDE:
+        return bool(_HINT_OVERRIDE[agent])
+    return WS_SPAWNER_HINT
+
+
+def _ws_spawner_hint(obj, agent=None):
     """Inject the constant spawner discovery hint (WS_SPAWNER_HINT, see
     above) as a TRAILING system block, then MIGRATE the last system cache
     marker onto it — so the hint rides INSIDE the marked system prefix (the
@@ -1465,8 +1529,10 @@ def _ws_spawner_hint(obj):
     as STRIP_MCP's tools[-1]. Gated to spawner requests only (not a
     subagent; carries a spawn tool). Idempotent (won't double-inject). Returns
     {injected:True, marker_moved:bool} or None. Default OFF — this is the lone
-    wire-visible proxy-authored text in the whole protocol."""
-    if not WS_SPAWNER_HINT:
+    wire-visible proxy-authored text in the whole protocol. `agent` = the
+    ROUTE name; a per-agent /_hint override beats the global (the A/B
+    invisibility gate — see _HINT_OVERRIDE above)."""
+    if not _hint_enabled(agent):
         return None
     if writer_mod._genuine_subagent(obj):          # never teach a real subagent
         return None                                # (a leaked parent turn IS a spawner)
@@ -2966,6 +3032,51 @@ def _inject_into_last_user(obj, text, sep="\n\n"):
         c.append({"type": "text", "text": text})
         return ""
     return None
+
+
+# ---- THROWAWAY PROTOTYPE: mid-flight DM delivery (scratch port ONLY) ---------
+# Gates the wire-delivery feature's ONE open risk: does the model double-react
+# when it sees DM content injected on the wire THIS turn AND a slim durable
+# record next turn? This is deliberately minimal — NO delivery.rode receipt, NO
+# ack, NO dedup, NO leak-guard (those are the real build, spec'd-but-uncoded
+# until this test clears). Off by default (DELIVER_PROTOTYPE unset) → inert on
+# :7800; only the scratch experiment port sets it. In-memory, non-durable,
+# fire-once: an enqueued item rides the NEXT request for its session then clears
+# (a throwaway approximation of the real transient tail-copy). The proxy never
+# parses `text` — it's opaque; clodex frames it.
+DELIVER_PROTOTYPE = os.environ.get("DELIVER_PROTOTYPE", "0") not in (
+    "0", "no", "off", "false")
+_DELIVER_QUEUE = {}          # session_id -> list[str]  (throwaway, in-memory)
+
+
+def _deliver_enqueue(session_id, text):
+    """Queue `text` for injection into `session_id`'s next request. Returns the
+    resulting queue depth. Throwaway prototype only."""
+    _DELIVER_QUEUE.setdefault(session_id, []).append(text)
+    return len(_DELIVER_QUEUE[session_id])
+
+
+def _deliver_tail_inject(obj):
+    """THROWAWAY: append any pending delivery text for this request's session as
+    a TRAILING text block on the last user message (tail-only → cache-safe;
+    appended AFTER any tool_result blocks, so tool_use pairing is untouched —
+    the exact shape the CLI itself uses for out-of-band notes). Fire-once: clears
+    the queue after injecting. Returns a log dict, or None if nothing pending /
+    the flag is off. NOT the real mechanism — no receipt/ack/dedup here."""
+    if not DELIVER_PROTOTYPE:
+        return None
+    sid = (writer_mod._session_ids(obj) or [None])[0]
+    if not sid:
+        return None
+    pending = _DELIVER_QUEUE.get(sid)
+    if not pending:
+        return None
+    text = "\n\n".join(pending)
+    orig = _inject_into_last_user(obj, text, sep="\n\n")
+    if orig is None:                 # no user message to ride (shouldn't happen)
+        return None
+    _DELIVER_QUEUE.pop(sid, None)    # fire-once
+    return {"session": sid, "items": len(pending), "chars": len(text)}
 
 
 def _decide_injection(obj):

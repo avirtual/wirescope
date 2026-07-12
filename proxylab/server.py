@@ -942,6 +942,77 @@ async def handler(request: Request) -> Response:
         print(f"[strip] session={sess[:12]}… level={new} (global={gdef})", flush=True)
         return Response(json.dumps(_body(new)), media_type="application/json")
 
+    # ---- per-agent spawner-hint toggle (A/B invisibility gate) ----------------
+    # GET  /_hint?agent=<route-name>          -> current effective state (read-only)
+    # POST /_hint?agent=<route-name>&on=1|0   -> set the per-agent override
+    # POST /_hint?agent=<route-name>&action=clear -> drop it (fall back global)
+    # Keyed by the AGENT ROUTE NAME (the <name> in /agent/<name>/…), NOT
+    # session_id: the route exists BEFORE the first request (configure the arm
+    # pre-launch) and survives /clear id-rotation. on=0 makes wirescope fully
+    # invisible to that agent's model (the hint is the lone model-visible
+    # proxy-authored text) while capture/billing/warmth still run — the
+    # "clueless" control arm of an aware-vs-stock experiment. Persisted
+    # owner-scoped (a restart must not flip an arm mid-experiment). Set BEFORE
+    # the arm's first turn: flipping mid-session busts the marked system prefix.
+    if request.url.path.rstrip("/") == "/_hint":
+        q = request.query_params
+        ag = q.get("agent")
+        if not ag:
+            return Response(json.dumps({"ok": False, "reason": "missing ?agent="}),
+                            status_code=400, media_type="application/json")
+        gdef = transforms_mod.WS_SPAWNER_HINT
+
+        def _hbody(override):
+            eff = bool(override) if override is not None else gdef
+            return {"ok": True, "agent": ag, "override": override,
+                    "global_default": gdef, "effective": eff}
+        if request.method == "GET":
+            return Response(json.dumps(_hbody(transforms_mod._HINT_OVERRIDE.get(ag))),
+                            media_type="application/json")
+        action = (q.get("action") or "").lower()
+        on_raw = q.get("on")
+        if action == "clear" or on_raw in ("clear", "none"):
+            new = transforms_mod._hint_set_override(ag, None)
+        else:
+            if on_raw is None:
+                return Response(json.dumps({"ok": False, "agent": ag,
+                                "reason": "missing &on=1|0 (or action=clear)"}),
+                                status_code=400, media_type="application/json")
+            new = transforms_mod._hint_set_override(
+                ag, on_raw in ("1", "yes", "on", "true"))
+        print(f"[hint] agent={ag} override={new} (global={gdef})", flush=True)
+        return Response(json.dumps(_hbody(new)), media_type="application/json")
+
+    # ---- THROWAWAY PROTOTYPE: POST /_deliver?session= — mid-flight DM inject ---
+    # Enqueue an opaque `text` for injection into the session's NEXT request
+    # (double-reaction test; scratch port only, gated by DELIVER_PROTOTYPE). This
+    # is the minimal enqueue half — NO ack/receipt/dedup/leak-guard yet (the real
+    # build, uncoded until the test clears). 400 only on malformed; outcome in the
+    # body (action-endpoint convention).
+    if request.method == "POST" and request.url.path.rstrip("/") == "/_deliver":
+        sess = request.query_params.get("session")
+        if not sess:
+            return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
+                            status_code=400, media_type="application/json")
+        if not transforms_mod.DELIVER_PROTOTYPE:
+            return Response(json.dumps({"ok": False, "reason": "DELIVER_PROTOTYPE off"}),
+                            status_code=400, media_type="application/json")
+        try:
+            payload = json.loads(await request.body() or b"{}")
+        except ValueError:
+            return Response(json.dumps({"ok": False, "reason": "bad JSON body"}),
+                            status_code=400, media_type="application/json")
+        text = payload.get("text")
+        if not isinstance(text, str) or not text:
+            return Response(json.dumps({"ok": False, "reason": "missing/empty text"}),
+                            status_code=400, media_type="application/json")
+        depth = transforms_mod._deliver_enqueue(sess, text)
+        print(f"[deliver] session={sess[:12]}… queued (depth={depth}, {len(text)}ch)",
+              flush=True)
+        return Response(json.dumps({"ok": True, "queued": True, "session": sess,
+                                    "queue_depth": depth}),
+                        media_type="application/json")
+
     # ---- subscriber registry: app-agnostic push feed (see SUBSCRIBERS.md) -----
     # GET/POST/DELETE /_subscribe — consumers register an endpoint + agent globs
     # and receive text.delta / turn.completed / session.ended for their sessions.
@@ -1111,7 +1182,7 @@ async def handler(request: Request) -> Response:
                 changed = True
             # WIRESCOPE: optional spawner discovery hint (operator opt-in, the
             # one model-visible proxy-authored line; spawner-only, Agent/Task-gated).
-            whint = transforms_mod._ws_spawner_hint(obj)
+            whint = transforms_mod._ws_spawner_hint(obj, agent=agent)
             if whint:
                 record["ws_spawner_hint"] = whint
                 changed = True
@@ -1241,6 +1312,17 @@ async def handler(request: Request) -> Response:
                     print(f"[hold] #{n} {he['action']} -> "
                           f"{'ARMED ' + str(he.get('hours') or '') if he.get('armed') else 'not armed'}"
                           f" (forwarding; model echoes the ack)", flush=True)
+            # THROWAWAY PROTOTYPE (scratch port only, DELIVER_PROTOTYPE): inject
+            # any pending mid-flight DM as a trailing block — LAST in the chain so
+            # it's the final text the model reads. Inert unless the flag is set.
+            if upstream_path.split("?")[0].endswith("/v1/messages"):
+                dlv = transforms_mod._deliver_tail_inject(obj)
+                if dlv:
+                    record["deliver_inject"] = dlv
+                    changed = True
+                    print(f"[deliver] #{n} injected {dlv['items']} item(s) "
+                          f"({dlv['chars']}ch) into session={dlv['session'][:12]}…",
+                          flush=True)
             if changed:
                 raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         role = writer_mod._classify_role(obj, agent_id=agent_id)

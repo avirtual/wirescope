@@ -115,6 +115,10 @@ def _identity():
                           "spawn": writer_mod.WS_SPAWN_DIRECTIVES,
                           "omit_default": transforms_mod.WS_OMIT_DEFAULT,
                           "spawner_hint": transforms_mod.WS_SPAWNER_HINT,
+                          # per-agent /_hint override of spawner_hint (keyed by
+                          # route name; on=0 = wirescope invisible to that
+                          # agent's model while observability still runs).
+                          "hint_override": True,
                           # tool-roster trim: `tools` (allowlist), `strip-tools`
                           # (denylist), `keep-tools` (override); gated by
                           # WS_STRIP_TOOLS, same spawn/body/sticky plumbing.
@@ -150,6 +154,7 @@ def _identity():
             "timeline": "/_timeline",
             "bust": "/_bust",
             "strip": "/_strip",
+            "hint": "/_hint",
             "prune": "/_prune",
         },
         "docs": "INTEGRATION.md",         # front-door contract; push deep-dive = SUBSCRIBERS.md
