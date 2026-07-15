@@ -1,0 +1,122 @@
+# OPERATIONS — how to run, deploy, and test proxy-lab
+
+Pull this when you're about to touch the running proxy, cut a release, or run the
+test/A-B tooling. It is **not** auto-read every turn (deliberately — port/pid/deploy
+facts change often, and an auto-read doc busts msg0 on every edit). Durable
+*conclusions* live in `CLAUDE.md`; the *current runtime truth* (which instance owns
+:7800 right this moment, live pid/tag, in-flight experiment state) lives in
+`HANDOFF.local.md`.
+
+## Who owns :7800 (deployment model)
+
+**:7800 is CLODEX-MANAGED-VENDORED** (the model since 2026-07-03).
+clodex runs a vendored wirescope snapshot from `wb-wrap-ui/vendor/wirescope` in a
+managed venv, detached, surviving GUI restarts.
+`/_identity` → `"vX.Y.Z (vendored)"`; pidfile + logs under
+`~/Library/Application Support/clodex/wirescope/` (captures in `.../logs/`, warmth
+DB alongside).
+To confirm which model is actually live, check the cwd of the :7800 LISTEN pid:
+`vendor/wirescope` = managed (correct); `proxy-lab/releases/…` = a rogue hand-run
+(wrong — see the 2026-07-15 incident in HANDOFF).
+
+**Release → deploy flow under this model:**
+Cutting a release here does NOT reach :7800.
+clodex must re-run its own `vendor-wirescope.sh` against the new tag (pushed to
+origin `avirtual/wirescope`), then a GUI restart self-applies the bump.
+So: tag + push the release, then **tell clodex** which tag to vendor.
+`run_release.sh` is a no-op for prod under this model (it still serves dev/scratch
+ports).
+
+**Legacy hand-run release model (pre-2026-07-03, still valid for dev/scratch):**
+`./release.sh vX.Y.Z` cuts a release — clean tree + test suite gated, tags, builds
+a `releases/<tag>` worktree, flips the `releases/current` symlink.
+`./run_release.sh` restarts a hand-run :7800 from `releases/current` with
+LOG_DIR/WARMTH_DB/OUT pinned to the lab root.
+**Do not hand-run :7800 while clodex manages it** — you'll collide with the managed
+instance and revert the model (that's exactly the Jul-2026 rogue-instance bug).
+
+## Launching proxies (dev / scratch ports)
+
+Proxies launch via `./start_proxy.sh` / `./restart_proxy.sh` (nohup+disown → PPID 1).
+A `run_in_background` Bash job dies with the CLI — never launch the proxy that way.
+`start` refuses a bound port; `restart` kills + starts.
+Script defaults add `STRIP_COMPACT_CACHE=1 WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1
+WS_SPAWNER_HINT=1 WS_OMIT_DEFAULT=useremail`, via `${VAR-default}` so an explicit
+0/empty sticks.
+The wirescope flags are ON by canonical-script default (a fresh clone needs no
+release.env) but stay OFF in CODE (library embeddings/tests unaffected).
+`start_proxy.sh` also sources `release.env` (gitignored, per-machine — fills only
+keys not already set, so caller env wins); `release.env.example` is the tracked
+template.
+
+**Scratch/experiment arm** = a scratch port from the dev tree:
+`PORT=7802 LOG_DIR=logs_scratch <flags> ./start_proxy.sh`.
+⚠️ `restart_proxy.sh` defaults `LOG_DIR=logs_main` — do NOT use it for scratch ports
+(it writes into the frozen :7800 archive). Kill + `start_proxy.sh` with an explicit
+LOG_DIR instead.
+Sanity: `curl -s localhost:7800/_status` or `localhost:7800/_admin`.
+
+**Teardown — HARD RULE:** to stop a proxy, target ONLY its listener PID via
+`lsof -nP -tiTCP:$PORT -sTCP:LISTEN` (the `-sTCP:LISTEN` filter is essential) or a
+pidfile — NEVER a bare `lsof -ti tcp:$PORT`, which also returns CLIENT sockets and
+can take down clodex + the whole Electron app. Prefer the scripts (they already
+filter to the listener). Signal nothing outside your own proxy process.
+
+## Other ports / corpora
+
+Other local ports may be in use by the operator — leave non-:7800 ports alone unless
+they're your own scratch arm (e.g. a legacy logproxy writing to `logs/` — don't
+touch `logs/`).
+Restarts are safe-ish (state persists; only a credentials gap, which the auth
+bootstrap closes) but avoid mid-experiment.
+**This Claude Code session does NOT route through :7800** — drills must set
+`ANTHROPIC_BASE_URL` explicitly; scratch ports have no SessionEnd hook.
+
+Capture dirs: under the managed model, live captures go to
+`~/Library/Application Support/clodex/wirescope/logs/`.
+`logs_main` is the FROZEN hand-run archive (do not expect it to grow; it briefly
+took live traffic Jul 12–15 during the rogue-instance window).
+`logs` = :7799.
+Old experiment captures live in `logs_archive/` (logs_live, logs_chatty,
+logs_compact_warmth, logs_inject, logs_codexprobe, …; retired port→corpus map in
+archive-2026-06-11).
+All gitignored.
+Git since 2026-06-09; commit after meaningful changes.
+
+## Client integration
+
+Client integration ships with the proxy in `client/` (warm-cache command, statusline,
+cache-expiry + cache-state hooks, settings.example.json, install.sh + README).
+These are the canonical copies — edit there, cut a release to ship.
+Project settings reference `releases/current/client/...` so wiring upgrades with
+releases.
+`~/.claude/commands/warm-cache.md` is a symlink through `releases/current`
+(install.sh).
+The SessionEnd→`/_end` hook is installed user-level in `~/.claude/settings.json`
+(pinned to :7800; scratch ports rely on the sweeper).
+
+## Test suites (gate every release)
+
+Run after any edit in the matching area — all three gate a release cut:
+- `python3 test_warmth_store.py` — 161 offline checks — after any
+  warmth/pricing/hold/persistence edit.
+- `python3 test_subscribers.py` — 52 offline checks — after any subs/tee/server-wiring
+  edit.
+- `python3 test_fold.py` — 68-session replay — after any strip/fold edit.
+
+## Offline analysis + A/B proof tooling
+
+`analyze_tools.py` — offline tool-utilization ledger:
+`python3 analyze_tools.py <dir> --by role|session`. Prices deadweight.
+
+**A/B proof harness (transforms vs verbatim passthrough):**
+- `ab_run.py "PROMPT" --a-url … --a-dir … --b-url … --b-dir … -n N -o run.json` —
+  drives the SAME `claude -p` task through two arms N times (A then B per rep),
+  records each `claude --output-format json` session_id + CLI cost cross-check into a
+  manifest. Probes `/_identity` to warn if the control arm isn't actually passthrough.
+- `ab_analyze.py DIR_A DIR_B [--last N|--since 30m|--manifest run.json]` — prices both
+  corpora from the captured `billing` blocks (real wire tokens + TTL-correct est_$,
+  NOT the CLI's under-report), side-by-side with deltas, split main vs subagent, plus
+  the treatment's fired-transform tally. Headline = carriage % and $ % vs the control.
+- Control arm = a second port from THIS binary started with `WIRESCOPE_PASSTHROUGH=1`
+  + its own `LOG_DIR` (no clone — zero code drift).
