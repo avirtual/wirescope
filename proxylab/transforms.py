@@ -1239,6 +1239,77 @@ def _strip_mcp_tools(obj, agent_id=None):
     return log
 
 
+# ---- GLOBAL EXACT-NAME TOOL STRIP (deployment-level) ----------------------
+# Drop named tools[] entries by EXACT name for every routed CLI, keyed on a
+# constant set. This is the sibling of STRIP_MCP_SERVERS (which keys on the
+# `mcp__<server>__*` prefix) for tools the CLI PINS into the outbound roster
+# past every native filter. Motivating case: EndConversation — a mandatory
+# safety tool the CLI force-includes even under a strict `--tools bash`
+# allowlist AND leaves on the wire under settings `permissions.deny`
+# (wire-proven 2026-07-18: --tools bash -> [Bash, EndConversation]; deny of
+# [Artifact, EndConversation] strips Artifact, keeps EndConversation). Its
+# entry is ~4.7k ch / ~1.7k tok of pure abuse-policy prose (empty
+# input_schema) a coding fleet never invokes, cached every turn. No native
+# means removes it; the proxy is the only lever.
+#
+# Same cache math as STRIP_MCP: tools[] is FIRST in cache order, so a CONSTANT
+# strip set reshapes the cached prefix to the smaller roster ONCE (one
+# downstream bust at adoption), then rides byte-stable (SORT_TOOLS downstream
+# re-alphabetizes, so the forwarded tools[] is identical every turn). Match is
+# by SET membership (case-insensitive), order-independent. Default OFF in code
+# (STRIP_TOOLS_GLOBAL="") so library/test embeddings are unaffected; a
+# deployment turns it on via STRIP_TOOLS_GLOBAL="EndConversation[,…]".
+# Per-agent re-admit: `[wirescope:keep-tools <name>]` (shares the resolver the
+# wirescope tool directives use). Kill switch: STRIP_TOOLS_GLOBAL="" (or =off).
+STRIP_TOOLS_GLOBAL = frozenset(
+    s.lower() for s in re.split(r"[,\s]+",
+                                os.environ.get("STRIP_TOOLS_GLOBAL", "").strip())
+    if s and s.lower() not in ("0", "no", "off", "false"))
+
+
+def _strip_tools_global(obj, agent_id=None):
+    """Drop tools[] whose name is in STRIP_TOOLS_GLOBAL (minus any the agent
+    re-admits via `[wirescope:keep-tools <name>]`). Returns a log dict
+    {removed, kept, targets[, miss]} or None (gate off / no tools / nothing to
+    strip). Mirrors _strip_mcp_tools including the defensive cache_control
+    migration onto the new last tool (never fires on the org-scope wire, where
+    tools carry no breakpoint)."""
+    if not STRIP_TOOLS_GLOBAL:
+        return None
+    tools = obj.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    keep = set()
+    for name, value in _ws_merged_pairs(obj, agent_id):
+        if name == "keep-tools":
+            keep.update(t.lower() for t in _ws_omit_target_list(value))
+    targets = STRIP_TOOLS_GLOBAL - keep
+    if not targets:
+        return None                          # every configured tool re-admitted
+    kept, removed, lost_cc = [], [], None
+    for t in tools:
+        nm = t.get("name") if isinstance(t, dict) else None
+        if nm and nm.lower() in targets:
+            removed.append(nm)
+            if isinstance(t, dict) and t.get("cache_control") and lost_cc is None:
+                lost_cc = t["cache_control"]
+        else:
+            kept.append(t)
+    log = {"targets": sorted(targets)}
+    if not removed:
+        log["removed"] = []
+        log["miss"] = True                   # configured but this req carried none
+        return log
+    if (lost_cc and kept and isinstance(kept[-1], dict)
+            and not any(isinstance(t, dict) and t.get("cache_control")
+                        for t in kept)):
+        kept[-1]["cache_control"] = lost_cc
+    obj["tools"] = kept
+    log["removed"] = removed
+    log["kept"] = [t.get("name") for t in kept]
+    return log
+
+
 # ---- SIDE-CALL MODEL DOWNSHIFT (WebFetch/WebSearch utility calls) ----------
 # The CLI dispatches two kinds of one-shot UTILITY side-calls on the SESSION'S
 # MAIN MODEL, ignoring both the invoking subagent's model and WebFetch's own

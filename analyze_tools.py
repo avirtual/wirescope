@@ -29,7 +29,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-CHARS_PER_TOK = 4          # rough JSON chars->tokens; ranking is robust to it
+CHARS_PER_TOK = 2.8        # dense JSON tool schemas ~2.8 ch/tok (wire-cal vs
+                           # /context 2026-07-18); mirrors status._SCHEMA_CHARS_PER_TOK
 DEFAULT_MIN_TURNS = 3      # successful turns needed before we call a tool DEAD
 
 # approx public list USD/1M (mirror of logproxy.PRICES); cache_read is the
@@ -147,13 +148,13 @@ def main():
     print(f"# tool-utilization ledger  ({len(req_files)} request files, grouped by {by})\n")
     grand_dead = grand_total = 0.0
     for key in sorted(G, key=lambda k: -sum(
-            s["schema_chars"] // CHARS_PER_TOK * s["loaded_turns"] for s in G[k].values()
+            int(s["schema_chars"] / CHARS_PER_TOK) * s["loaded_turns"] for s in G[k].values()
             if s["called_turns"] == 0 and s["evaluable_turns"] >= min_turns)):
         gm = group_meta[key]
         rows = []
         dead_tok = total_tok = 0
         for name, s in G[key].items():
-            tok = s["schema_chars"] // CHARS_PER_TOK
+            tok = int(s["schema_chars"] / CHARS_PER_TOK)
             carried = tok * s["loaded_turns"]          # re-shipped every turn
             total_tok += carried
             if s["called_turns"] > 0:

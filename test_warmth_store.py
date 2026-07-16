@@ -2137,8 +2137,9 @@ check("/_context per_tool sorted biggest-first (Bash leads)",
       and _cm["tools"]["per_tool"] ==
           sorted(_cm["tools"]["per_tool"],
                  key=lambda x: x["schema_chars"], reverse=True))
-check("/_context est_tokens == total_schema_chars // 4",
-      _cm["tools"]["est_tokens"] == _cm["tools"]["total_schema_chars"] // 4
+check("/_context est_tokens == total_schema_chars / schema-divisor (dense tool JSON)",
+      _cm["tools"]["est_tokens"]
+          == int(_cm["tools"]["total_schema_chars"] / lp.status._SCHEMA_CHARS_PER_TOK)
       and _cm["tools"]["total_schema_chars"]
           == sum(p["schema_chars"] for p in _cm["tools"]["per_tool"]))
 _cs = _ctx["agents"][1]

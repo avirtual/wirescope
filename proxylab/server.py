@@ -1168,6 +1168,16 @@ async def handler(request: Request) -> Response:
                 record["strip_mcp"] = smcp
                 if smcp.get("removed"):
                     changed = True
+            # STRIP_TOOLS_GLOBAL: drop named tools[] entries by EXACT name for
+            # every routed CLI (sibling of STRIP_MCP_SERVERS, keyed on name not
+            # mcp prefix). For tools the CLI force-includes past --tools and
+            # settings permissions.deny alike (EndConversation). Default off in
+            # code; per-agent re-admit via [wirescope:keep-tools <name>].
+            stg = transforms_mod._strip_tools_global(obj, agent_id=agent_id)
+            if stg:
+                record["strip_tools_global"] = stg
+                if stg.get("removed"):
+                    changed = True
             # WIRESCOPE [wirescope:strip-thinking ...]: resolve the strip decision
             # into the sticky per-session store NOW, BEFORE the directive-strip
             # below removes the line from the wire — otherwise a directive placed

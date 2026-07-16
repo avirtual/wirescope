@@ -35,6 +35,7 @@ python3 test_warmth_store.py >/dev/null
 python3 test_subscribers.py >/dev/null
 python3 test_fold.py >/dev/null
 python3 test_scrap_tail.py >/dev/null
+python3 test_strip_tools.py >/dev/null
 echo "tests OK"
 
 git tag -a "$VERSION" -m "proxy release $VERSION"
