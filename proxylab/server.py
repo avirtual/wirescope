@@ -112,7 +112,7 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts):
                   or request.headers.get("thread-id")
                   or (obj or {}).get("prompt_cache_key"))
     session_key = session_id or writer_mod.NO_SESSION
-    out_dir = core_mod.LOG_DIR / session_key
+    out_dir = core_mod._session_dir(session_key)
     stem = f"{n:03d}-{agent}-codex-{writer_mod._short_model(model)}-{ts}"
 
     client = request.client
@@ -279,6 +279,14 @@ async def _websockets_connect(url, headers, subprotocols=None, user_agent=None):
         return await websockets.connect(url, extra_headers=headers, **kwargs)
 
 
+# Connection-level frame-log chunk size. The log used to accumulate for the
+# connection's whole life and write once at close — codex 0.141 keeps ONE WS up
+# for the entire conversation, so a day-long session grew it unboundedly in RSS
+# and a crash lost all of it. Chunked flushing bounds both (≤ ~2 MB per chunk at
+# 1000-ch previews; crash loses at most the current chunk).
+_WS_FRAMES_FLUSH = 2000
+
+
 async def websocket_handler(websocket: WebSocket):
     """Tunnel Codex /responses WebSockets to the OpenAI/ChatGPT upstream.
 
@@ -305,7 +313,7 @@ async def websocket_handler(websocket: WebSocket):
     session_id = (websocket.headers.get("session-id")
                   or websocket.headers.get("thread-id"))
     session_key = session_id or writer_mod.NO_SESSION
-    out_dir = core_mod.LOG_DIR / session_key
+    out_dir = core_mod._session_dir(session_key)
     stem = f"{n:03d}-{agent}-codex-ws-{ts}"
     client = websocket.client
     record = {"seq": n, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -326,6 +334,25 @@ async def websocket_handler(websocket: WebSocket):
     upstream_url = _upstream_websocket_url(codex_mod.UPSTREAM_OPENAI, up_path)
 
     frames = []
+    frames_out = {"part": 0, "written": 0}
+
+    def flush_frames():
+        if not frames:
+            return
+        part = frames_out["part"]
+        writer_mod._enqueue_json(
+            out_dir / f"{stem}.frames-{part:03d}.json",
+            {"seq": n, "agent": agent, "provider": "openai",
+             "transport": "websocket", "part": part, "frames": list(frames)})
+        frames_out["part"] += 1
+        frames_out["written"] += len(frames)
+        frames.clear()
+
+    def log_frame(entry):
+        frames.append(entry)
+        if len(frames) >= _WS_FRAMES_FLUSH:
+            flush_frames()
+
     close_status = {"client": None, "upstream": None, "error": None}
 
     try:
@@ -354,7 +381,7 @@ async def websocket_handler(websocket: WebSocket):
     # terminal event finalizes THAT turn and resets for the next. The connection
     # stem/n stay reserved for the handshake .request.json + transport.json.
     turn = {"n": None, "stem": None, "model": None, "frames": [], "open": False,
-            "count": 0}
+            "count": 0, "ts": None}
 
     def maybe_record_request_obj(data):
         try:
@@ -364,7 +391,8 @@ async def websocket_handler(websocket: WebSocket):
         if not isinstance(obj, dict) or obj.get("type") != "response.create":
             return
         turn["n"] = next(core_mod._counter)
-        turn["stem"] = f"{turn['n']:03d}-{agent}-codex-ws-{time.strftime('%H%M%S')}"
+        turn["ts"] = time.strftime("%H%M%S")
+        turn["stem"] = f"{turn['n']:03d}-{agent}-codex-ws-{turn['ts']}"
         turn["model"] = obj.get("model")
         turn["frames"] = []
         turn["open"] = True
@@ -388,8 +416,10 @@ async def websocket_handler(websocket: WebSocket):
         blob = "".join(f"data: {frame}\n\n" for frame in turn["frames"])
         raw = blob.encode("utf-8")
         writer_mod._enqueue_bytes(out_dir / f"{turn['stem']}.response.sse", raw)
+        # per-turn ts, not the connection-open one: all turns on a multiplexed
+        # connection would otherwise share one stale receipt timestamp
         receipts_mod.openai(
-            raw, n=turn["n"], ts=ts, agent=agent, model=turn["model"],
+            raw, n=turn["n"], ts=turn["ts"] or ts, agent=agent, model=turn["model"],
             session_id=session_id, session_key=session_key,
             out_dir=out_dir, stem=turn["stem"], status_code=200, resp_headers={})
         turn["open"] = False
@@ -413,13 +443,13 @@ async def websocket_handler(websocket: WebSocket):
                 if "text" in msg:
                     data = msg["text"]
                     maybe_record_request_obj(data)
-                    frames.append({"dir": "client", "type": "text",
+                    log_frame({"dir": "client", "type": "text",
                                    "bytes": len(data.encode("utf-8")),
                                    "preview": data[:1000]})
                     await up.send(data)
                 elif "bytes" in msg:
                     data = msg["bytes"]
-                    frames.append({"dir": "client", "type": "bytes",
+                    log_frame({"dir": "client", "type": "bytes",
                                    "bytes": len(data),
                                    "preview_hex": data[:128].hex()})
                     await up.send(data)
@@ -435,13 +465,13 @@ async def websocket_handler(websocket: WebSocket):
                 if isinstance(data, str):
                     if turn["open"]:
                         turn["frames"].append(data)
-                    frames.append({"dir": "upstream", "type": "text",
+                    log_frame({"dir": "upstream", "type": "text",
                                    "bytes": len(data.encode("utf-8")),
                                    "preview": data[:1000]})
                     await websocket.send_text(data)
                     maybe_finalize_ws_receipt(data)
                 else:
-                    frames.append({"dir": "upstream", "type": "bytes",
+                    log_frame({"dir": "upstream", "type": "bytes",
                                    "bytes": len(data),
                                    "preview_hex": data[:128].hex()})
                     await websocket.send_bytes(data)
@@ -478,17 +508,33 @@ async def websocket_handler(websocket: WebSocket):
     finally:
         with contextlib.suppress(Exception):
             await up.close()
+        flush_frames()
         writer_mod._enqueue_json(out_dir / f"{stem}.transport.json",
                      {"seq": n, "agent": agent, "provider": "openai",
                       "transport": "websocket", "endpoint": base_path,
                       "upstream_url": upstream_url, "status": "closed",
-                      "close": close_status, "n_frames": len(frames),
+                      "close": close_status, "n_frames": frames_out["written"],
+                      "frames_parts": frames_out["part"],
                       "turns_captured": turn["count"],
                       "turn_open_at_close": turn["open"]})
-        if frames:
-            writer_mod._enqueue_json(out_dir / f"{stem}.frames.json",
-                         {"seq": n, "agent": agent, "provider": "openai",
-                          "transport": "websocket", "frames": frames})
+
+
+# /_compact's `path` param names a file the endpoint may REWRITE (backed up +
+# atomic, but still a localhost write primitive). Confine it to the transcript
+# tree(s): real consumers (clodex compactOnResume) always resolve under
+# ~/.claude/projects. Colon-separated env override for non-standard homes; the
+# offline CLI (python3 -m proxylab.bake_session) is intentionally unconfined —
+# running it is an operator action, not a network surface.
+COMPACT_PATH_ROOTS = [os.path.realpath(os.path.expanduser(p))
+                      for p in os.environ.get("COMPACT_PATH_ROOTS",
+                                              "~/.claude/projects").split(":")
+                      if p.strip()]
+
+
+def _compact_path_allowed(path):
+    rp = os.path.realpath(os.path.expanduser(path))
+    return rp, any(rp == root or rp.startswith(root.rstrip("/") + "/")
+                   for root in COMPACT_PATH_ROOTS)
 
 
 async def handler(request: Request) -> Response:
@@ -573,8 +619,17 @@ async def handler(request: Request) -> Response:
             level = int(q.get("level")) if q.get("level") is not None else None
         except (TypeError, ValueError):
             level = None
+        # confinement before any file I/O: outside the transcript roots ->
+        # {ok:false} at 200 (action-endpoint convention: HTTP status = request
+        # validity; the consumer keys on `ok` and resumes the original).
+        rp, allowed = _compact_path_allowed(path)
+        if not allowed:
+            return Response(json.dumps({"ok": False, "reason": "path_outside_root",
+                                        "path": path,
+                                        "roots": COMPACT_PATH_ROOTS}),
+                            media_type="application/json")
         from proxylab import bake_session
-        res = bake_session.compact_file(path, expect_session=sess)
+        res = bake_session.compact_file(rp, expect_session=sess)
         res["session"] = sess
         res["requested_level"] = level
         res["baked_families"] = ["thinking"]
@@ -1498,7 +1553,7 @@ async def handler(request: Request) -> Response:
 
     # one subdirectory per session; count_tokens/probes (no metadata) -> NO_SESSION
     session_key = session_id or writer_mod.NO_SESSION
-    out_dir = core_mod.LOG_DIR / session_key
+    out_dir = core_mod._session_dir(session_key)
     stem = f"{n:03d}-{agent}-{role}-{writer_mod._short_model(model)}-{ts}"
     writer_mod._enqueue_json(out_dir / f"{stem}.request.json", record)
 

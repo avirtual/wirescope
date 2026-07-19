@@ -1629,6 +1629,36 @@ lp._restore_last_requests()
 check("stale last_request row is reaped at restore",
       "sess-lr-stale" not in lp._LAST_REQUEST)
 
+# --- sweep age-purge: dead-owner last_request rows + session_bust rows ------------
+# rows from a LOG_DIR that never boots again are invisible to the in-memory
+# mirror delete; the ts-age purge (bounded by WARMTH_PURGE_SLACK) is the only
+# thing that can ever reap them. session_bust rides the same purge.
+con9 = sqlite3.connect(os.environ["WARMTH_DB"])
+_slack = lp.pinger._WARMTH_PURGE_SLACK
+con9.execute("INSERT OR REPLACE INTO last_request(owner, session_id, account_uuid, "
+             "path, ts, body, headers) VALUES('/dead/owner','sess-dead-old',NULL,"
+             "'/v1/messages',?,'{}','{}')", (time.time() - _slack - 3600,))
+con9.execute("INSERT OR REPLACE INTO last_request(owner, session_id, account_uuid, "
+             "path, ts, body, headers) VALUES('/dead/owner','sess-dead-fresh',NULL,"
+             "'/v1/messages',?,'{}','{}')", (time.time() - 60,))
+con9.execute("INSERT OR REPLACE INTO session_bust(session_id, tools, last_class, "
+             "last_ts) VALUES('sess-bust-old',1,'tools',?)",
+             (time.time() - _slack - 3600,))
+con9.execute("INSERT OR REPLACE INTO session_bust(session_id, tools, last_class, "
+             "last_ts) VALUES('sess-bust-fresh',1,'tools',?)", (time.time() - 60,))
+con9.commit(); con9.close()
+res_sw = lp._sweep_state()
+con9b = sqlite3.connect(os.environ["WARMTH_DB"])
+lr_left = {r[0] for r in con9b.execute(
+    "SELECT session_id FROM last_request WHERE owner='/dead/owner'")}
+bust_left = {r[0] for r in con9b.execute(
+    "SELECT session_id FROM session_bust WHERE session_id LIKE 'sess-bust-%'")}
+con9b.close()
+check("sweep age-purges dead-owner last_request rows past the slack",
+      res_sw["last_request_aged"] >= 1 and lr_left == {"sess-dead-fresh"})
+check("sweep age-purges orphaned session_bust rows past the slack",
+      res_sw["session_busts_dropped"] >= 1 and bust_left == {"sess-bust-fresh"})
+
 # --- restart-amnesia: totals reload + since_start delta ---------------------------
 import pathlib  # noqa: E402
 
@@ -4237,6 +4267,24 @@ check("_ws_forget drops the rider latch from memory and store",
       "sess-rider-5" not in lp.transforms._RIDER_LATCH)
 for _s in (_SID_R, _SID_R2, _SID_R3, _SID_R4):
     lp.transforms._ws_forget(_s)
+
+# --- path confinement: session-param traversal + /_compact roots ------------------
+# endpoint session= params reach LOG_DIR globs; /_compact's path= is a write
+# primitive. Both must fail closed on traversal shapes.
+check("_session_dir passes a normal id through",
+      lp.core._session_dir("abc-123") == lp.core.LOG_DIR / "abc-123")
+check("_session_dir confines traversal shapes to the reserved bucket",
+      all(lp.core._session_dir(s) == lp.core.LOG_DIR / "_invalid-session-id"
+          for s in ("../../etc", "..", ".", "", None, "a/b", "a\\b", "/abs")))
+_saved_roots = lp.server.COMPACT_PATH_ROOTS
+lp.server.COMPACT_PATH_ROOTS = [os.path.realpath("/tmp/tx-root")]
+_rp_in, _ok_in = lp.server._compact_path_allowed("/tmp/tx-root/proj/s.jsonl")
+_rp_out, _ok_out = lp.server._compact_path_allowed("/tmp/tx-root/../etc/passwd")
+_rp_pfx, _ok_pfx = lp.server._compact_path_allowed("/tmp/tx-rootEVIL/s.jsonl")
+check("compact path inside the root is allowed", _ok_in)
+check("compact path traversal out of the root is refused (realpath, not prefix)",
+      not _ok_out and not _ok_pfx)
+lp.server.COMPACT_PATH_ROOTS = _saved_roots
 
 print()
 if FAILS:

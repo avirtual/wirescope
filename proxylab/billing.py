@@ -404,7 +404,7 @@ def _accumulate(bill, session_key, stop=None, line=None):
     # deep-copy the session snapshot: by_line nests dicts, and the writer
     # thread serializes AFTER we return — a shallow dict() would let the next
     # turn's bump race the json.dumps (dict-changed-during-iteration).
-    writer_mod._enqueue_json(core_mod.LOG_DIR / session_key / "_session.json",
+    writer_mod._enqueue_json(core_mod._session_dir(session_key) / "_session.json",
                              json.loads(json.dumps(sess)))
     return snap
 

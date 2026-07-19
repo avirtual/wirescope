@@ -41,8 +41,9 @@ Proxies launch via `./start_proxy.sh` / `./restart_proxy.sh` (nohup+disown → P
 A `run_in_background` Bash job dies with the CLI — never launch the proxy that way.
 `start` refuses a bound port; `restart` kills + starts.
 Script defaults add `STRIP_COMPACT_CACHE=1 WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1
-WS_SPAWNER_HINT=1 WS_OMIT_DEFAULT=useremail`, via `${VAR-default}` so an explicit
-0/empty sticks.
+WS_SPAWNER_HINT=1 WS_OMIT_DEFAULT=useremail STRIP_MCP_SERVERS=claude_design`, via
+`${VAR-default}` so an explicit 0/empty sticks — note this means every scratch arm
+also strips the `claude_design` connector unless you pass `STRIP_MCP_SERVERS=`.
 The wirescope flags are ON by canonical-script default (a fresh clone needs no
 release.env) but stay OFF in CODE (library embeddings/tests unaffected).
 `start_proxy.sh` also sources `release.env` (gitignored, per-machine — fills only
@@ -97,12 +98,14 @@ The SessionEnd→`/_end` hook is installed user-level in `~/.claude/settings.jso
 
 ## Test suites (gate every release)
 
-Run after any edit in the matching area — all three gate a release cut:
-- `python3 test_warmth_store.py` — 161 offline checks — after any
-  warmth/pricing/hold/persistence edit.
-- `python3 test_subscribers.py` — 52 offline checks — after any subs/tee/server-wiring
-  edit.
-- `python3 test_fold.py` — 68-session replay — after any strip/fold edit.
+`release.sh` runs **every `test_*.py` in the repo root** (glob, since 2026-07-19 — a new suite is gated the day it lands; before that an explicit six-suite list had silently omitted test_bake/test_pot).
+All are offline script-style suites (`python3 test_X.py`, exit 0 + `ALL PASS`; not pytest). Run the matching one after any edit in its area:
+- `test_warmth_store.py` — the grab-bag: warmth/pricing/hold/persistence/strip-latch/path-confinement (~600 checks).
+- `test_subscribers.py` — subs/tee/server-wiring.
+- `test_fold.py` — replay corpus for the L2 strip/fold family.
+- `test_scrap_tail.py`, `test_strip_tools.py`, `test_marker_budget.py` — their named transforms.
+- `test_bake.py` — offline transcript bake (`bake_session.py` / `/_compact` core).
+- `test_pot.py` — the /_pot rollup.
 
 ## Offline analysis + A/B proof tooling
 

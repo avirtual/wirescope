@@ -54,6 +54,20 @@ UPSTREAM = "https://api.anthropic.com"
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/tmp/proxyclone/logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _session_dir(session):
+    """LOG_DIR/<session>, traversal-confined. Endpoint `session=` params reach
+    filesystem globs (/_report, /_timeline, /_session, /_context&utilization),
+    so a traversal-shaped id ('../..', absolute, or anything with a separator)
+    must not escape the capture root. Real ids are single path components
+    (UUIDs / the NO_SESSION bucket). Invalid ids map to a reserved never-created
+    name so every caller's existing is_dir()/OSError guard fails closed — no
+    call-site changes, no new error paths."""
+    s = str(session or "")
+    if not s or "/" in s or "\\" in s or s in (".", ".."):
+        return LOG_DIR / "_invalid-session-id"
+    return LOG_DIR / s
+
 # hop-by-hop + accept-encoding (we want an uncompressed SSE stream we can read)
 _HOP = {"host", "content-length", "connection", "transfer-encoding",
         "keep-alive", "proxy-authenticate", "proxy-authorization", "te",

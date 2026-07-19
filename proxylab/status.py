@@ -1009,7 +1009,7 @@ def _utilization(session):
     _context_snapshot resolves per agent, so the merge lines up. Empty map for a
     cold/absent dir."""
     out = {}
-    d = core_mod.LOG_DIR / session
+    d = core_mod._session_dir(session)
     if not d.is_dir():
         return out
     for f in sorted(d.glob("*.request.json")):
@@ -1082,7 +1082,7 @@ def _skill_utilization(session):
     Returns {key -> {evaluable_turns, by_skill: {name -> count}}}, key resolved
     the same way as _utilization ('main' / subagent agent_id-or-role)."""
     out = {}
-    d = core_mod.LOG_DIR / session
+    d = core_mod._session_dir(session)
     if not d.is_dir():
         return out
     seen = set()                          # tool_use ids counted once per session

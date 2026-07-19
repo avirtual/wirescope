@@ -171,6 +171,16 @@ Re-admit (un-strip) a whole **MCP server's** tool family for this agent, cancell
 
 Server **names** (not tool names) are matched with the same liberal separator. Same forge-safety + stickiness as the other verbs. The deployment toggle is `STRIP_MCP_SERVERS` (comma/space list of servers; empty = off); `keep-mcp` is the per-agent escape hatch.
 
+### `[wirescope:strip-thinking <off|on|l1|l2>]`
+
+Opt this **session** into the prior-turn strip ladder (the proxy ships with it globally OFF; a consumer opts individual sessions in). Levels:
+
+- `on` / `l1` / `1` / bare directive → **L1**: drop `thinking`/`redacted_thinking` blocks from COMPLETED prior turns (the current turn's signed chain is never touched). This is the value clodex emits today.
+- `l2` / `2` → **L2**: L1 plus the settled-history riders — edit-ack/tool-error stubbing, task-reminder and file-modification-diff strips. (`l3`/`3` is accepted as a back-compat alias; fold moved into L2 2026-06-20 and L3 is retired.)
+- `off` / `0` → level 0 for this session even if a deployment default (`STRIP_PRIOR_THINKING` / `STRIP_L2`) is on.
+
+Same placement rules as every verb (system body or spawn-prompt head, never message content), **sticky** per session, last directive wins; a later turn carrying a new value updates it. The programmatic twin is `GET/POST /_strip?session=<id>&on=1|0` or `&level=0|1|2` (`action=clear` drops the override back to the deployment default; a bare POST with none of these is a 400, it no longer implies on=1). The actual strip decision is additionally **cold-gated and latched** per session (anti-flap: it is only ever established on a cold prefix, so opting in mid-session never busts a warm cache; see CLAUDE.md `STRIP_PRIOR_THINKING`).
+
 ## Directives are consumed, not forwarded
 
 The proxy reads and acts on directives, then **strips them before forwarding upstream** — body directives from the system prompt (every `[wirescope:...]` line), and spawn directives from the prompt head (only the consumed leading lines).

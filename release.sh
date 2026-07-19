@@ -29,14 +29,12 @@ if ! grep -q "^## $VERSION\b" CHANGELOG.md 2>/dev/null; then
   echo "WARNING: CHANGELOG.md has no '## $VERSION' entry — add one (top of file) so the release is self-describing." >&2
 fi
 
-# Gate on the offline test suites.
+# Gate on ALL the offline test suites (every test_*.py — a new suite is gated
+# the day it lands, no list to forget to extend).
 echo "running test suites…"
-python3 test_warmth_store.py >/dev/null
-python3 test_subscribers.py >/dev/null
-python3 test_fold.py >/dev/null
-python3 test_scrap_tail.py >/dev/null
-python3 test_strip_tools.py >/dev/null
-python3 test_marker_budget.py >/dev/null
+for t in test_*.py; do
+  python3 "$t" >/dev/null || { echo "FAILED: $t" >&2; exit 1; }
+done
 echo "tests OK"
 
 git tag -a "$VERSION" -m "proxy release $VERSION"
