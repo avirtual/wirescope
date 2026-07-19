@@ -5,6 +5,25 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.37 — 2026-07-19
+
+Introspection-audit release: no new features — hardening, hygiene and doc catch-up from the 2026-07-19 five-agent code audit. All 8 suites green + live-smoked on a scratch instance before cut.
+
+- **Quick-wins tier:**
+  - Captures: response headers now pass `_safe_headers`; `set-cookie` added to `_SECRET_HEADERS` (codex/Cloudflare session cookies were persisting verbatim into `.response.json`).
+  - Billing: `PRICES_DATED` overlay in `_price_for` — the sonnet-5 intro→standard price cutover applies itself on 2026-09-01 (was a manual-edit time bomb).
+  - `WIRESCOPE_PASSTHROUGH` now covers the RESPONSE side too (`_resp_mutating`/`_relay_active` return False, SC local-answer skipped) — the A/B control arm could previously still mutate responses.
+  - Server error surfacing: parse try split from transform-chain try and summary/meta try — a proxy bug no longer masquerades as client `parse_error` while silently degrading capture; loud `[transform-error]`/`[meta-error]` prints + `core.ERROR_COUNTS` exposed as `/_status` `proxy.error_counts`. Original bytes still forward fail-open.
+  - Endpoint edge cases: `/_status` `/_warm` `/_ping` `/_end` rstrip trailing slashes (`GET /_ping/` used to fall through to the upstream forwarder as a REAL billed request); bare `POST /_strip` no longer silently defaults to L1 — explicit `on=`/`level=`/`action=` required (400 otherwise).
+  - Transforms hygiene: `_sidecall_kind` cheap-rejects before any full-body dump; dead `_compact_condition_met` deleted; stale `_STRIP_OVERRIDE` "in memory only" comment corrected. Fold now uses the shared `_settled_boundary` (was the one inline recompute the project rule forbids) and is covered by the inspect-source enforcement.
+- **Medium tier:**
+  - Sweeper age-purges (`WARMTH_PURGE_SLACK`): dead-owner `last_request` rows and never-deleted `session_bust` rows — both structurally unreachable by any existing purge — now age out.
+  - Codex WS tunnel: connection-level frame log flushes in 2000-frame chunks (`{stem}.frames-NNN.json`) — bounds RSS on day-long multiplexed connections, crash loses at most one chunk; per-turn receipt ts instead of connection-open ts.
+  - Path confinement: `core._session_dir` (traversal-confined LOG_DIR join) swapped into every endpoint `session=` glob AND the header-derived capture-WRITE paths; `/_compact` `path=` confined to `COMPACT_PATH_ROOTS` (default `~/.claude/projects`) → `{ok:false, reason:"path_outside_root"}`.
+  - `release.sh` gates every `test_*.py` by glob (test_bake/test_pot were gated by neither; a new suite is gated the day it lands).
+  - Docs: OPERATIONS.md test section rewritten (8 suites); `STRIP_MCP_SERVERS=claude_design` added to canonical-defaults lists; WIRESCOPE.md documents `[wirescope:strip-thinking off|on|l1|l2]`; INTEGRATION.md gains `/_subagents` `/_compact` `/_strip` `/_hint` `/_pot` `/_deliver` rows + the `since_compact` shape.
+- **`/_pot` `product` field flipped `"logproxy"` → `"wirescope"`** (matches `/_identity`; clodex confirmed its potSeries() consumer never reads the field).
+
 ## v0.6.36 — 2026-07-19
 
 - **4-marker budget discipline — HARD RULE: never forward a 5th `cache_control` marker.** Root cause of the vendored-clodex hard 400s ("A maximum of 4 blocks with cache_control"): `_relocate_env_to_tail` step 4 stamped the CLAUDE.md-bundle marker unconditionally, on the baked-in assumption the CLI always ships 3 markers and leaves a slot free. True on our wire (all 32 canary namespaces here: 2 sys + 1 msg, side-calls 0) — false on the org-route layout, where the client legitimately arrives at 4 of its own (2 sys + 2 msg, or a tools marker); relocate's blind add made 5 and the API rejected the user's turn. Model-independent (sonnet + opus both hit it), invisible on any 3-marker deployment. Three cooperating fixes:
