@@ -47,6 +47,12 @@ from proxylab import writer as writer_mod
 # fact lives in the capture record as `client_markers_at_budget`).
 _CLIENT_MARKER_SEEN = set()
 
+
+class _SkipMeta(Exception):
+    """Control-flow sentinel: parse failed, so the summary/meta try below has
+    nothing to do — distinct from a real crash, which is counted + printed."""
+
+
 def _record_openai_context(obj, *, session_id, base_path, upstream_path,
                            agent, model):
     """Record Codex request metadata used by /_status, /_admin, and /_session.
@@ -498,7 +504,7 @@ async def handler(request: Request) -> Response:
 
     # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
     # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
-    if request.method == "GET" and request.url.path == "/_status":
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_status":
         q = request.query_params
         res = status_mod._status_snapshot(session=q.get("session"),
                                all_sessions=q.get("all") in ("1", "yes", "true"))
@@ -807,7 +813,7 @@ async def handler(request: Request) -> Response:
 
     # ---- warmth read endpoint (local consumers: statusline / hook / pinger) ---
     # GET /_warm?h=<prefix-hash>  or  /_warm?session=<session_id>
-    if request.method == "GET" and request.url.path == "/_warm":
+    if request.method == "GET" and request.url.path.rstrip("/") == "/_warm":
         q = request.query_params
         res = warmth_mod.warmth_query(hash_hex=q.get("h"), session=q.get("session"))
         return Response(json.dumps(res), media_type="application/json")
@@ -881,7 +887,7 @@ async def handler(request: Request) -> Response:
     # normal turn. Locates the session's cached last request and replays it as a
     # thinking-off, max_tokens:1 cache-read to slide the TTL. (force=1 re-warms a
     # provably-cold prefix instead of declining.)
-    if request.url.path == "/_ping":
+    if request.url.path.rstrip("/") == "/_ping":
         q = request.query_params
         sess = q.get("session")
         if not sess:
@@ -899,7 +905,7 @@ async def handler(request: Request) -> Response:
     # GET/POST /_end?session=<id>[&reason=clear] — wire to the CLI's SessionEnd
     # hook so a /clear or exit forgets the session's cached request immediately;
     # the background sweeper is the backstop for crashes/kills the hook misses.
-    if request.url.path == "/_end":
+    if request.url.path.rstrip("/") == "/_end":
         sess = request.query_params.get("session")
         if not sess:
             return Response(json.dumps({"ok": False, "reason": "missing ?session="}),
@@ -952,9 +958,16 @@ async def handler(request: Request) -> Response:
                                     "reason": f"bad level={level_raw!r} (0|1|2|3|l1|l2|l3)"}),
                                     status_code=400, media_type="application/json")
             new = transforms_mod._strip_thinking_set_override(sess, lv)
-        else:
-            on = (on_raw in ("1", "yes", "on", "true")) if on_raw is not None else True
+        elif on_raw is not None:
+            on = on_raw in ("1", "yes", "on", "true")
             new = transforms_mod._strip_thinking_set_override(sess, 1 if on else 0)
+        else:
+            # A bare POST used to default to enabling L1 — a state-FLIPPING
+            # default a mere probe could trigger. Require an explicit knob.
+            return Response(json.dumps({"ok": False, "session": sess,
+                            "reason": "missing on=/level=/action= (a bare POST "
+                                      "no longer implies on=1)"}),
+                            status_code=400, media_type="application/json")
         print(f"[strip] session={sess[:12]}… level={new} (global={gdef})", flush=True)
         return Response(json.dumps(_body(new)), media_type="application/json")
 
@@ -1072,9 +1085,22 @@ async def handler(request: Request) -> Response:
               # inbound transport identity — the "who" behind no-session calls
               "client": {"host": client.host, "port": client.port} if client else None,
               "request_headers": core_mod._safe_headers(request.headers)}
+    # PARSE try: failure here is genuine client-side garbage -> parse_error,
+    # verbatim passthrough. Our OWN code (transform chain, summary/meta) runs
+    # in separate trys below so a proxy bug is stamped/printed as OURS instead
+    # of masquerading as a client parse error while silently degrading capture.
     try:
         obj = json.loads(raw) if raw else {}
         record["body"] = obj
+    except Exception as e:
+        record["parse_error"] = str(e)
+        record["body_raw"] = raw.decode("utf-8", "replace")
+        obj = None
+    # Read pre-chain so a transform crash can't lose them: the per-instance
+    # subagent key + the display-name slot the chain fills in.
+    ws_display_name = None
+    agent_id = request.headers.get("x-claude-code-agent-id")
+    try:
         # VERSION-DRIFT CANARY (read-only): fingerprint the ORIGINAL CLI request
         # shape BEFORE any of our transforms, so we detect CLI/wire changes (incl.
         # a new 4th cache_control marker), not our own mutations.
@@ -1097,11 +1123,7 @@ async def handler(request: Request) -> Response:
                           f"cache markers (budget {transforms_mod._CACHE_BREAKPOINT_BUDGET}) — "
                           f"proxy adders will migrate/skip, clamp armed", flush=True)
         # EXPERIMENTAL piggyback: mutate the outbound payload, forward modified bytes
-        ws_display_name = None     # captured pre-strip below; passed to meta
-        # Per-instance key (present iff subagent, stable across that instance's
-        # turns): threads into _ws_omit so a spawn directive remembered on turn 1
-        # re-applies on continuation turns; reused for _capture_session_meta below.
-        agent_id = request.headers.get("x-claude-code-agent-id")
+        # (ws_display_name / agent_id are initialized above the try)
         # PASSTHROUGH (A/B control arm): skip the entire mutation chain so the
         # forwarded bytes equal the received bytes. Capture/billing/warmth below
         # still run (they only read obj). One guard instead of N per-feature 0s.
@@ -1390,6 +1412,19 @@ async def handler(request: Request) -> Response:
                           flush=True)
             if changed:
                 raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        # OUR bug, not the client's: forward the ORIGINAL bytes fail-open (raw
+        # is only reassigned after the whole chain succeeds, so a mid-chain
+        # partial mutation never reaches the wire) — but say so LOUDLY and
+        # count it: a persistent crash here must not look like client garbage.
+        record["transform_error"] = repr(e)
+        core_mod.ERROR_COUNTS["transform_errors"] += 1
+        print(f"[transform-error] #{n} {agent} {type(e).__name__}: {e} — "
+              "request forwarded verbatim (fail-open), transforms skipped",
+              flush=True)
+    try:
+        if obj is None:
+            raise _SkipMeta   # parse failed above — nothing to summarize
         role = writer_mod._classify_role(obj, agent_id=agent_id)
         model = obj.get("model")
         session_id, account_uuid, device_id = writer_mod._session_ids(obj)
@@ -1451,9 +1486,15 @@ async def handler(request: Request) -> Response:
                     and _new_tic < _prev_tic
                 pot_mod.ingest(session_id, obj, _is_compact)
                 meta_mod._CONTEXT_STATS[session_id] = {**_ts, "ts": time.time()}
+    except _SkipMeta:
+        pass
     except Exception as e:
-        record["parse_error"] = str(e)
-        record["body_raw"] = raw.decode("utf-8", "replace")
+        # summary/meta/pot crashed — attribution for this request degrades
+        # (may land under NO_SESSION) but the forward is unaffected. Loud.
+        record["meta_error"] = repr(e)
+        core_mod.ERROR_COUNTS["meta_errors"] += 1
+        print(f"[meta-error] #{n} {agent} {type(e).__name__}: {e} — "
+              "summary/meta capture degraded for this request", flush=True)
 
     # one subdirectory per session; count_tokens/probes (no metadata) -> NO_SESSION
     session_key = session_id or writer_mod.NO_SESSION
@@ -1495,7 +1536,10 @@ async def handler(request: Request) -> Response:
     # already modified by the CLI before it sent this request, so nothing about
     # the edit is lost — only the redundant round trip to hear the model stop.
     sc = None
-    if isinstance(obj, dict) and upstream_path.split("?")[0].endswith("/v1/messages"):
+    # not-PASSTHROUGH: the control arm must never answer locally — SC elides a
+    # real upstream turn, the strongest possible deviation from byte-verbatim.
+    if (isinstance(obj, dict) and not transforms_mod.PASSTHROUGH
+            and upstream_path.split("?")[0].endswith("/v1/messages")):
         # RELAY (model's own prose, matched by tool_use_id) takes precedence; in
         # relay mode the sentinel is stripped from history so the canned path
         # won't fire. Without relay, fall back to the history-sentinel decision.

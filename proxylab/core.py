@@ -103,9 +103,19 @@ _ROUTE = re.compile(r"^/agent/(?P<name>[A-Za-z0-9_.-]+)/anthropic(?P<rest>/.*)?$
 # calling CLI process/build/account (the "who sent this" the metadata omits).
 # Secrets are redacted — never write the caller's API key to disk.
 _SECRET_HEADERS = {"authorization", "x-api-key", "cookie", "proxy-authorization",
-                   "chatgpt-account-id", "openai-api-key"}
+                   "chatgpt-account-id", "openai-api-key",
+                   # response-side: upstream CDNs (Cloudflare on the codex
+                   # backend) set live session cookies — never persist them
+                   "set-cookie"}
 
 
 def _safe_headers(headers):
     return {k: ("<redacted>" if k.lower() in _SECRET_HEADERS else v)
             for k, v in headers.items()}
+
+
+# Process-wide error counters (server increments, /_status reads — lives here
+# because core is the one module everyone may import). A nonzero
+# transform_errors means OUR chain crashed on some shape and the request
+# forwarded fail-open with degraded capture — loud, not silent.
+ERROR_COUNTS = {"transform_errors": 0, "meta_errors": 0}

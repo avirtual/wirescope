@@ -284,6 +284,9 @@ def snapshot(days=RETENTION_DAYS):
         totals["redundant_tokens"] += rt
         frm = mn if frm is None else min(frm, mn)
     files.sort(key=lambda x: -x["redundant_tokens"])
+    # "logproxy" predates the wirescope rename and MISMATCHES /_identity's
+    # product ("wirescope"); frozen-contract field — flip only after clodex
+    # confirms its consumer doesn't key on it (asked 2026-07-19).
     return {"product": "logproxy", "version": core_mod.VERSION,
             "window": {"from": frm, "to": datetime.date.today().isoformat(),
                        "days": days},

@@ -4007,6 +4007,12 @@ for _fn in (lp.transforms._strip_prior_thinking,
 _src2 = inspect.getsource(lp.transforms._pin_settled_breakpoint)
 check("pin uses the SHARED boundary detector",
       "_settled_boundary(msgs)" in _src2)
+# fold is dormant (FOLD_EXPERIMENTAL) but must not drift off the shared
+# detector while parked — it inlined the recompute once (audit 2026-07-19).
+import proxylab.fold as _fold_mod  # noqa: E402
+_src3 = inspect.getsource(_fold_mod.fold_read_edits)
+check("fold uses the SHARED boundary detector (no inline recompute)",
+      "_settled_boundary(msgs)" in _src3 and "max((i for" not in _src3)
 
 # 4/4 budget (2 sys + msg0 + tail) -> MIGRATE the msg0 marker to the anchor
 _o = _mk_pin_obj()

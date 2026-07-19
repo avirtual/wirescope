@@ -347,6 +347,7 @@ def _status_snapshot(session=None, all_sessions=False, limit=None):
                      "sessions_total": sessions_total,
                      "sessions_shown": len(sessions),
                      "sessions_truncated": truncated,
+                     "error_counts": dict(core_mod.ERROR_COUNTS),
                      "restored_at_start": dict(restore_mod._RESTORED),
                      "totals": dict(billing_mod._TOTALS),
                      "totals_since_start": billing_mod._since_start()},
