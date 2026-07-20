@@ -536,6 +536,15 @@ def _endpoint_auth_ok(auth_header, token_param):
 
 
 async def handler(request: Request) -> Response:
+    # ---- HEAD preflight (CLI >= Bun-1.4 builds, 2026-07-20) -------------------
+    # Newer claude CLIs HEAD the ANTHROPIC_BASE_URL once at startup as a
+    # reachability check and refuse to run ("issue with the selected model")
+    # on a non-2xx. Answer locally: a HEAD carries no body to observe, and
+    # forwarding it upstream with the agent prefix stripped would just 404.
+    if request.method == "HEAD":
+        return Response(status_code=200,
+                        headers={"X-Wirescope-Version": core_mod.VERSION})
+
     # ---- identity: "is this our proxy?" handshake for subscribers -------------
     # GET /_identity — read-only, unauthenticated, spends nothing. Lets a
     # consumer confirm product == "wirescope" + read capabilities/protocols
@@ -1789,7 +1798,7 @@ async def _lifespan(app):
 
 
 _routes = [Route("/{path:path}", handler,
-                 methods=["GET", "POST", "PUT", "DELETE"])]
+                 methods=["HEAD", "GET", "POST", "PUT", "DELETE"])]
 if codex_mod._websocket_available():
     _routes.append(WebSocketRoute("/{path:path}", websocket_handler))
 
