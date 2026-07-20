@@ -54,5 +54,23 @@ if ! git push origin HEAD "$VERSION"; then
   echo "WARNING: push failed — $VERSION exists only locally. Run: git push origin main $VERSION" >&2
 fi
 
+# Also publish a GitHub RELEASE (the human-facing Releases page) — a separate
+# step from pushing the tag, and the one that silently lapsed for
+# v0.6.25–v0.6.36 (page sat at v0.6.24 for two weeks while the code was
+# current). Notes = this version's CHANGELOG.md section; title = its heading
+# suffix when the entry carries one. Non-fatal like the push.
+if command -v gh >/dev/null; then
+  NOTES="$(awk -v v="$VERSION" '$0 ~ "^## "v" " || $0 ~ "^## "v"$" {f=1; next} /^## v/{f=0} f' CHANGELOG.md)"
+  if [ -n "$NOTES" ]; then
+    if ! printf '%s\n' "$NOTES" | gh release create "$VERSION" --title "$VERSION" --notes-file -; then
+      echo "WARNING: GitHub Release not created — run: gh release create $VERSION --notes-file <(changelog section)" >&2
+    fi
+  else
+    echo "WARNING: no CHANGELOG.md section for $VERSION — GitHub Release skipped." >&2
+  fi
+else
+  echo "WARNING: gh not installed — GitHub Release not created for $VERSION." >&2
+fi
+
 echo "release $VERSION cut -> releases/$VERSION (releases/current updated)"
 echo "deploy it on :7800 with:  ./run_release.sh"
