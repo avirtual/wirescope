@@ -2523,6 +2523,15 @@ def _strip_prior_thinking(obj, agent_id=None):
 # revert L-level sessions to settled-only stripping.
 STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "1") not in ("0", "no", "off", "false")
 STRIP_MIDTURN_KEEP = max(1, int(os.environ.get("STRIP_MIDTURN_KEEP", "1")))
+# Texture gate (AB2 postmortem 2026-07-20): a mid-turn thinking block is only
+# strippable when the NEXT thinking message landed within MAX_GAP messages of
+# it — the dense-loop shape (marathons: gap ~2). Deleting a block whose
+# successor is far away re-writes the whole span between them to reclaim a
+# few hundred tokens (measured 30x negative ROI on sparse turns); those
+# blocks are left for the settled-region strip to take from cold later. Gap
+# is frozen once the successor exists -> eligibility is deterministic and
+# monotone across rounds (a stripped block can never reappear).
+STRIP_MIDTURN_MAX_GAP = max(1, int(os.environ.get("STRIP_MIDTURN_MAX_GAP", "6")))
 
 
 def _midturn_strip_active(obj, agent_id=None):
@@ -2556,34 +2565,67 @@ def _midturn_strip_active(obj, agent_id=None):
 # (scrap-tail's argument moved inward; scrap-tail downshifts the rolling tail
 # on the same sessions, so no 1h marker follows and ordering stays legal). On
 # a non-strip session mirror the tail's ttl (a bare 5m before a 1h tail is a
-# hard 400). Durable anchors are untouched: the turn-start boundary write and
-# the settled pin stay 1h — mid-loop the settled pin YIELDS its slot to this
-# one (server chain), safe because the u_k entry was already written by the
-# turn's first request; cache entries persist, marker placement never deletes.
+# hard 400). DURABLE 1h ANCHORS ARE UNTOUCHABLE (AB2 postmortem 2026-07-20):
+# the original "settled pin yields its slot" donor design stole the 1h anchor
+# every mid-loop round, leaving the whole history on 5m-only coverage — the
+# ladder defect Bogdan spotted on the wire (marker #3 at 5m). Entries persist
+# but their 1h refresh doesn't: one >5m pause = re-write the turn span at
+# write premium, every pause. Donor preference is now 5m-only (a leftover 5m
+# loop marker, else the rolling tail when it is loop scrap — bounded cost of
+# at most one op billed uncached next round), and a hard ladder invariant
+# backstops: if no 1h message marker survives beneath the pin, the pin itself
+# is written 1h rather than leaving the settled history 5m-only.
 PIN_MIDTURN_BREAKPOINT = os.environ.get("PIN_MIDTURN_BREAKPOINT", "1") not in (
     "0", "no", "off", "false")
 
 
+def _midturn_targets(msgs, boundary):
+    """(eligible_targets, skipped_sparse, think_idx) for the current turn.
+    think_idx = thinking-bearing assistant messages after the settled
+    boundary; targets = all but the newest STRIP_MIDTURN_KEEP of them;
+    ELIGIBLE targets are the dense-loop ones — successor thinking message
+    within STRIP_MIDTURN_MAX_GAP messages (see the knob comment for the
+    economics). Shared by the strip AND the pin so they cannot disagree
+    about whether this turn's texture is worth acting on."""
+    think_idx = [i for i in range(boundary + 1, len(msgs))
+                 if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
+    if len(think_idx) <= STRIP_MIDTURN_KEEP:
+        return [], 0, think_idx
+    targets = think_idx[:-STRIP_MIDTURN_KEEP]
+    eligible, sparse = [], 0
+    for k, i in enumerate(targets):
+        if think_idx[k + 1] - i <= STRIP_MIDTURN_MAX_GAP:
+            eligible.append(i)
+        else:
+            sparse += 1
+    return eligible, sparse, think_idx
+
+
 def _strip_midturn_thinking(obj, agent_id=None):
     """Inside the CURRENT turn (at/after the settled boundary), delete
-    thinking blocks from every thinking-bearing assistant message EXCEPT the
-    last STRIP_MIDTURN_KEEP of them. Prior turns untouched (that's
-    _strip_prior_thinking's region). Whole-block deletion only — signatures
-    never edited. Gated per-session via _midturn_strip_active (L1+, same
-    channel as the settled strip). Returns a log dict or None."""
+    thinking blocks from every ELIGIBLE thinking-bearing assistant message
+    behind the keep-window (dense-loop texture only — _midturn_targets).
+    Prior turns untouched (that's _strip_prior_thinking's region). Whole-block
+    deletion only — signatures never edited. Gated per-session via
+    _midturn_strip_active (L1+, same channel as the settled strip). Returns a
+    log dict or None."""
     if not _midturn_strip_active(obj, agent_id):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
     boundary = _settled_boundary(msgs)
-    think_idx = [i for i in range(boundary + 1, len(msgs))
-                 if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
-    if len(think_idx) <= STRIP_MIDTURN_KEEP:
+    eligible, skipped_sparse, think_idx = _midturn_targets(msgs, boundary)
+    if not eligible:
+        if skipped_sparse:                # thinking present, texture-gated
+            return {"stripped": False, "reason": "sparse_turn",
+                    "skipped_sparse_blocks": skipped_sparse,
+                    "max_gap": STRIP_MIDTURN_MAX_GAP,
+                    "current_turn_thinking_msgs": len(think_idx),
+                    "boundary_idx": boundary}
         return None                       # nothing behind the keep-window yet
-    targets = think_idx[:-STRIP_MIDTURN_KEEP]
     removed = stripped_chars = touched = 0
-    for i in targets:
+    for i in eligible:
         c = msgs[i].get("content")
         if not isinstance(c, list):
             continue
@@ -2600,6 +2642,7 @@ def _strip_midturn_thinking(obj, agent_id=None):
             "touched_messages": touched, "stripped_chars": stripped_chars,
             "keep_window": STRIP_MIDTURN_KEEP, "boundary_idx": boundary,
             "current_turn_thinking_msgs": len(think_idx),
+            "skipped_sparse_blocks": skipped_sparse,
             "total_messages": len(msgs)}
 
 
@@ -2636,6 +2679,16 @@ def _pin_midturn_breakpoint(obj, agent_id=None):
     head = _midturn_head_idx(msgs, boundary)
     if head is None or head <= 0:
         return None                       # no moving frontier to anchor
+    eligible, skipped_sparse, _ = _midturn_targets(msgs, boundary)
+    if not eligible:
+        # Texture-gated turn: the strip isn't deleting anything, so the turn
+        # is append-only on the wire and the CLI's rolling tail already
+        # chains it — a pin would spend budget for nothing.
+        if skipped_sparse:
+            return {"pinned": False, "reason": "sparse_turn",
+                    "skipped_sparse_blocks": skipped_sparse,
+                    "head_idx": head, "boundary_idx": boundary}
+        return None
     pin_idx = head - 1
     if pin_idx == len(msgs) - 1:
         return None                       # would collide with the rolling tail
@@ -2668,24 +2721,54 @@ def _pin_midturn_breakpoint(obj, agent_id=None):
         cc = dict(markers[-1][2]["cache_control"])
     donor_idx = None
     if len(markers) >= _CACHE_BREAKPOINT_BUDGET:
-        # Donor = the HIGHEST-index message marker strictly below the pin,
-        # excluding the rolling tail: typically the settled-turn anchor, whose
-        # 1h entry the turn-first request already wrote (entries persist;
-        # removing the MARKER deletes nothing) and whose prefix the op-1 pin's
-        # cumulative coverage subsumes. Deeper markers (msg0 bundle = the
-        # cross-instance sharing anchor) are kept by preference.
+        # Donor is 5m-ONLY — NEVER a 1h marker (AB2 postmortem 2026-07-20:
+        # the old highest-below-pin rule stole the settled 1h anchor every
+        # mid-loop round, leaving the whole history on 5m-only coverage).
+        # Preference: (1) a 5m message marker strictly below the pin (not
+        # msg0 — the cross-instance sharing anchor — and not the tail);
+        # (2) the rolling TAIL marker itself when it is loop scrap (past the
+        # boundary; scrap-tail downshifts it to 5m under this same gate) —
+        # losing it costs at most one op billed uncached next round, and the
+        # pin takes over round-to-round chaining; (3) else decline — a
+        # skipped pin is one round without an exact entry hit, strictly
+        # cheaper than surrendering 1h coverage.
+        def _is_5m(b):
+            return (b.get("cache_control") or {}).get("ttl", "5m") == "5m"
         last_mi = len(msgs) - 1
         donor = next(((r, i, b) for r, i, b in reversed(markers)
-                      if r == "messages" and i < pin_idx and i != last_mi), None)
+                      if r == "messages" and 0 < i < pin_idx
+                      and i != last_mi and _is_5m(b)), None)
+        if donor is None:
+            tail = next(((r, i, b) for r, i, b in reversed(markers)
+                         if r == "messages" and i == last_mi), None)
+            if (tail is not None and tail[1] > boundary
+                    and (_is_5m(tail[2]) or SCRAP_TAIL_5M)):
+                donor = tail
         if donor is None:
             return {"pinned": False, "reason": "budget_full_no_donor",
                     "pin_idx": pin_idx, "head_idx": head,
                     "markers_total": len(markers)}
         donor[2].pop("cache_control")
         donor_idx = donor[1]
-        mode = "migrated"
+        mode = "migrated_tail" if donor_idx == last_mi else "migrated"
     else:
         mode = "added"
+    # Ladder invariant (the defect's backstop, checked AFTER donor removal):
+    # never leave the message history on 5m-only coverage. System-side 1h
+    # markers cover tools+system, not messages; without a 1h message anchor
+    # below the pin, the settled history rides 5m entries — one >5m pause
+    # re-writes it at premium, every pause. When NO message marker survives
+    # below the pin at all, write the pin itself 1h (cumulative entry covers
+    # the full prefix; one 2x write buys durable coverage — legal, nothing
+    # 5m precedes it). When a surviving 5m marker sits below, the pin MUST
+    # stay 5m (a 1h marker after a 5m one is a hard 400, longer TTLs first)
+    # — coverage there is no worse than the incoming shape.
+    if cc.get("ttl", "5m") == "5m":
+        below = [(b.get("cache_control") or {}).get("ttl", "5m")
+                 for r, i, b in markers
+                 if r == "messages" and i < pin_idx and b.get("cache_control")]
+        if not below:
+            cc = {"type": "ephemeral", "ttl": "1h"}
     if needs_convert:
         tgt["content"] = [{"type": "text", "text": c}]
     tgt["content"][-1]["cache_control"] = cc
