@@ -1354,11 +1354,18 @@ async def handler(request: Request) -> Response:
                 record["strip_midturn_thinking"] = smt
                 changed = True
             # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
-            # with "ok" — but ONLY inside the region the thinking-strip just busted
-            # (free-rider). Originating its own bust to reclaim ~1.4k tok/turn is a
-            # ~1400-turn loss, so when thinking didn't strip (spt None/declined) we
-            # pass busted_from=None and it collapses nothing. Current turn untouched.
-            busted_from = spt.get("earliest_idx") if (spt and spt.get("stripped")) else None
+            # with "ok" — but ONLY inside a region that is ALREADY (really) busted.
+            # 2026-07-20: the thinking-strip's earliest_idx is NO LONGER a valid
+            # bust source. With the mid-turn strip + marker gate active, current-
+            # turn thinking is pre-stripped in-turn and the marker never caches it,
+            # so at the transition the prior-thinking strip re-converges to
+            # already-stripped bytes = BYTE-NEUTRAL (no real bust). Feeding its
+            # earliest_idx to the riders made them ORIGINATE the bust they thought
+            # they were riding (the AB3 phantom-bust leak). The ONLY legitimate
+            # busted_from now is the rider LATCH (a real cold write, established
+            # under its own cold-gate). Errors no longer ride this at all — they
+            # moved to the deterministic consumed-vs-live model below.
+            busted_from = None
             # RIDER LATCH (v0.6.26): once a session's riders are latched
             # full-range they fire on EVERY request like fold — deterministic
             # replay, so baked resumes (no prior thinking -> spt no-ops) still
@@ -1380,14 +1387,16 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_edit_acks"] = sea
                 if sea.get("collapsed_edit_acks"):
                     changed = True
-            # STUB PRIOR-TURN FAILED CALLS (experimental, scratch-port A/B; OFF on
-            # :7800): a failed Edit etc. re-rides as the fat tool_use input + its
-            # is_error result; in a completed prior turn the recovery is already
-            # recorded downstream, so both halves are deadweight. Free-rides the
-            # SAME thinking-strip bust as the edit-ack strip (busted_from=None ->
-            # strips nothing). Current turn's error kept (live retry signal).
-            ste = transforms_mod._strip_prior_tool_errors(
-                obj, agent_id=agent_id, busted_from=busted_from)
+            # STUB CONSUMED FAILED CALLS (CONSUMED-vs-LIVE model, 2026-07-20): a
+            # failed Edit etc. re-rides as the fat tool_use input + its is_error
+            # result; once the model has REACTED to it (a later assistant message
+            # exists) both halves are deadweight. Stubbed DETERMINISTICALLY every
+            # turn (no busted_from) so the stub is first cached already-final and
+            # never mutates-after-caching → never originates a bust (the AB3 leak
+            # fix). The LIVE frontier error (no reaction yet) is kept — it's the
+            # model's retry signal, and the marker gate above keeps it out of
+            # cache so its later stubbing is bust-free too.
+            ste = transforms_mod._strip_consumed_tool_errors(obj, agent_id=agent_id)
             if ste:
                 record["strip_prior_tool_errors"] = ste
                 if ste.get("stubbed_error_results") or ste.get("stubbed_failed_calls"):

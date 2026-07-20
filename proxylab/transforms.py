@@ -2575,6 +2575,20 @@ MIDTURN_MARKER_GATE = os.environ.get("MIDTURN_MARKER_GATE", "1") not in (
     "0", "no", "off", "false")
 
 
+def _last_assistant_idx(msgs):
+    """Index of the LAST assistant message (or None). The 'live frontier' pivot
+    shared by the current-turn strips + the marker gate: thinking is LIVE only
+    at this index (the API signature requirement binds here and only here); an
+    error is LIVE only AFTER this index (a frontier tool_result the model hasn't
+    reacted to yet). Everything below it is CONSUMED — a later assistant message
+    exists, so it has already had its reaction and is deletable/stubbable. Shared
+    helper (no inline `max((i for` recompute) so the strips and the gate agree on
+    the frontier by construction."""
+    return max((i for i in range(len(msgs))
+                if isinstance(msgs[i], dict) and msgs[i].get("role") == "assistant"),
+               default=None)
+
+
 def _midturn_targets(msgs, boundary):
     """(targets, protected_idx, think_idx) for the current turn. think_idx =
     thinking-bearing assistant messages after the settled boundary;
@@ -2635,13 +2649,18 @@ def _strip_midturn_thinking(obj, agent_id=None):
 
 
 def _midturn_marker_gate(obj, agent_id=None):
-    """The placement decision (see block comment above): when the current
-    turn's last assistant message carries protected thinking, pull the CLI's
-    rolling tail marker back to the last stable message (or drop it on the
-    turn's first thinking round, where the boundary anchor already covers
-    everything stable). Clean-tail rounds and transition requests return None
-    — byte-stock. Every message marker ABOVE the halt point is removed (any
-    of them would cache doomed bytes). Returns a log dict or None."""
+    """The placement decision (see block comment above): never let the CLI's
+    rolling tail marker cache a LIVE block — one the model still owes a reaction
+    to and that a later turn will therefore delete or stub. Two live classes
+    (2026-07-20 generalization, Bogdan): (a) THINKING in the last assistant
+    message (stripped the moment it stops being last), and (b) a frontier ERROR
+    tool_result AFTER the last assistant message (stubbed the moment the model
+    reacts to it) — 'if current_block is thinking or error, don't write marker'.
+    Pull the tail marker back to the last stable message below the LOWEST live
+    block (or drop it on the turn's first round, where the boundary anchor
+    already covers everything stable). Clean-tail rounds and transition requests
+    return None — byte-stock. Every message marker ABOVE the halt point is
+    removed (any would cache a doomed byte). Returns a log dict or None."""
     if not MIDTURN_MARKER_GATE or not _midturn_strip_active(obj, agent_id):
         return None
     msgs = obj.get("messages")
@@ -2652,20 +2671,38 @@ def _midturn_marker_gate(obj, agent_id=None):
                      if msgs[i].get("role") == "assistant"), default=None)
     if last_asst is None:
         return None                       # transition / turn-first: stock wire
-    if not _msg_thinking_chars(msgs[last_asst]):
+    live = []                             # lowest-first list of LIVE block idxs
+    if _msg_thinking_chars(msgs[last_asst]):
+        live.append(last_asst)            # (a) protected thinking
+    if STRIP_PRIOR_TOOL_ERRORS or _strip_l2_enabled(obj, agent_id):
+        # (b) frontier error: the lowest user tool_result AFTER last_asst that
+        # carries an is_error (only meaningful when the error strip is active —
+        # otherwise nothing will stub it, so there is nothing to protect).
+        for j in range(last_asst + 1, len(msgs)):
+            m = msgs[j]
+            if (isinstance(m, dict) and m.get("role") == "user"
+                    and isinstance(m.get("content"), list)
+                    and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                            and b.get("is_error") for b in m["content"])):
+                live.append(j)
+                break
+    if not live:
         return None                       # clean tail: CLI marker stands
+    lowest_live = min(live)
     marked = [(i, blk) for i, m in enumerate(msgs) if isinstance(m, dict)
               for blk in (m.get("content") if isinstance(m.get("content"), list) else [])
               if isinstance(blk, dict) and blk.get("cache_control")]
-    halt = last_asst - 1                  # >= boundary by construction
+    halt = lowest_live - 1                # >= boundary by construction
     if not marked or marked[-1][0] <= boundary:
         return {"acted": False, "reason": "no_inturn_tail_marker",
-                "protected_idx": last_asst, "boundary_idx": boundary}
+                "protected_idx": last_asst, "lowest_live_idx": lowest_live,
+                "boundary_idx": boundary}
     if marked[-1][0] <= halt:
-        # marker already sits below the doomed block — nothing doomed is
+        # marker already sits below the lowest live block — nothing live is
         # cached; leave placement alone.
         return {"acted": False, "reason": "tail_below_protected",
-                "tail_idx": marked[-1][0], "protected_idx": last_asst}
+                "tail_idx": marked[-1][0], "protected_idx": last_asst,
+                "lowest_live_idx": lowest_live}
     tail_ttl = (marked[-1][1].get("cache_control") or {}).get("ttl") or "5m"
     dropped = 0
     for i, blk in marked:
@@ -2673,7 +2710,8 @@ def _midturn_marker_gate(obj, agent_id=None):
             blk.pop("cache_control", None)
             dropped += 1
     log = {"acted": True, "tail_idx": marked[-1][0], "halt_idx": halt,
-           "protected_idx": last_asst, "boundary_idx": boundary,
+           "protected_idx": last_asst, "lowest_live_idx": lowest_live,
+           "live_error": any(x > last_asst for x in live), "boundary_idx": boundary,
            "markers_dropped": dropped, "total_messages": len(msgs)}
     if halt <= boundary:
         # first round of the turn: the boundary anchor (settled pin, advanced)
@@ -2781,39 +2819,46 @@ def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
 
-def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
-    """Stub both halves of a FAILED tool call in COMPLETED prior turns: the
-    assistant `tool_use.input` (the fat old_string/new_string the model tried)
-    AND its paired error `tool_result.content`, matched by tool_use_id. A call is
-    "failed" iff its result carries a truthy `is_error`. Envelopes preserved
-    (tool_use id/type/name; result tool_use_id/type/is_error) — only the args
-    object / body string are replaced with byte-stable constants, so the API
-    pairing holds and the stripped prefix stays stable as the boundary advances.
-    ECONOMIC GATE — identical to the edit-ack strip: confined to [busted_from,
-    last_user), the region the thinking-strip ALREADY busted this turn; with
-    busted_from None (thinking didn't fire/declined) we strip NOTHING, since
-    originating a fresh bust to reclaim bursty error text is a ~1400-turn loss.
-    Current turn untouched (its error is the live retry signal). Gated by
-    the per-session L2 level (or the STRIP_PRIOR_TOOL_ERRORS scratch-A/B flag).
-    Returns a log dict or None."""
+def _strip_consumed_tool_errors(obj, agent_id=None):
+    """Stub both halves of a FAILED tool call once it has been CONSUMED — the
+    assistant `tool_use.input` (the fat old/new string the model tried) AND its
+    paired error `tool_result.content`, matched by tool_use_id. A call is
+    "failed" iff its result carries a truthy `is_error`; it is "consumed" iff its
+    error result sits BELOW the last assistant message (`idx < last_asst`), i.e.
+    the model has already produced its reaction to that error. Envelopes
+    preserved (tool_use id/type/name; result tool_use_id/type/is_error) — only
+    the args object / body string are replaced with byte-stable constants, so
+    the API pairing holds and the stripped bytes stay stable turn to turn.
+
+    NEW MODEL (2026-07-20, Bogdan): the axis is CONSUMED vs LIVE, not prior vs
+    current turn. The LIVE frontier error (in a user message AFTER last_asst, no
+    reaction yet) is untouched — it is the model's working retry signal, treated
+    exactly like current-turn thinking. Everything consumed is stubbed
+    DETERMINISTICALLY every turn (no `busted_from`, no free-rider premise): the
+    stub is a constant and "consumed" is monotone (once a later assistant exists,
+    it exists forever), so the first prefix that caches a stubbed span caches it
+    ALREADY-FINAL and it can never mutate-after-caching → the strip never
+    originates a bust (that phantom bust was the AB3 leak). Paired with the marker
+    gate, which keeps the LIVE error out of cache so its later stubbing is
+    bust-free too. Gated by the per-session L2 level (or the
+    STRIP_PRIOR_TOOL_ERRORS scratch-A/B flag). Returns a log dict or None."""
     if not isinstance(obj, dict):
         return None
     if not (STRIP_PRIOR_TOOL_ERRORS or _strip_l2_enabled(obj, agent_id)):
         return None
-    if busted_from is None:               # no already-busted region to ride -> skip
-        return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = _settled_boundary(msgs)
-    if last_user <= 0:
+    last_asst = _last_assistant_idx(msgs)
+    if not last_asst:                     # None or 0: nothing consumed below it
         return None
-    # Pass 1 (user side): stub error result bodies in the busted region; collect
-    # their tool_use_ids so pass 2 can find the matching failed calls.
+    # Pass 1 (user side): stub CONSUMED error result bodies (idx < last_asst);
+    # collect their tool_use_ids so pass 2 can find the matching failed calls.
     error_ids = set()
     stripped_chars = stubbed_results = stubbed_calls = touched_msgs = 0
-    for i, m in enumerate(msgs):
-        if i < busted_from or i >= last_user or m.get("role") != "user":
+    for i in range(last_asst):
+        m = msgs[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
             continue
         c = m.get("content")
         if not isinstance(c, list):
@@ -2840,11 +2885,12 @@ def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
             touched_msgs += 1
     if not error_ids:
         return None
-    # Pass 2 (assistant side): stub the input of each failed tool_use in the
-    # busted region whose id matched an error result (the larger half).
+    # Pass 2 (assistant side): stub the input of each failed tool_use below
+    # last_asst whose id matched a consumed error result (the larger half).
     stub_len = len(json.dumps(ERROR_CALL_STUB, default=str))
-    for i, m in enumerate(msgs):
-        if i < busted_from or i >= last_user or m.get("role") != "assistant":
+    for i in range(last_asst):
+        m = msgs[i]
+        if not isinstance(m, dict) or m.get("role") != "assistant":
             continue
         c = m.get("content")
         if not isinstance(c, list):
@@ -2870,8 +2916,8 @@ def _strip_prior_tool_errors(obj, agent_id=None, busted_from=None):
         return None
     return {"stripped": True, "stubbed_error_results": stubbed_results,
             "stubbed_failed_calls": stubbed_calls, "touched_messages": touched_msgs,
-            "stripped_chars": stripped_chars, "rode_bust_from": busted_from,
-            "boundary_idx": last_user, "total_messages": len(msgs)}
+            "stripped_chars": stripped_chars, "last_asst_idx": last_asst,
+            "total_messages": len(msgs)}
 
 
 # ---- PIN SETTLED BREAKPOINT (cache-anchor placement, default ON) -----------

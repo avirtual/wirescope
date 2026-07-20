@@ -235,6 +235,63 @@ rec = t._strip_midturn_thinking(b)
 check("clean-tail strip removed all", rec and rec["removed_thinking_blocks"] == 2)
 check("gate stock on clean tail post-strip", t._midturn_marker_gate(b) is None)
 
+print("== consumed error strip + live-error marker gate (2026-07-20) ==")
+t.STRIP_PRIOR_TOOL_ERRORS = True
+
+
+def fail_call_msg(n):
+    return {"role": "assistant", "content": [
+        {"type": "tool_use", "id": f"e{n}", "name": "Edit",
+         "input": {"old_string": "x" * 120, "new_string": "y" * 120}}]}
+
+
+def err_result_msg(n):
+    return {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": f"e{n}",
+         "content": "boom " * 30, "is_error": True}]}
+
+
+# [0]user [1]fail-call e0 [2]err e0 [3]assistant reaction [4]LIVE err e1
+emsgs = [{"role": "user", "content": "task"},
+         fail_call_msg(0), err_result_msg(0),
+         plain_msg(1), err_result_msg(1)]
+b = body(copy.deepcopy(emsgs))
+rec = t._strip_consumed_tool_errors(b)
+check("consumed strip fires", rec and rec.get("stripped") is True, str(rec))
+check("consumed call stubbed (1)", rec and rec["stubbed_failed_calls"] == 1, str(rec))
+check("consumed error result stubbed (1)", rec and rec["stubbed_error_results"] == 1, str(rec))
+check("consumed call input replaced with stub",
+      b["messages"][1]["content"][0]["input"] == t.ERROR_CALL_STUB)
+check("consumed error body replaced with marker",
+      b["messages"][2]["content"][0]["content"] == t.ERROR_ELIDED_MARKER)
+check("LIVE frontier error UNTOUCHED (still the model's retry signal)",
+      b["messages"][4]["content"][0]["content"] == "boom " * 30)
+
+# determinism: re-running is a no-op (idempotent, byte-stable)
+rec2 = t._strip_consumed_tool_errors(b)
+check("consumed strip idempotent (second pass None)", rec2 is None, str(rec2))
+
+# marker gate relocates below a LIVE error even with NO thinking in last_asst
+b = body(copy.deepcopy(emsgs), msg_markers=((4, "1h"),))
+t._strip_consumed_tool_errors(b)          # in-turn strip runs first (as in server)
+g = t._midturn_marker_gate(b)
+check("gate acts on a live-error tail (no thinking)", g and g.get("acted") is True, str(g))
+check("gate flags the live error", g and g.get("live_error") is True, str(g))
+check("gate halt sits below the live error (idx 3)", g and g.get("halt_idx") == 3, str(g))
+check("marker relocated off the live error (idx 4) onto idx 3",
+      (4, "1h") not in msg_markers_of(b) and any(i == 3 for i, _ in msg_markers_of(b)),
+      str(msg_markers_of(b)))
+
+# a consumed-only error (no live frontier) is a clean tail -> gate stock
+csmsgs = [{"role": "user", "content": "task"},
+          fail_call_msg(0), err_result_msg(0), plain_msg(1), result_msg(1)]
+b = body(copy.deepcopy(csmsgs), msg_markers=((4, "1h"),))
+t._strip_consumed_tool_errors(b)
+check("gate stock when the tail is a plain (non-error) result",
+      t._midturn_marker_gate(b) is None)
+
+t.STRIP_PRIOR_TOOL_ERRORS = False
+
 print("== kill switches ==")
 msgs = turn("task", [True, True])
 b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))

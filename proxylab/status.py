@@ -849,22 +849,22 @@ def _strip_thinking_panel(obj, scale, total):
 
 
 def _strip_tool_errors_panel(obj, scale, total):
-    """Decision panel for STRIP_PRIOR_TOOL_ERRORS: how much of the window is
-    PRIOR-turn failed-call carriage — both halves the strip reclaims, the fat
+    """Decision panel for the consumed failed-call strip: how much of the window
+    is CONSUMED failed-call carriage — both halves the strip reclaims, the fat
     assistant `tool_use.input` (old/new string the model tried) plus its paired
-    `is_error` result — counted over the strippable region (before the last real
-    user boundary; current turn's error is the live retry signal, never counted).
-    Reuses the transform's id-pairing so the figures match the real strip. Note
-    the strip free-rides the thinking-strip bust, so `would_strip` is also gated
-    on prior thinking being present to strip. None when there are no prior errors."""
+    `is_error` result — counted over the CONSUMED region (below the last
+    assistant message; the LIVE frontier error the model hasn't reacted to yet is
+    never counted). Reuses the transform's id-pairing so the figures match the
+    real strip. 2026-07-20 consumed-vs-live model: the strip is deterministic and
+    bust-free (no thinking-bust free-ride), so `would_strip` is gated only on L2
+    being enabled. None when there are no consumed errors."""
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = max((i for i, m in enumerate(msgs)
-                     if transforms_mod._is_real_user_turn(m)), default=-1)
-    if last_user <= 0:
+    last_asst = transforms_mod._last_assistant_idx(msgs)
+    if not last_asst:
         return None
-    prior = msgs[:last_user]
+    prior = msgs[:last_asst]
     # Pass 1: error result ids + their reclaimable body chars (minus the marker).
     error_ids, result_ch, n_results = set(), 0, 0
     mk = len(transforms_mod.ERROR_ELIDED_MARKER)
@@ -904,22 +904,15 @@ def _strip_tool_errors_panel(obj, scale, total):
     if reclaim_ch <= 0:
         return None
     reclaim_tok = round((reclaim_ch // _CHARS_PER_TOK) * scale)
-    cur_think = sum(transforms_mod._msg_thinking_chars(m) for m in msgs[last_user:]
-                    if isinstance(m, dict) and m.get("role") == "assistant")
-    prior_think = sum(transforms_mod._msg_thinking_chars(m) for m in prior
-                      if isinstance(m, dict) and m.get("role") == "assistant")
     p = billing_mod._price_for(obj.get("model"))
     est_usd = round(reclaim_tok / 1e6 * p["cache_read"], 4) if p else None
     return {"failed_calls": n_calls, "error_results": n_results,
             "failed_call_tokens": round((call_ch // _CHARS_PER_TOK) * scale),
             "error_result_tokens": round((result_ch // _CHARS_PER_TOK) * scale),
-            # free-rides the thinking-strip bust -> only fires when prior thinking
-            # is also strippable this turn (no bust to ride otherwise) AND L2 (or
-            # the scratch-A/B flag) is enabled for the session.
-            "would_strip": bool((transforms_mod.STRIP_PRIOR_TOOL_ERRORS
-                                 or transforms_mod._strip_l2_enabled(obj))
-                                and prior_think > 0),
-            "rides_thinking_bust": prior_think > 0,
+            # consumed-vs-live model: deterministic + bust-free, no thinking-bust
+            # free-ride -> fires whenever L2 (or the scratch-A/B flag) is enabled.
+            "would_strip": bool(transforms_mod.STRIP_PRIOR_TOOL_ERRORS
+                                or transforms_mod._strip_l2_enabled(obj)),
             "pct_of_window": round(100.0 * reclaim_tok / total, 1) if total else 0.0,
             "read_reclaim_tokens_per_turn": reclaim_tok,
             "est_read_reclaim_usd_per_turn": est_usd}

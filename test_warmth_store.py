@@ -4021,11 +4021,16 @@ check("pin anchor: upto= finds the last SETTLED user turn (one boundary back)",
       lp.transforms._settled_boundary(_mk_pin_obj()["messages"], upto=4) == 2)
 import inspect  # noqa: E402
 for _fn in (lp.transforms._strip_prior_thinking,
-            lp.transforms._strip_prior_edit_acks,
-            lp.transforms._strip_prior_tool_errors):
+            lp.transforms._strip_prior_edit_acks):
     _src = inspect.getsource(_fn)
     check(f"{_fn.__name__} uses the SHARED boundary detector (no inline recompute)",
           "_settled_boundary(msgs)" in _src and "max((i for" not in _src)
+# the consumed failed-call strip pivots on the LAST ASSISTANT message (consumed
+# vs live), not the settled boundary -> it uses the shared _last_assistant_idx
+# helper (no inline max recompute).
+_src_cte = inspect.getsource(lp.transforms._strip_consumed_tool_errors)
+check("_strip_consumed_tool_errors uses the shared _last_assistant_idx (no inline recompute)",
+      "_last_assistant_idx(msgs)" in _src_cte and "max((i for" not in _src_cte)
 _src2 = inspect.getsource(lp.transforms._pin_settled_breakpoint)
 check("pin uses the SHARED boundary detector",
       "_settled_boundary(msgs)" in _src2)
