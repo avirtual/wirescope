@@ -2509,6 +2509,56 @@ def _strip_prior_thinking(obj, agent_id=None):
             "earliest_idx": earliest,     # edit-ack strip rides this bust point
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
+
+# EXPERIMENTAL PROBE (default off; scratch ports only — no latch, no warmth
+# gate, busts the warm prefix EVERY round by design): mid-turn thinking strip.
+# Question under test (clodex 2026-07-19): is the API's tool-loop signature
+# requirement per-TURN (all current-turn thinking must ride) or per-LAST-
+# assistant-message (docs phrase it around the final assistant message)? If
+# keep-window=1 survives a multi-round tool marathon without 400s, the
+# productized version (threshold + latch, one amortized bust) becomes viable.
+STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "0") not in ("0", "no", "off", "false")
+STRIP_MIDTURN_KEEP = max(1, int(os.environ.get("STRIP_MIDTURN_KEEP", "1")))
+
+
+def _strip_midturn_thinking(obj):
+    """PROBE: inside the CURRENT turn (at/after the settled boundary), delete
+    thinking blocks from every thinking-bearing assistant message EXCEPT the
+    last STRIP_MIDTURN_KEEP of them. Prior turns untouched (that's
+    _strip_prior_thinking's region). Whole-block deletion only — signatures
+    never edited. Returns a log dict or None."""
+    if not STRIP_MIDTURN_THINKING or not isinstance(obj, dict):
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    boundary = _settled_boundary(msgs)
+    think_idx = [i for i in range(boundary + 1, len(msgs))
+                 if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
+    if len(think_idx) <= STRIP_MIDTURN_KEEP:
+        return None                       # nothing behind the keep-window yet
+    targets = think_idx[:-STRIP_MIDTURN_KEEP]
+    removed = stripped_chars = touched = 0
+    for i in targets:
+        c = msgs[i].get("content")
+        if not isinstance(c, list):
+            continue
+        kept = [b for b in c if not (isinstance(b, dict)
+                and b.get("type") in ("thinking", "redacted_thinking"))]
+        if kept and len(kept) < len(c):   # never leave an empty content array
+            stripped_chars += _msg_thinking_chars(msgs[i])
+            removed += len(c) - len(kept)
+            msgs[i]["content"] = kept
+            touched += 1
+    if not removed:
+        return None
+    return {"stripped": True, "removed_thinking_blocks": removed,
+            "touched_messages": touched, "stripped_chars": stripped_chars,
+            "keep_window": STRIP_MIDTURN_KEEP, "boundary_idx": boundary,
+            "current_turn_thinking_msgs": len(think_idx),
+            "total_messages": len(msgs)}
+
+
 def _edit_result_ids(msgs):
     """tool_use_ids whose assistant tool_use was an Edit/Write tool (any wire
     dialect) — so we can identify which user-side tool_result blocks are edit

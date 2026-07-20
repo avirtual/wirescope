@@ -1334,6 +1334,15 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_thinking"] = spt
                 if spt.get("removed_thinking_blocks"):
                     changed = True
+            # MID-TURN THINKING STRIP PROBE (STRIP_MIDTURN_THINKING, default off,
+            # scratch-only): deletes thinking behind a keep-window INSIDE the
+            # current turn — the 400-test for the per-last-assistant-message
+            # signature hypothesis. Never enable on :7800 (unlatched: busts the
+            # warm prefix every round by design).
+            smt = transforms_mod._strip_midturn_thinking(obj)
+            if smt:
+                record["strip_midturn_thinking"] = smt
+                changed = True
             # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
             # with "ok" — but ONLY inside the region the thinking-strip just busted
             # (free-rider). Originating its own bust to reclaim ~1.4k tok/turn is a
