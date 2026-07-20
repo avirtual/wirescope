@@ -1464,16 +1464,8 @@ async def handler(request: Request) -> Response:
                 record["midturn_marker_gate"] = mmg
                 if mmg.get("acted"):
                     changed = True
-            # SCRAP-TAIL 5m (L1 strip sessions): once we know this turn's frontier
-            # will be stripped+rewritten next turn, write that doomed cache at 5m
-            # (1.25x) instead of 1h (2x). Runs AFTER the pin so the pin (1h) stays a
-            # lower index than the 5m tail (legal ttl ordering); only fires when the
-            # tail sits PAST the settled boundary (durable boundary write stays 1h).
-            dst = transforms_mod._downshift_scrap_tail(obj, agent_id=agent_id)
-            if dst:
-                record["scrap_tail_5m"] = dst
-                if dst.get("downshifted"):
-                    changed = True
+            # (scrap-tail 5m downshift removed 2026-07-20: in-turn stripping
+            # leaves the tail-covered span durable — the CLI's own ttl stands.)
             # MARKER-BUDGET INVARIANT (hard rule): never forward >4
             # cache_control markers — the API hard-400s a 5th and kills the
             # user's turn. Every adder is budget-aware upstream; this clamp

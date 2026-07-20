@@ -5,10 +5,12 @@ strip every consumed thinking block (everything but the last assistant
 message); then, if the last assistant message still carries thinking, pull the
 CLI's rolling tail marker back to the last stable message so the doomed block
 is read once at 1x instead of written at premium and invalidated (the AB2
-churn). Clean-tail rounds are byte-stock. Invariants: budget never grows, no
-marker ever sits above the halt point on a doomed round, 1h anchors are never
-touched, strip/gate cannot desync (gate predicate reads only the last
-assistant message, which the strip never mutates)."""
+churn). The relocated marker KEEPS the CLI's own ttl (2026-07-20 correction:
+no 5m of ours anywhere — in-turn stripping discards nothing, the covered span
+is durable). Clean-tail rounds are byte-stock. Invariants: budget never
+grows, no marker ever sits above the halt point on a doomed round, 1h anchors
+are never touched, strip/gate cannot desync (gate predicate reads only the
+last assistant message, which the strip never mutates)."""
 import copy
 import json
 
@@ -132,8 +134,9 @@ b = body(msgs, msg_markers=((last, "1h"),))
 rec = t._midturn_marker_gate(b)
 check("acted + relocated", rec and rec.get("acted") and rec.get("mode") == "relocated", str(rec))
 check("halt just below the doomed block", rec and rec.get("halt_idx") == prot - 1, str(rec))
+check("relocated ttl inherits the CLI marker's (1h)", rec and rec.get("ttl") == "1h", str(rec))
 mm = msg_markers_of(b)
-check("single 5m marker at halt, tail gone", mm == [(prot - 1, "5m")], str(mm))
+check("single 1h marker at halt, tail gone", mm == [(prot - 1, "1h")], str(mm))
 
 print("== gate: clean tail is byte-stock (None, marker untouched) ==")
 msgs = turn("task", [True, False])
@@ -163,17 +166,17 @@ b = body(msgs, msg_markers=((prot, "5m"), (last, "1h")))   # stray marker ON the
 rec = t._midturn_marker_gate(b)
 check("both dropped, one placed", rec and rec.get("markers_dropped") == 2, str(rec))
 mm = msg_markers_of(b)
-check("only halt marked", mm == [(prot - 1, "5m")], str(mm))
+check("only halt marked, tail ttl inherited", mm == [(prot - 1, "1h")], str(mm))
 
-print("== gate: 1h anchor below halt is never touched; ordering stays legal ==")
+print("== gate: 1h anchor below halt is never touched; homogeneous 1h layout ==")
 msgs = turn("task", [True, True, True])
 last = len(msgs) - 1
 b = body(msgs, msg_markers=((0, "1h"), (last, "1h")))
 rec = t._midturn_marker_gate(b)
 check("relocated", rec and rec.get("mode") == "relocated", str(rec))
 mm = msg_markers_of(b)
-check("anchor 1h below, halt 5m above (legal order)",
-      mm == [(0, "1h"), (last - 2, "5m")], str(mm))
+check("anchor 1h below, halt 1h above (no-strip layout, no 5m)",
+      mm == [(0, "1h"), (last - 2, "1h")], str(mm))
 
 print("== gate: halt already marked -> tail dropped, no duplicate ==")
 msgs = turn("task", [True, True])
@@ -209,7 +212,14 @@ check("relocated w/ conversion", rec and rec.get("mode") == "relocated"
 halt = b["messages"][rec["halt_idx"]]
 check("converted shape", isinstance(halt["content"], list)
       and halt["content"][0]["type"] == "text"
-      and halt["content"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "5m"})
+      and halt["content"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
+
+print("== gate: subagent-style 5m tail relocates as 5m (ttl travels) ==")
+msgs = turn("task", [True, True])
+b = body(msgs, msg_markers=((len(msgs) - 1, "5m"),))
+rec = t._midturn_marker_gate(b)
+check("relocated w/ 5m inherited", rec and rec.get("mode") == "relocated"
+      and rec.get("ttl") == "5m", str(rec))
 
 print("== live order: strip mutates first, gate unaffected (4a0521e class dead) ==")
 msgs = turn("task", [True, True, True, True])

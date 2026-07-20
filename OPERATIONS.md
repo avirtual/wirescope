@@ -103,7 +103,8 @@ All are offline script-style suites (`python3 test_X.py`, exit 0 + `ALL PASS`; n
 - `test_warmth_store.py` — the grab-bag: warmth/pricing/hold/persistence/strip-latch/path-confinement (~600 checks).
 - `test_subscribers.py` — subs/tee/server-wiring.
 - `test_fold.py` — replay corpus for the L2 strip/fold family.
-- `test_scrap_tail.py`, `test_strip_tools.py`, `test_marker_budget.py` — their named transforms.
+- `test_strip_tools.py`, `test_marker_budget.py` — their named transforms.
+- `test_midturn.py` — mid-turn strip + marker gate (relocations keep the CLI's own ttl; the 5m scrap-tail downshift was removed 2026-07-20).
 - `test_bake.py` — offline transcript bake (`bake_session.py` / `/_compact` core).
 - `test_pot.py` — the /_pot rollup.
 

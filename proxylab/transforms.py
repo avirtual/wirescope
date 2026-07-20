@@ -2561,9 +2561,12 @@ def _midturn_strip_active(obj, agent_id=None):
 #     (byte-stock wire).
 # No second marker, no donors, no TTL ladder: the budget can only shrink, so
 # the anchor-steal / budget_full / 1h-after-5m defect class is structurally
-# unreachable. The relocated marker is 5m (turn-local scrap-cadence reuse;
-# every 1h marker — system, settled anchor — sits at a lower index, so
-# ordering stays legal). Skeleton entries survive INTO the turn transition:
+# unreachable. The relocated marker KEEPS the CLI's own ttl (2026-07-20
+# correction: no 5m anywhere — scrap pricing only made sense when the old
+# cross-turn strip discarded the whole frontier; in-turn stripping discards
+# nothing, the span below the marker is durable, so the marker is simply the
+# CLI's 1h marker advanced or held back a step — the no-strip layout).
+# Skeleton entries survive INTO the turn transition:
 # the final doomed block was never cached, so the transition request hits the
 # last relocated entry exactly. Gate predicate depends only on the LAST
 # assistant message, which the strip never touches -> strip/gate ordering
@@ -2660,9 +2663,10 @@ def _midturn_marker_gate(obj, agent_id=None):
                 "protected_idx": last_asst, "boundary_idx": boundary}
     if marked[-1][0] <= halt:
         # marker already sits below the doomed block — nothing doomed is
-        # cached; leave placement alone (scrap-tail owns its ttl).
+        # cached; leave placement alone.
         return {"acted": False, "reason": "tail_below_protected",
                 "tail_idx": marked[-1][0], "protected_idx": last_asst}
+    tail_ttl = (marked[-1][1].get("cache_control") or {}).get("ttl") or "5m"
     dropped = 0
     for i, blk in marked:
         if i > halt:
@@ -2688,8 +2692,9 @@ def _midturn_marker_gate(obj, agent_id=None):
         return log
     if needs_convert:
         tgt["content"] = [{"type": "text", "text": c}]
-    tgt["content"][-1]["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
-    log["mode"], log["ttl"] = "relocated", "5m"
+    # the CLI's own marker, moved — its ttl travels with it (no 5m of ours)
+    tgt["content"][-1]["cache_control"] = {"type": "ephemeral", "ttl": tail_ttl}
+    log["mode"], log["ttl"] = "relocated", tail_ttl
     log["converted_string"] = needs_convert
     return log
 
@@ -3081,62 +3086,11 @@ def _enforce_marker_budget(obj, agent_id=None):
     return {"dropped": dropped, "markers_before": len(markers)}
 
 
-SCRAP_TAIL_5M = os.environ.get("SCRAP_TAIL_5M", "1") not in ("0", "no", "off", "false")
-
-
-def _downshift_scrap_tail(obj, agent_id=None):
-    """On a session that STRIPS prior thinking (L1+), the current turn's frontier —
-    the assistant thinking + tool_results that accrete PAST the settled boundary —
-    is guaranteed to be busted and rewritten next turn by the strip. Paying the 1h
-    write premium (2x) to cache that frontier buys durability that is discarded
-    before it is ever collected cross-turn; at that point the right thing is to
-    write the scrap at 5m (1.25x). Intra-turn reuse is unaffected: reads match on
-    content regardless of ttl (wire-proven via the :7802 probe — a 1h pin over a
-    5m-written prefix re-reads it with ephemeral_1h=0, never re-writes), and the
-    5m entry slides on every in-loop read seconds apart.
-
-    THE GUARDRAIL — downshift ONLY when the tail marker sits STRICTLY PAST the
-    settled boundary (`tail_idx > boundary`). When the CLI's rolling marker is AT
-    the boundary (the turn's FIRST request, marking the user prompt), that write is
-    the DURABLE anchor next turn's pin reads back at 1h — 5m there would re-expose
-    the >5min-gap eviction trap on the base prefix. So the boundary write stays 1h;
-    only the post-boundary frontier goes 5m. This exactly separates durable
-    (turn-start / at-or-below boundary) from scrap (mid-loop / past boundary).
-
-    Ordering stays legal: every remaining 1h marker (system blocks, the settled
-    pin, the boundary write) sits at a lower index than the single 5m tail, and the
-    API requires longer-TTL markers first. Gated by L1 (`_strip_thinking_enabled`)
-    so a non-strip session keeps the CLI's 1h tail untouched — the frontier is only
-    'doomed' when this session actually strips. Kill-switch `SCRAP_TAIL_5M` (default
-    on; real gate is L1). Runs AFTER the pin. Returns a log dict or None."""
-    if not SCRAP_TAIL_5M or not isinstance(obj, dict):
-        return None
-    if not _strip_thinking_enabled(obj, agent_id):
-        return None                       # non-strip session: frontier not doomed
-    msgs = obj.get("messages")
-    if not isinstance(msgs, list) or not msgs:
-        return None
-    boundary = _settled_boundary(msgs)
-    # the rolling tail = the highest-index message block carrying a marker
-    tail = None
-    for i, m in enumerate(msgs):
-        c = m.get("content") if isinstance(m, dict) else None
-        if isinstance(c, list):
-            for blk in c:
-                if isinstance(blk, dict) and blk.get("cache_control"):
-                    tail = (i, blk)
-    if not tail:
-        return None
-    i, blk = tail
-    if i <= boundary:                     # durable boundary/prompt write -> keep 1h
-        return {"downshifted": False, "reason": "tail_at_durable_boundary",
-                "tail_idx": i, "boundary_idx": boundary}
-    was = blk["cache_control"].get("ttl")
-    if was == "5m":
-        return {"downshifted": False, "reason": "already_5m", "tail_idx": i}
-    blk["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
-    return {"downshifted": True, "tail_idx": i, "boundary_idx": boundary,
-            "from_ttl": was, "to_ttl": "5m", "total_messages": len(msgs)}
+# SCRAP_TAIL_5M / _downshift_scrap_tail REMOVED (2026-07-20 correction): the
+# 1h->5m tail downshift priced the frontier as doomed scrap, which was only
+# true under the old cross-turn strip (whole turn discarded + rewritten next
+# turn). In-turn stripping discards nothing — the span the tail marker covers
+# is durable — so the CLI's own ttl is simply correct and we don't touch it.
 
 
 def _patch_tool_descriptions(obj):
