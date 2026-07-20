@@ -292,6 +292,49 @@ check("gate stock when the tail is a plain (non-error) result",
 
 t.STRIP_PRIOR_TOOL_ERRORS = False
 
+print("== consumed edit-ack strip: bust-free at the transition (AB3 8.7k fix) ==")
+t.STRIP_PRIOR_EDIT_ACKS = True
+_UPD = "The file /repo/lib/slugify.js has been updated successfully. (file state is current in your context — no need to Read it back)"
+
+
+def edit_call_msg(n):
+    return {"role": "assistant", "content": [
+        {"type": "tool_use", "id": f"ed{n}", "name": "Edit",
+         "input": {"file_path": "/repo/lib/slugify.js", "old_string": "a", "new_string": "b"}}]}
+
+
+def ack_result_msg(n, body_text=_UPD):
+    return {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": f"ed{n}", "content": body_text, "is_error": False}]}
+
+
+# The exact AB3 seq-7→8 shape: task-1 edit ack settled in history, then a NEW
+# assistant turn. [0]user [1]edit ed0 [2]ack ed0 [3]assistant reaction
+# [4]user(task2) [5]edit ed1 [6]LIVE ack ed1
+amsgs = [{"role": "user", "content": "task1"},
+         edit_call_msg(0), ack_result_msg(0),
+         plain_msg(9),
+         {"role": "user", "content": "task2"},
+         edit_call_msg(1), ack_result_msg(1)]
+b = body(copy.deepcopy(amsgs))
+rec = t._strip_consumed_edit_acks(b)
+check("consumed ack collapses (1)", rec and rec["collapsed_edit_acks"] == 1, str(rec))
+check("consumed ack body -> 'ok'", b["messages"][2]["content"][0]["content"] == "ok")
+check("LIVE frontier ack UNTOUCHED (keeps the no-Read-back nudge)",
+      b["messages"][6]["content"][0]["content"] == _UPD)
+# BUST-FREE PROOF: the collapse is deterministic + idempotent, so a re-shipped
+# history is byte-stable (never mutates-after-caching -> never busts a warm prefix)
+rec2 = t._strip_consumed_edit_acks(b)
+check("consumed ack strip idempotent (second pass None)", rec2 is None, str(rec2))
+# the two-task history from cold produces the SAME bytes as the incremental one
+# above (determinism across the transition = no self-inflicted bust)
+b_cold = body(copy.deepcopy(amsgs))
+t._strip_consumed_edit_acks(b_cold)
+check("cold vs incremental produce identical collapsed bytes (bust-free)",
+      json.dumps(b_cold["messages"][2], sort_keys=True) ==
+      json.dumps(b["messages"][2], sort_keys=True))
+t.STRIP_PRIOR_EDIT_ACKS = False
+
 print("== kill switches ==")
 msgs = turn("task", [True, True])
 b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))

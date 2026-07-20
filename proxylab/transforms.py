@@ -2755,37 +2755,48 @@ def _edit_result_ids(msgs):
     return ids
 
 
-def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
-    """Collapse Edit/Write SUCCESS acks to "ok" in the region the thinking-strip
-    ALREADY busted this turn — message indices in [busted_from, last_user). The
-    current turn is untouched (its ack keeps the live "no need to Read it back"
-    nudge). A result is collapsed only when ALL hold: its tool_use was an edit
-    tool, is_error is falsy, the string body matches a known ack fragment, and it
-    sits in the busted region. ECONOMIC GATE: `busted_from` is the thinking-strip's
-    earliest stripped index; when None (thinking didn't fire / declined) we collapse
-    NOTHING — originating a fresh bust to reclaim ~1.4k tok/turn is a ~1400-turn
-    loss. Byte-stable envelope (tool_use_id + type kept). Gated by
-    the per-session L2 level (or the STRIP_PRIOR_EDIT_ACKS scratch-A/B flag).
-    Returns a log dict or None."""
+def _strip_consumed_edit_acks(obj, agent_id=None):
+    """Collapse Edit/Write SUCCESS acks to "ok" once they have been CONSUMED —
+    an edit ack sitting BELOW the last assistant message (`idx < last_asst`), i.e.
+    the model has already produced its next action after the edit. The LIVE
+    frontier ack (in a user message after last_asst, no reaction yet) is kept: it
+    carries the CLI's "no need to Read it back" nudge that steers the very next
+    step. A result is collapsed only when ALL hold: its tool_use was an edit tool,
+    is_error is falsy, the string body matches a known ack fragment, and it is
+    consumed.
+
+    NEW MODEL (2026-07-20, Bogdan): CONSUMED vs LIVE, not prior vs current turn —
+    the same rewrite the failed-call strip got, for the same reason. The old
+    `busted_from` gate rode the thinking-strip bust "for free"; under the mid-turn
+    strip that bust is PHANTOM (thinking is pre-stripped in-turn, byte-neutral at
+    the transition), so the rider ORIGINATED the bust — wire-proven in the AB3
+    multi-turn rerun: the rider cold-latched at a task transition and collapsed
+    two ALREADY-CACHED task-1 acks, busting ~8.7k tok to reclaim 296 chars (~30:1
+    loss). Fix: collapse CONSUMED acks DETERMINISTICALLY every turn (no
+    busted_from, no rider latch). The marker "ok" is a constant + consumed is
+    monotone, so the first prefix that caches a collapsed span caches it
+    already-final and it never mutates-after-caching → the strip never originates
+    a bust. Byte-stable envelope (tool_use_id + type kept). Gated by the
+    per-session L2 level (or the STRIP_PRIOR_EDIT_ACKS scratch-A/B flag). Returns
+    a log dict or None."""
     if not isinstance(obj, dict):
         return None
     if not (STRIP_PRIOR_EDIT_ACKS or _strip_l2_enabled(obj, agent_id)):
         return None
-    if busted_from is None:               # no already-busted region to ride -> skip
-        return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = _settled_boundary(msgs)
-    if last_user <= 0:
+    last_asst = _last_assistant_idx(msgs)
+    if not last_asst:                     # None or 0: nothing consumed below it
         return None
     edit_ids = _edit_result_ids(msgs)
     if not edit_ids:
         return None
     collapsed = stripped_chars = touched_msgs = 0
-    for i, m in enumerate(msgs):
-        if i < busted_from or i >= last_user or m.get("role") != "user":
-            continue                      # only the thinking-busted prior region
+    for i in range(last_asst):
+        m = msgs[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
         c = m.get("content")
         if not isinstance(c, list):
             continue
@@ -2815,8 +2826,7 @@ def _strip_prior_edit_acks(obj, agent_id=None, busted_from=None):
         return None
     return {"stripped": True, "collapsed_edit_acks": collapsed,
             "touched_messages": touched_msgs, "stripped_chars": stripped_chars,
-            "rode_bust_from": busted_from,  # free-rode the thinking-strip bust here
-            "boundary_idx": last_user, "total_messages": len(msgs)}
+            "last_asst_idx": last_asst, "total_messages": len(msgs)}
 
 
 def _strip_consumed_tool_errors(obj, agent_id=None):

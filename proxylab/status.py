@@ -920,22 +920,21 @@ def _strip_tool_errors_panel(obj, scale, total):
 
 def _strip_edit_acks_panel(obj, scale, total):
     """Decision panel for the L2 edit-ack collapse: how much of the window is
-    PRIOR-turn Edit/Write SUCCESS-ack boilerplate that L2 collapses to "ok" — the
+    CONSUMED Edit/Write SUCCESS-ack boilerplate that L2 collapses to "ok" — the
     OTHER half of L2 (the failed-call panel above is the first half). Counted over
-    the strippable region (before the last real user boundary; the current turn's
-    ack carries the live 'no need to Read it back' nudge, never counted). Reuses
-    the transform's edit-id pairing + ack fragments so the figures match the real
-    strip. Like the errors panel, the collapse free-rides the thinking-strip bust,
-    so `would_strip` is also gated on prior thinking being present. None when there
-    are no collapsible prior acks."""
+    the CONSUMED region (below the last assistant message; the LIVE frontier ack
+    carries the 'no need to Read it back' nudge, never counted). Reuses the
+    transform's edit-id pairing + ack fragments so the figures match the real
+    strip. 2026-07-20 consumed-vs-live model: deterministic + bust-free (no
+    thinking-bust free-ride), so `would_strip` is gated only on L2. None when
+    there are no collapsible consumed acks."""
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
-    last_user = max((i for i, m in enumerate(msgs)
-                     if transforms_mod._is_real_user_turn(m)), default=-1)
-    if last_user <= 0:
+    last_asst = transforms_mod._last_assistant_idx(msgs)
+    if not last_asst:
         return None
-    prior = msgs[:last_user]
+    prior = msgs[:last_asst]
     edit_ids = transforms_mod._edit_result_ids(prior)
     if not edit_ids:
         return None
@@ -962,18 +961,14 @@ def _strip_edit_acks_panel(obj, scale, total):
     if ack_ch <= 0:
         return None
     reclaim_tok = round((ack_ch // _CHARS_PER_TOK) * scale)
-    prior_think = sum(transforms_mod._msg_thinking_chars(m) for m in prior
-                      if isinstance(m, dict) and m.get("role") == "assistant")
     p = billing_mod._price_for(obj.get("model"))
     est_usd = round(reclaim_tok / 1e6 * p["cache_read"], 4) if p else None
     return {"collapsed_acks": n_acks,
             "edit_ack_tokens": reclaim_tok,
-            # free-rides the thinking-strip bust -> only fires when prior thinking
-            # is also strippable this turn AND L2 (or the scratch-A/B flag) is on.
-            "would_strip": bool((transforms_mod.STRIP_PRIOR_EDIT_ACKS
-                                 or transforms_mod._strip_l2_enabled(obj))
-                                and prior_think > 0),
-            "rides_thinking_bust": prior_think > 0,
+            # consumed-vs-live model: deterministic + bust-free, no thinking-bust
+            # free-ride -> fires whenever L2 (or the scratch-A/B flag) is enabled.
+            "would_strip": bool(transforms_mod.STRIP_PRIOR_EDIT_ACKS
+                                or transforms_mod._strip_l2_enabled(obj)),
             "pct_of_window": round(100.0 * reclaim_tok / total, 1) if total else 0.0,
             "read_reclaim_tokens_per_turn": reclaim_tok,
             "est_read_reclaim_usd_per_turn": est_usd}

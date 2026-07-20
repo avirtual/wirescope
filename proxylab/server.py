@@ -1353,36 +1353,20 @@ async def handler(request: Request) -> Response:
             if smt:
                 record["strip_midturn_thinking"] = smt
                 changed = True
-            # COLLAPSE PRIOR-TURN EDIT/WRITE ACKS: replace the success boilerplate
-            # with "ok" — but ONLY inside a region that is ALREADY (really) busted.
-            # 2026-07-20: the thinking-strip's earliest_idx is NO LONGER a valid
-            # bust source. With the mid-turn strip + marker gate active, current-
-            # turn thinking is pre-stripped in-turn and the marker never caches it,
-            # so at the transition the prior-thinking strip re-converges to
-            # already-stripped bytes = BYTE-NEUTRAL (no real bust). Feeding its
-            # earliest_idx to the riders made them ORIGINATE the bust they thought
-            # they were riding (the AB3 phantom-bust leak). The ONLY legitimate
-            # busted_from now is the rider LATCH (a real cold write, established
-            # under its own cold-gate). Errors no longer ride this at all — they
-            # moved to the deterministic consumed-vs-live model below.
-            busted_from = None
-            # RIDER LATCH (v0.6.26): once a session's riders are latched
-            # full-range they fire on EVERY request like fold — deterministic
-            # replay, so baked resumes (no prior thinking -> spt no-ops) still
-            # re-produce the stubbed bytes the warm lineage carries instead of
-            # shipping raw acks and busting from the first old stub. Cold-gated
-            # establishment inside the helper; until latched the free-rider
-            # busted_from behavior is unchanged.
-            _sid_for_riders = (writer_mod._session_ids(obj) or [None])[0]
-            rider_from, rider_reason = transforms_mod._rider_full_range(
-                obj, _sid_for_riders, agent_id=agent_id)
-            if rider_from is not None:
-                busted_from = rider_from
-            if rider_reason:
-                record["rider_gate"] = {"reason": rider_reason,
-                                        "full_range": rider_from is not None}
-            sea = transforms_mod._strip_prior_edit_acks(
-                obj, agent_id=agent_id, busted_from=busted_from)
+            # COLLAPSE CONSUMED EDIT/WRITE ACKS (CONSUMED-vs-LIVE model,
+            # 2026-07-20): replace the success boilerplate with "ok" once the ack
+            # has been CONSUMED (sits below the last assistant message = the model
+            # already acted after it). The LIVE frontier ack keeps its "no need to
+            # Read it back" nudge. Collapsed DETERMINISTICALLY every turn (no
+            # busted_from, no rider latch): "ok" is a constant + consumed is
+            # monotone, so the first prefix caches the collapsed span already-final
+            # → never mutates-after-caching → never originates a bust. This
+            # REPLACES the busted_from/rider-latch path, which under the mid-turn
+            # strip rode a PHANTOM bust and self-inflicted one instead — wire-proven
+            # in the AB3 multi-turn rerun (rider cold-latched at a task transition,
+            # collapsed two already-cached acks, busting ~8.7k tok for 296 chars,
+            # ~30:1). (The _RIDER_LATCH machinery is now vestigial — no caller.)
+            sea = transforms_mod._strip_consumed_edit_acks(obj, agent_id=agent_id)
             if sea:
                 record["strip_prior_edit_acks"] = sea
                 if sea.get("collapsed_edit_acks"):

@@ -3174,31 +3174,32 @@ def _sea_msgs():
 
 
 _so = {"messages": _sea_msgs()}
-# busted_from=0 simulates the thinking-strip having busted from the top.
-_sr = lp.transforms._strip_prior_edit_acks(_so, busted_from=0)
-check("strip_prior_edit_acks: collapses the prior-turn ack (riding a bust)",
+# CONSUMED-vs-LIVE (2026-07-20): last_asst = idx 5 (Edit e2). The e1 ack at idx 2
+# is CONSUMED (below last_asst) -> collapsed deterministically, no busted_from.
+# The e2 ack at idx 6 is the LIVE frontier ack (after last_asst) -> kept.
+_sr = lp.transforms._strip_consumed_edit_acks(_so)
+check("strip_consumed_edit_acks: collapses the consumed ack",
       _sr and _sr.get("stripped") is True and _sr["collapsed_edit_acks"] == 1)
-check("strip_prior_edit_acks: prior ack body becomes 'ok'",
+check("strip_consumed_edit_acks: consumed ack body becomes 'ok'",
       _so["messages"][2]["content"][0]["content"] == "ok")
-check("strip_prior_edit_acks: byte-stable envelope (tool_use_id kept)",
+check("strip_consumed_edit_acks: byte-stable envelope (tool_use_id kept)",
       _so["messages"][2]["content"][0]["tool_use_id"] == "e1")
-check("strip_prior_edit_acks: CURRENT-turn ack is never touched",
+check("strip_consumed_edit_acks: LIVE frontier ack is never touched",
       _so["messages"][6]["content"][0]["content"].startswith("The file /y.py"))
-check("strip_prior_edit_acks: idempotent re-run -> None (already collapsed)",
-      lp.transforms._strip_prior_edit_acks(_so, busted_from=0) is None)
+check("strip_consumed_edit_acks: idempotent re-run -> None (already collapsed)",
+      lp.transforms._strip_consumed_edit_acks(_so) is None)
 
-# ECONOMIC GATE: no thinking bust to ride (busted_from=None) -> collapse NOTHING
-_gate = {"messages": _sea_msgs()}
-check("strip_prior_edit_acks: busted_from=None (no thinking strip) -> None",
-      lp.transforms._strip_prior_edit_acks(_gate, busted_from=None) is None
+# DETERMINISTIC + BUST-FREE: fires every turn with no bust to ride (no
+# busted_from param at all). A body with no consumed ack (only the live frontier)
+# collapses NOTHING.
+_gate = {"messages": _sea_msgs()[:2] + [{"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "e1",
+     "content": _UPD % "/x.py", "is_error": False}]}]}
+# here last_asst = idx 1, the only ack (idx 2) is LIVE -> untouched
+check("strip_consumed_edit_acks: a live-only ack (nothing consumed) -> None",
+      lp.transforms._strip_consumed_edit_acks(_gate) is None
       and _gate["messages"][2]["content"][0]["content"].startswith("The file /x.py"))
-# REGION: an ack UPSTREAM of the bust point is left alone (would originate a bust)
-_reg = {"messages": _sea_msgs()}
-check("strip_prior_edit_acks: ack before busted_from is not collapsed",
-      lp.transforms._strip_prior_edit_acks(_reg, busted_from=3) is None
-      and _reg["messages"][2]["content"][0]["content"].startswith("The file /x.py"))
-
-# failed edit keeps its diagnostic text
+# failed edit keeps its diagnostic text (consumed: reaction at idx 3)
 _fail = {"messages": [
     {"role": "user", "content": "edit"},
     {"role": "assistant", "content": [
@@ -3206,10 +3207,11 @@ _fail = {"messages": [
     {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "f1",
          "content": "Error: old_string not found in /z", "is_error": True}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "retry"}]},
     {"role": "user", "content": "next"},
 ]}
-check("strip_prior_edit_acks: failed edit (is_error) is kept verbatim",
-      lp.transforms._strip_prior_edit_acks(_fail, busted_from=0) is None
+check("strip_consumed_edit_acks: failed edit (is_error) is kept verbatim",
+      lp.transforms._strip_consumed_edit_acks(_fail) is None
       and _fail["messages"][2]["content"][0]["content"].startswith("Error:"))
 
 # a non-edit tool_result that happens to contain the phrase is NOT collapsed
@@ -3221,53 +3223,41 @@ _bash = {"messages": [
     {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "b1",
          "content": "log: record has been updated successfully", "is_error": False}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "seen"}]},
     {"role": "user", "content": "next"},
 ]}
-check("strip_prior_edit_acks: non-edit result with the phrase is left alone",
-      lp.transforms._strip_prior_edit_acks(_bash, busted_from=0) is None)
+check("strip_consumed_edit_acks: non-edit result with the phrase is left alone",
+      lp.transforms._strip_consumed_edit_acks(_bash) is None)
 
-# Write's distinct "File created successfully at:" form also collapses
+# Write's distinct "File created successfully at:" form also collapses (consumed)
 _wr = {"messages": [
     {"role": "user", "content": "write"},
     {"role": "assistant", "content": [
         {"type": "tool_use", "id": "w1", "name": "Write", "input": {"file_path": "/n"}}]},
     {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "w1", "content": _NEW % "/n", "is_error": False}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "wrote"}]},
     {"role": "user", "content": "next"},
 ]}
-_wrr = lp.transforms._strip_prior_edit_acks(_wr, busted_from=0)
-check("strip_prior_edit_acks: Write 'File created…' ack collapses",
+_wrr = lp.transforms._strip_consumed_edit_acks(_wr)
+check("strip_consumed_edit_acks: Write 'File created…' ack collapses",
       _wrr and _wrr["collapsed_edit_acks"] == 1
       and _wr["messages"][2]["content"][0]["content"] == "ok")
 
-# guards: disabled flag, and no-prior-turn -> None
+# guards: disabled flag, and no assistant-below (nothing consumed) -> None
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = False
-check("strip_prior_edit_acks: disabled flag -> None",
-      lp.transforms._strip_prior_edit_acks({"messages": _sea_msgs()}, busted_from=0) is None)
+check("strip_consumed_edit_acks: disabled flag -> None",
+      lp.transforms._strip_consumed_edit_acks({"messages": _sea_msgs()}) is None)
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
-check("strip_prior_edit_acks: no prior turn before current -> None",
-      lp.transforms._strip_prior_edit_acks({"messages": [
+check("strip_consumed_edit_acks: no consumed region (single assistant) -> None",
+      lp.transforms._strip_consumed_edit_acks({"messages": [
           {"role": "user", "content": "only turn"},
-          {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]},
-          busted_from=0) is None)
-# thinking-strip reports earliest_idx so the server can pass it as busted_from
-_ti = {"messages": [
-    {"role": "user", "content": "q"},
-    {"role": "assistant", "content": [
-        {"type": "thinking", "thinking": "x" * 80, "signature": "s"},
-        {"type": "text", "text": "a"}]},
-    {"role": "user", "content": "now"}]}
-_tsave2 = lp.transforms.STRIP_PRIOR_THINKING
-lp.transforms.STRIP_PRIOR_THINKING = True
-_tr = lp.transforms._strip_prior_thinking(_ti)
-check("strip_prior_thinking: reports earliest_idx for the ack free-rider gate",
-      _tr and _tr.get("earliest_idx") == 1)
-lp.transforms.STRIP_PRIOR_THINKING = _tsave2
+          {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]}) is None)
 
 # /_context VISIBILITY: the L2 edit-ack collapse must surface its reclaim in the
 # composition panel (`strip_prior_edit_acks`) so a consumer's UI can show L2 as
 # distinct from L1 — the gap clodex hit (L2 looked identical to L1). Mirrors the
-# failed-call panel; would_strip rides the thinking bust + L2/flag gate.
+# failed-call panel; consumed-vs-live model -> would_strip gated only on L2/flag.
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = True
 _pea = {"model": "claude-opus-4-8", "messages": [
     {"role": "user", "content": "edit"},
@@ -3284,7 +3274,6 @@ _pea_panel = lp.status._strip_edit_acks_panel(_pea, 1.0, 100000)
 check("/_context: strip_prior_edit_acks panel surfaces the L2 ack reclaim",
       _pea_panel is not None and _pea_panel["collapsed_acks"] == 1
       and _pea_panel["edit_ack_tokens"] > 0
-      and _pea_panel["rides_thinking_bust"] is True
       and _pea_panel["would_strip"] is True)
 lp.transforms.STRIP_PRIOR_EDIT_ACKS = _sea_save
 
@@ -4020,17 +4009,17 @@ check("settled boundary: shared detector finds last real user turn",
 check("pin anchor: upto= finds the last SETTLED user turn (one boundary back)",
       lp.transforms._settled_boundary(_mk_pin_obj()["messages"], upto=4) == 2)
 import inspect  # noqa: E402
-for _fn in (lp.transforms._strip_prior_thinking,
-            lp.transforms._strip_prior_edit_acks):
-    _src = inspect.getsource(_fn)
-    check(f"{_fn.__name__} uses the SHARED boundary detector (no inline recompute)",
-          "_settled_boundary(msgs)" in _src and "max((i for" not in _src)
-# the consumed failed-call strip pivots on the LAST ASSISTANT message (consumed
-# vs live), not the settled boundary -> it uses the shared _last_assistant_idx
-# helper (no inline max recompute).
-_src_cte = inspect.getsource(lp.transforms._strip_consumed_tool_errors)
-check("_strip_consumed_tool_errors uses the shared _last_assistant_idx (no inline recompute)",
-      "_last_assistant_idx(msgs)" in _src_cte and "max((i for" not in _src_cte)
+_src = inspect.getsource(lp.transforms._strip_prior_thinking)
+check("_strip_prior_thinking uses the SHARED boundary detector (no inline recompute)",
+      "_settled_boundary(msgs)" in _src and "max((i for" not in _src)
+# the consumed edit-ack + failed-call strips pivot on the LAST ASSISTANT message
+# (consumed vs live), not the settled boundary -> they use the shared
+# _last_assistant_idx helper (no inline max recompute).
+for _fn in (lp.transforms._strip_consumed_tool_errors,
+            lp.transforms._strip_consumed_edit_acks):
+    _src_c = inspect.getsource(_fn)
+    check(f"{_fn.__name__} uses the shared _last_assistant_idx (no inline recompute)",
+          "_last_assistant_idx(msgs)" in _src_c and "max((i for" not in _src_c)
 _src2 = inspect.getsource(lp.transforms._pin_settled_breakpoint)
 check("pin uses the SHARED boundary detector",
       "_settled_boundary(msgs)" in _src2)
@@ -4221,11 +4210,12 @@ lp.restore._restore_rider_latches()
 check("rider latch survives restart (persisted + restored)",
       lp.transforms._RIDER_LATCH.get(_SID_R) is True)
 
-# full-range busted_from=0 makes the ack strip fire with NO thinking strip:
-# the exact post-bake scenario
+# consumed-vs-live (2026-07-20): the ack strip fires deterministically with NO
+# thinking strip and no rider latch — the consumed ack (idx 2, below last_asst 3)
+# collapses; the exact post-bake scenario, now bust-free by construction.
 _o = _mk_rider_obj(_SID_R)
-_res = lp.transforms._strip_prior_edit_acks(_o, busted_from=0)
-check("post-bake scenario: ack strip fires full-range without a thinking bust",
+_res = lp.transforms._strip_consumed_edit_acks(_o)
+check("post-bake scenario: consumed ack strip fires without a thinking bust",
       _res and _res["collapsed_edit_acks"] == 1
       and _o["messages"][2]["content"][0]["content"] == lp.transforms.EDIT_ACK_MARKER)
 
