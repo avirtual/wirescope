@@ -3040,9 +3040,27 @@ def _pin_settled_breakpoint(obj, agent_id=None):
     boundary = _settled_boundary(msgs)
     if boundary <= 0:
         return None                       # single-turn: nothing settled to anchor
-    anchor = _settled_boundary(msgs, upto=boundary)
-    if anchor < 0:
-        return None                       # first turn after msg0: msg0 markers cover it
+    # ANCHOR-ADVANCE (2026-07-20, Bogdan's lag find; AB2v2 expiry probe priced
+    # the lag at ~25-29k tok x 2x premium per >5m pause): the penultimate
+    # anchor is only NEEDED on the turn's FIRST request, where the boundary
+    # message is the fresh tail (the CLI's rolling marker sits on it — pinning
+    # would collide, and the penultimate entry is the exact-match transition
+    # anchor). From request 2+ (an assistant message exists past the boundary)
+    # the boundary has settled and everything above it is byte-stable for the
+    # rest of the turn (settle strips ran at the transition; mid-turn strips
+    # only touch later messages) -> anchor the CURRENT turn's opening. Costs
+    # the same 1h write the next transition would pay, just a turn earlier;
+    # the entry it writes then IS the next transition's exact-match anchor.
+    advanced = any(m.get("role") == "assistant" for m in msgs[boundary + 1:])
+    if advanced:
+        # request 2+ — anchor the boundary itself; if it already carries a
+        # marker (org-route second rolling marker) the already_marked decline
+        # below is the right outcome: coverage is already there.
+        anchor = boundary
+    else:
+        anchor = _settled_boundary(msgs, upto=boundary)
+        if anchor < 0:
+            return None                   # first turn after msg0: msg0 markers cover it
     tgt = msgs[anchor]
     c = tgt.get("content")
     # THE COMMON CASE is a bare-STRING anchor: the CLI sends a user prompt as
@@ -3085,15 +3103,24 @@ def _pin_settled_breakpoint(obj, agent_id=None):
         donor_idx = donor[1]
         mode = "migrated"
     else:
-        # fresh slot: mirror the prevailing ttl (API forbids 1h AFTER 5m; CLI
-        # requests share one ttl in practice) — copy the last marker's.
-        cc = dict(markers[-1][2]["cache_control"])
+        # fresh slot: mirror the ttl of the last marker BEFORE the anchor in
+        # canonical order — always ordering-legal (never longer than its
+        # predecessor; API forbids 1h AFTER 5m). In practice that is a 1h
+        # system/bundle marker, so the anchor goes durable even when
+        # scrap-tail has already downshifted the rolling tail to 5m (copying
+        # markers[-1] there would hand the anchor a 5m ttl = re-creating the
+        # expiry lag the advance exists to close).
+        prior = [b for r, i, b in markers
+                 if r in ("tools", "system") or (r == "messages" and i < anchor)]
+        src = prior[-1] if prior else markers[-1][2]
+        cc = dict(src["cache_control"])
         mode = "added"
     if needs_convert:
         tgt["content"] = [{"type": "text", "text": c}]
     tgt["content"][-1]["cache_control"] = cc
     return {"pinned": True, "mode": mode, "anchor_idx": anchor,
-            "boundary_idx": boundary, "donor_msg_idx": donor_idx,
+            "boundary_idx": boundary, "advanced": advanced,
+            "donor_msg_idx": donor_idx,
             "ttl": cc.get("ttl"), "converted_string": needs_convert,
             "markers_total": len(markers) + (1 if mode == "added" else 0),
             "total_messages": len(msgs)}

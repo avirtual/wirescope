@@ -4015,14 +4015,6 @@ def _mk_pin_obj(n_hist_turns=2, sys_markers=2, msg0_marker=True, tail_marker=Tru
     return o
 
 
-def _pin_of(o):
-    """(anchor_block_marker, msg0_marker) after a pin run, for asserts."""
-    msgs = o["messages"]
-    b = lp.transforms._settled_boundary(msgs)
-    a = lp.transforms._settled_boundary(msgs, upto=b)
-    return (msgs[a]["content"][-1].get("cache_control"),
-            msgs[0]["content"][0].get("cache_control"))
-
 check("settled boundary: shared detector finds last real user turn",
       lp.transforms._settled_boundary(_mk_pin_obj()["messages"]) == 4)
 check("pin anchor: upto= finds the last SETTLED user turn (one boundary back)",
@@ -4044,23 +4036,27 @@ _src3 = inspect.getsource(_fold_mod.fold_read_edits)
 check("fold uses the SHARED boundary detector (no inline recompute)",
       "_settled_boundary(msgs)" in _src3 and "max((i for" not in _src3)
 
-# 4/4 budget (2 sys + msg0 + tail) -> MIGRATE the msg0 marker to the anchor
+# 4/4 budget (2 sys + msg0 + tail), mid-turn shape -> ADVANCED anchor (the
+# CURRENT turn's boundary, 2026-07-20) + MIGRATE the msg0 marker onto it
 _o = _mk_pin_obj()
 _r = lp.transforms._pin_settled_breakpoint(_o)
-check("pin at 4/4 budget migrates the msg0 marker to the settled anchor",
+check("pin at 4/4 budget migrates the msg0 marker to the (advanced) anchor",
       _r and _r["pinned"] and _r["mode"] == "migrated" and _r["donor_msg_idx"] == 0
-      and _r["anchor_idx"] == 2 and _r["boundary_idx"] == 4
-      and _pin_of(_o)[0] == _CC and _pin_of(_o)[1] is None)
+      and _r["advanced"] is True
+      and _r["anchor_idx"] == 4 and _r["boundary_idx"] == 4
+      and _o["messages"][4]["content"][-1].get("cache_control") == _CC
+      and _o["messages"][0]["content"][0].get("cache_control") is None)
 check("pin migration keeps total marker count at 4",
       len(lp.transforms._cache_markers(_o)) == 4)
 check("pin inherits the donor's ttl", _r["ttl"] == "1h")
 
-# 3/4 budget (no msg0 marker) -> ADD a fresh marker, mirror prevailing ttl
+# 3/4 budget (no msg0 marker) -> ADD a fresh marker at the advanced anchor
 _o = _mk_pin_obj(msg0_marker=False)
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin at 3/4 budget adds a fresh marker (no donor popped)",
-      _r and _r["pinned"] and _r["mode"] == "added"
-      and _r["donor_msg_idx"] is None and _pin_of(_o)[0] == _CC)
+      _r and _r["pinned"] and _r["mode"] == "added" and _r["advanced"] is True
+      and _r["donor_msg_idx"] is None
+      and _o["messages"][4]["content"][-1].get("cache_control") == _CC)
 check("pin add lands at 4 total markers",
       len(lp.transforms._cache_markers(_o)) == 4)
 
@@ -4075,18 +4071,23 @@ check("pin fires at a turn transition, anchoring the PREVIOUS turn's boundary",
       _r and _r["pinned"] and _r["anchor_idx"] == 2 and _r["boundary_idx"] == 4
       and _o["messages"][2]["content"][-1].get("cache_control"))
 
-# anchor already marked (client rolls two message markers) -> decline
+# anchor already marked (org-route second rolling marker sits on the
+# boundary) -> decline: coverage is already there
 _o = _mk_pin_obj()
-_o["messages"][2]["content"][-1]["cache_control"] = dict(_CC)
+_o["messages"][4]["content"][-1]["cache_control"] = dict(_CC)
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin declines already_marked when the anchor carries a marker",
       _r and not _r["pinned"] and _r["reason"] == "already_marked")
 
-# anchor == msg0 (second turn of a session): msg0's last block unmarked -> pin
+# anchor == msg0 (second turn's TRANSITION request: ends at the fresh user
+# prompt, CLI tail marker on it): msg0's last block unmarked -> pin msg0
 _o = _mk_pin_obj(n_hist_turns=1, msg0_marker=False)
+_o["messages"] = _o["messages"][:3]        # m0, answer, fresh user prompt
+_o["messages"][2]["content"][-1]["cache_control"] = dict(_CC)  # CLI tail marker
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin anchors msg0's last block on the second turn (anchor == 0)",
-      _r and _r["pinned"] and _r["anchor_idx"] == 0 and _r["boundary_idx"] == 2)
+      _r and _r["pinned"] and _r["advanced"] is False
+      and _r["anchor_idx"] == 0 and _r["boundary_idx"] == 2)
 
 # single-turn: nothing settled
 check("pin skips a single-turn request (boundary <= 0)",
@@ -4112,28 +4113,28 @@ check("pin declines budget_full_no_donor rather than stealing a system marker",
 # string-content anchor (THE common case: the CLI rewrites its block-form tail
 # prompt to a bare string once it's history) -> convert to block form + pin
 _o = _mk_pin_obj()
-_o["messages"][2] = {"role": "user", "content": "plain string prompt"}
+_o["messages"][4] = {"role": "user", "content": "plain string prompt"}
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin converts a string anchor to block form and pins it",
       _r and _r["pinned"] and _r["converted_string"]
-      and _o["messages"][2]["content"] == [
+      and _o["messages"][4]["content"] == [
           {"type": "text", "text": "plain string prompt",
            "cache_control": _CC}])
 
 # decline paths never mutate: a string anchor + budget full + no donor must
 # leave the string shape untouched
 _o = _mk_pin_obj(msg0_marker=False)
-_o["messages"][2] = {"role": "user", "content": "plain string prompt"}
+_o["messages"][4] = {"role": "user", "content": "plain string prompt"}
 _o["system"].append({"type": "text", "text": "x", "cache_control": dict(_CC)})
 _o["system"].append({"type": "text", "text": "y", "cache_control": dict(_CC)})
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin decline leaves a string anchor unconverted (no mutation on decline)",
       _r and not _r["pinned"] and _r["reason"] == "budget_full_no_donor"
-      and _o["messages"][2]["content"] == "plain string prompt")
+      and _o["messages"][4]["content"] == "plain string prompt")
 
 # genuinely unmarkable: list content whose last block isn't a dict
 _o = _mk_pin_obj()
-_o["messages"][2]["content"] = [{"type": "text", "text": "x"}, 5]
+_o["messages"][4]["content"] = [{"type": "text", "text": "x"}, 5]
 _r = lp.transforms._pin_settled_breakpoint(_o)
 check("pin declines a malformed anchor (last block not a dict)",
       _r and not _r["pinned"] and _r["reason"] == "unmarkable_content")

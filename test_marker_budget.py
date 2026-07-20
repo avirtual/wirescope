@@ -171,6 +171,40 @@ def test_end_to_end_four_marker_client():
     print("ok  end-to-end (relocate + pin) on 4-marker client: exactly <=4, clamp idle")
 
 
+def test_pin_advances_in_turn():
+    # mid-turn shape (assistant past the boundary, boundary unmarked): the pin
+    # anchors the CURRENT turn's opening, not the penultimate boundary
+    # (anchor-advance, 2026-07-20 — closes the full-turn 1h-coverage lag).
+    o = _base(sys_markers=2, msg_markers=1, n_msgs=6)   # last=assistant+marker
+    log = t._pin_settled_breakpoint(o)
+    assert log and log["pinned"] and log["advanced"] is True, log
+    assert log["anchor_idx"] == log["boundary_idx"] == 4, log
+    assert o["messages"][4]["content"][-1].get("cache_control"), "boundary unpinned"
+    print("ok  pin ADVANCES to the current turn's opening on request 2+")
+
+
+def test_pin_penultimate_at_transition():
+    # turn-first shape: the boundary IS the marked tail -> penultimate anchor
+    # (the exact-match transition mechanism, unchanged).
+    o = _base(sys_markers=2, msg_markers=1, n_msgs=7)   # last=user+marker
+    log = t._pin_settled_breakpoint(o)
+    assert log and log["pinned"] and log["advanced"] is False, log
+    assert log["boundary_idx"] == 6 and log["anchor_idx"] == 4, log
+    print("ok  pin stays PENULTIMATE at the turn transition (boundary is the tail)")
+
+
+def test_pin_ttl_mirrors_prior_not_tail():
+    # scrap-tail world: rolling tail at 5m must NOT drag the anchor to 5m —
+    # the pin mirrors the last marker BEFORE it (1h system) instead.
+    o = _base(sys_markers=2, msg_markers=1, n_msgs=6)
+    o["messages"][-1]["content"][-1]["cache_control"] = _cc("5m")
+    log = t._pin_settled_breakpoint(o)
+    assert log and log["pinned"] and log["advanced"], log
+    assert log["ttl"] == "1h", log
+    assert _count(o) == 4
+    print("ok  advanced pin ttl mirrors prior 1h marker, not the scrapped 5m tail")
+
+
 if __name__ == "__main__":
     test_add_at_three()
     test_migrate_at_four()
@@ -180,4 +214,7 @@ if __name__ == "__main__":
     test_clamp_preference_order()
     test_clamp_noop_within_budget()
     test_end_to_end_four_marker_client()
+    test_pin_advances_in_turn()
+    test_pin_penultimate_at_transition()
+    test_pin_ttl_mirrors_prior_not_tail()
     print("ALL MARKER-BUDGET TESTS PASSED")
