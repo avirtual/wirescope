@@ -2511,27 +2511,20 @@ def _strip_prior_thinking(obj, agent_id=None):
 
 
 # MID-TURN THINKING STRIP — part of how the L-levels WORK (no separate tier):
-# an L1+ session now strips thinking OP BY OP inside the current turn too,
-# behind a keep-window protecting the head (the API's signature requirement
-# binds on the LAST assistant message only — wire-proven 2026-07-20 on
-# sonnet-5/opus-4-8/fable-5, keep=1, incl. interleaved-thinking; the old
-# "current turn is untouchable" boundary was our own conservatism). Deletion
-# only, never signature edits; paired with the op-1 rolling pin below so each
-# round is an exact entry hit + a one-op 5m write instead of an unanchored
-# bust. `STRIP_MIDTURN_THINKING` is a KILL SWITCH (default on; real gate =
-# the per-session strip level, same as the settled-region strip): set =0 to
+# an L1+ session strips thinking inside the current turn too, one round after
+# each block is CONSUMED (the API's signature requirement binds on the LAST
+# assistant message only — wire-proven 2026-07-20 on sonnet-5/opus-4-8/
+# fable-5 incl. interleaved-thinking; the moment a later assistant message
+# exists, a block is deletable). Deletion only, never signature edits.
+# Paired with the MARKER GATE below (Bogdan's placement rule, 2026-07-20,
+# REPLACING the op-1 pin): doomed thinking is never cached in the first
+# place, so stripping it never invalidates anything — which also retires the
+# sparse-texture ROI gate (the 30x-negative case only existed because the
+# doomed block had been written at premium before the strip busted it).
+# `STRIP_MIDTURN_THINKING` is a KILL SWITCH (default on; real gate = the
+# per-session strip level, same as the settled-region strip): set =0 to
 # revert L-level sessions to settled-only stripping.
 STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "1") not in ("0", "no", "off", "false")
-STRIP_MIDTURN_KEEP = max(1, int(os.environ.get("STRIP_MIDTURN_KEEP", "1")))
-# Texture gate (AB2 postmortem 2026-07-20): a mid-turn thinking block is only
-# strippable when the NEXT thinking message landed within MAX_GAP messages of
-# it — the dense-loop shape (marathons: gap ~2). Deleting a block whose
-# successor is far away re-writes the whole span between them to reclaim a
-# few hundred tokens (measured 30x negative ROI on sparse turns); those
-# blocks are left for the settled-region strip to take from cold later. Gap
-# is frozen once the successor exists -> eligibility is deterministic and
-# monotone across rounds (a stripped block can never reappear).
-STRIP_MIDTURN_MAX_GAP = max(1, int(os.environ.get("STRIP_MIDTURN_MAX_GAP", "6")))
 
 
 def _midturn_strip_active(obj, agent_id=None):
@@ -2550,62 +2543,61 @@ def _midturn_strip_active(obj, agent_id=None):
         return False
     return True
 
-# PIN MIDTURN BREAKPOINT — the settled-boundary machinery moved INSIDE the turn
-# (bogdan's "cache boundary at current op -1", 2026-07-20). The mid-turn strip
-# makes round k+1's bytes identical to round k's FORWARDED (stripped) bytes all
-# the way up to the previous head's thinking — that block is the only thing
-# that changed (it just became strippable). So pin a breakpoint on the message
-# IMMEDIATELY BEFORE the head thinking-bearing assistant message: next round is
-# an exact entry hit there and the write is one op's worth (the head op in
-# stripped form + its tool_result + the new head). Without it the per-round
-# bust depth is at the mercy of the CLI's rolling tail placement — the fable
-# plateau pattern (probe 2026-07-20) vs opus's monotone.
-# TTL: on an L1+ strip session the mid-turn span is LOOP SCRAP (superseded in
-# seconds, re-read within seconds) -> 5m is the reuse-gap-correct write
-# (scrap-tail's argument moved inward; scrap-tail downshifts the rolling tail
-# on the same sessions, so no 1h marker follows and ordering stays legal). On
-# a non-strip session mirror the tail's ttl (a bare 5m before a 1h tail is a
-# hard 400). DURABLE 1h ANCHORS ARE UNTOUCHABLE (AB2 postmortem 2026-07-20):
-# the original "settled pin yields its slot" donor design stole the 1h anchor
-# every mid-loop round, leaving the whole history on 5m-only coverage — the
-# ladder defect Bogdan spotted on the wire (marker #3 at 5m). Entries persist
-# but their 1h refresh doesn't: one >5m pause = re-write the turn span at
-# write premium, every pause. Donor preference is now 5m-only (a leftover 5m
-# loop marker, else the rolling tail when it is loop scrap — bounded cost of
-# at most one op billed uncached next round), and a hard ladder invariant
-# backstops: if no 1h message marker survives beneath the pin, the pin itself
-# is written 1h rather than leaving the settled history 5m-only.
-PIN_MIDTURN_BREAKPOINT = os.environ.get("PIN_MIDTURN_BREAKPOINT", "1") not in (
+# MID-TURN MARKER GATE — Bogdan's placement rule (2026-07-20), REPLACING the
+# op-1 pin and its whole donor/ladder apparatus. The insight: the CLI's own
+# rolling tail marker is the only mobile marker the turn needs; the proxy's
+# job is a single per-request placement decision, not marker management.
+#   - Last assistant message carries thinking (a DOOMED block — it is
+#     stripped the moment it stops being last): letting the tail marker
+#     stand would cache that block at write premium one round before we
+#     delete it, and the deletion then invalidates the entry and re-writes
+#     the span (the AB2 churn: T4 reqs 056-059 carried the kept block at 5m
+#     for three rounds, then re-wrote 34..39 when the strip fired). Instead
+#     RELOCATE the tail marker to the last STABLE message, just below the
+#     doomed block: the skeleton delta is written once at 5m, the doomed
+#     thinking is read exactly once at 1x, and nothing is ever invalidated.
+#   - Last assistant message clean: everything below the tail is post-strip
+#     skeleton, byte-stable next round -> the CLI's marker stands untouched
+#     (byte-stock wire).
+# No second marker, no donors, no TTL ladder: the budget can only shrink, so
+# the anchor-steal / budget_full / 1h-after-5m defect class is structurally
+# unreachable. The relocated marker is 5m (turn-local scrap-cadence reuse;
+# every 1h marker — system, settled anchor — sits at a lower index, so
+# ordering stays legal). Skeleton entries survive INTO the turn transition:
+# the final doomed block was never cached, so the transition request hits the
+# last relocated entry exactly. Gate predicate depends only on the LAST
+# assistant message, which the strip never touches -> strip/gate ordering
+# cannot desync (the 4a0521e bug class needs no strip_rec plumbing here).
+MIDTURN_MARKER_GATE = os.environ.get("MIDTURN_MARKER_GATE", "1") not in (
     "0", "no", "off", "false")
 
 
 def _midturn_targets(msgs, boundary):
-    """(eligible_targets, skipped_sparse, think_idx) for the current turn.
-    think_idx = thinking-bearing assistant messages after the settled
-    boundary; targets = all but the newest STRIP_MIDTURN_KEEP of them;
-    ELIGIBLE targets are the dense-loop ones — successor thinking message
-    within STRIP_MIDTURN_MAX_GAP messages (see the knob comment for the
-    economics). Shared by the strip AND the pin so they cannot disagree
-    about whether this turn's texture is worth acting on."""
+    """(targets, protected_idx, think_idx) for the current turn. think_idx =
+    thinking-bearing assistant messages after the settled boundary;
+    protected_idx = the LAST assistant message of the turn iff it carries
+    thinking (the API's signature requirement binds there and ONLY there —
+    wire-proven 2026-07-20); targets = every other thinking-bearing message:
+    consumed the moment a later assistant message exists, deletable one round
+    after they were paid for. No texture gate (2026-07-20 redesign): the
+    marker gate keeps doomed thinking out of cache entirely, so a strip never
+    invalidates a cached span and sparse-texture ROI cannot go negative.
+    Eligibility 'no longer the last assistant message' is monotone (once
+    outrun, forever outrun) -> deterministic re-strip across rounds."""
+    last_asst = max((i for i in range(boundary + 1, len(msgs))
+                     if msgs[i].get("role") == "assistant"), default=None)
     think_idx = [i for i in range(boundary + 1, len(msgs))
                  if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
-    if len(think_idx) <= STRIP_MIDTURN_KEEP:
-        return [], 0, think_idx
-    targets = think_idx[:-STRIP_MIDTURN_KEEP]
-    eligible, sparse = [], 0
-    for k, i in enumerate(targets):
-        if think_idx[k + 1] - i <= STRIP_MIDTURN_MAX_GAP:
-            eligible.append(i)
-        else:
-            sparse += 1
-    return eligible, sparse, think_idx
+    protected = last_asst if last_asst in think_idx else None
+    targets = [i for i in think_idx if i != last_asst]
+    return targets, protected, think_idx
 
 
 def _strip_midturn_thinking(obj, agent_id=None):
     """Inside the CURRENT turn (at/after the settled boundary), delete
-    thinking blocks from every ELIGIBLE thinking-bearing assistant message
-    behind the keep-window (dense-loop texture only — _midturn_targets).
-    Prior turns untouched (that's _strip_prior_thinking's region). Whole-block
+    thinking blocks from every consumed thinking-bearing assistant message —
+    everything except the last assistant message (_midturn_targets). Prior
+    turns untouched (that's _strip_prior_thinking's region). Whole-block
     deletion only — signatures never edited. Gated per-session via
     _midturn_strip_active (L1+, same channel as the settled strip). Returns a
     log dict or None."""
@@ -2615,17 +2607,11 @@ def _strip_midturn_thinking(obj, agent_id=None):
     if not isinstance(msgs, list) or not msgs:
         return None
     boundary = _settled_boundary(msgs)
-    eligible, skipped_sparse, think_idx = _midturn_targets(msgs, boundary)
-    if not eligible:
-        if skipped_sparse:                # thinking present, texture-gated
-            return {"stripped": False, "reason": "sparse_turn",
-                    "skipped_sparse_blocks": skipped_sparse,
-                    "max_gap": STRIP_MIDTURN_MAX_GAP,
-                    "current_turn_thinking_msgs": len(think_idx),
-                    "boundary_idx": boundary}
-        return None                       # nothing behind the keep-window yet
+    targets, protected, think_idx = _midturn_targets(msgs, boundary)
+    if not targets:
+        return None                       # nothing consumed yet
     removed = stripped_chars = touched = 0
-    for i in eligible:
+    for i in targets:
         c = msgs[i].get("content")
         if not isinstance(c, list):
             continue
@@ -2640,154 +2626,72 @@ def _strip_midturn_thinking(obj, agent_id=None):
         return None
     return {"stripped": True, "removed_thinking_blocks": removed,
             "touched_messages": touched, "stripped_chars": stripped_chars,
-            "keep_window": STRIP_MIDTURN_KEEP, "boundary_idx": boundary,
+            "protected_idx": protected, "boundary_idx": boundary,
             "current_turn_thinking_msgs": len(think_idx),
-            "skipped_sparse_blocks": skipped_sparse,
             "total_messages": len(msgs)}
 
 
-def _midturn_head_idx(msgs, boundary):
-    """Index of the FRONTIER of the current turn's keep-window: the OLDEST
-    thinking-bearing assistant message the window still protects. That message
-    is the first thing the strip will delete next round — i.e. the exact
-    divergence point — so the pin must sit strictly before it. (With KEEP=1
-    this is simply the newest thinking message.) None when the turn has no
-    thinking yet. Shared by the mid-turn strip and pin so they cannot disagree
-    about where the moving frontier sits."""
-    idx = [i for i in range(boundary + 1, len(msgs))
-           if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
-    if not idx:
-        return None
-    return idx[max(0, len(idx) - STRIP_MIDTURN_KEEP)]
-
-
-def _pin_midturn_breakpoint(obj, agent_id=None, strip_rec=None):
-    """Pin a breakpoint on the message immediately BEFORE the current turn's
-    head thinking-bearing assistant message (op -1). Everything up to there is
-    in its FINAL stripped form — next round re-reads it exactly; only the head
-    op diverges. Only meaningful while the mid-turn strip is active (without
-    it the turn is append-only and the CLI's rolling tail already chains).
-    Budget-aware via donor migration (never steals system markers or the
-    rolling tail). Returns a log dict (`pinned` True/False + reason) or None
-    (disabled / no in-turn thinking yet)."""
-    if not PIN_MIDTURN_BREAKPOINT or not _midturn_strip_active(obj, agent_id):
+def _midturn_marker_gate(obj, agent_id=None):
+    """The placement decision (see block comment above): when the current
+    turn's last assistant message carries protected thinking, pull the CLI's
+    rolling tail marker back to the last stable message (or drop it on the
+    turn's first thinking round, where the boundary anchor already covers
+    everything stable). Clean-tail rounds and transition requests return None
+    — byte-stock. Every message marker ABOVE the halt point is removed (any
+    of them would cache doomed bytes). Returns a log dict or None."""
+    if not MIDTURN_MARKER_GATE or not _midturn_strip_active(obj, agent_id):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return None
     boundary = _settled_boundary(msgs)
-    head = _midturn_head_idx(msgs, boundary)
-    if head is None or head <= 0:
-        return None                       # no moving frontier to anchor
-    eligible, skipped_sparse, _ = _midturn_targets(msgs, boundary)
-    if strip_rec is not None:
-        # Live-path order: the STRIP ran first on this same obj and already
-        # deleted its targets — recomputing here sees keep-window-only and
-        # would decline every round (AB2v2 T1 regression: pin dead on the
-        # wire while the suite, pinning unstripped bodies, stayed green).
-        # Trust the strip's own pre-mutation verdict instead.
-        acted = bool(strip_rec.get("stripped"))
-        skipped_sparse = strip_rec.get("skipped_sparse_blocks",
-                                       skipped_sparse) or skipped_sparse
-    else:
-        acted = bool(eligible)
-    if not acted:
-        # Texture-gated turn: the strip isn't deleting anything, so the turn
-        # is append-only on the wire and the CLI's rolling tail already
-        # chains it — a pin would spend budget for nothing.
-        if skipped_sparse:
-            return {"pinned": False, "reason": "sparse_turn",
-                    "skipped_sparse_blocks": skipped_sparse,
-                    "head_idx": head, "boundary_idx": boundary}
-        return None
-    pin_idx = head - 1
-    if pin_idx == len(msgs) - 1:
-        return None                       # would collide with the rolling tail
-    tgt = msgs[pin_idx]
+    last_asst = max((i for i in range(boundary + 1, len(msgs))
+                     if msgs[i].get("role") == "assistant"), default=None)
+    if last_asst is None:
+        return None                       # transition / turn-first: stock wire
+    if not _msg_thinking_chars(msgs[last_asst]):
+        return None                       # clean tail: CLI marker stands
+    marked = [(i, blk) for i, m in enumerate(msgs) if isinstance(m, dict)
+              for blk in (m.get("content") if isinstance(m.get("content"), list) else [])
+              if isinstance(blk, dict) and blk.get("cache_control")]
+    halt = last_asst - 1                  # >= boundary by construction
+    if not marked or marked[-1][0] <= boundary:
+        return {"acted": False, "reason": "no_inturn_tail_marker",
+                "protected_idx": last_asst, "boundary_idx": boundary}
+    if marked[-1][0] <= halt:
+        # marker already sits below the doomed block — nothing doomed is
+        # cached; leave placement alone (scrap-tail owns its ttl).
+        return {"acted": False, "reason": "tail_below_protected",
+                "tail_idx": marked[-1][0], "protected_idx": last_asst}
+    dropped = 0
+    for i, blk in marked:
+        if i > halt:
+            blk.pop("cache_control", None)
+            dropped += 1
+    log = {"acted": True, "tail_idx": marked[-1][0], "halt_idx": halt,
+           "protected_idx": last_asst, "boundary_idx": boundary,
+           "markers_dropped": dropped, "total_messages": len(msgs)}
+    if halt <= boundary:
+        # first round of the turn: the boundary anchor (settled pin, advanced)
+        # already covers the stable prefix — dropping the tail is the whole job.
+        log["mode"] = "dropped"
+        return log
+    tgt = msgs[halt]
     c = tgt.get("content")
     needs_convert = isinstance(c, str) and bool(c)
     if not needs_convert and (
             not isinstance(c, list) or not c or not isinstance(c[-1], dict)):
-        return {"pinned": False, "reason": "unmarkable_content",
-                "pin_idx": pin_idx, "head_idx": head}
+        log["mode"], log["reason"] = "dropped", "unmarkable_halt"
+        return log
     if not needs_convert and c[-1].get("cache_control"):
-        return {"pinned": False, "reason": "already_marked",
-                "pin_idx": pin_idx, "head_idx": head}
-    markers = _cache_markers(obj)
-    if not markers:
-        return {"pinned": False, "reason": "no_client_markers",
-                "pin_idx": pin_idx, "head_idx": head}
-    # TTL: loop scrap on a strip session -> 5m (scrap-tail downshifts the tail
-    # on the same sessions under the IDENTICAL gate, so no 1h marker follows
-    # and ordering stays legal). Anywhere else mirror the LAST marker's ttl —
-    # a bare 5m before a 1h marker is a hard 400 (longer TTLs must come
-    # first). Defensive: the 5m choice additionally requires the rolling tail
-    # to sit past the boundary (scrap-tail's own firing condition) — if the
-    # downshift wouldn't fire on this shape, mirror rather than assume.
-    tail_i = max((i for r, i, b in markers if r == "messages"), default=-1)
-    if (SCRAP_TAIL_5M and _strip_thinking_enabled(obj, agent_id)
-            and tail_i > boundary):
-        cc = {"type": "ephemeral", "ttl": "5m"}
-    else:
-        cc = dict(markers[-1][2]["cache_control"])
-    donor_idx = None
-    if len(markers) >= _CACHE_BREAKPOINT_BUDGET:
-        # Donor is 5m-ONLY — NEVER a 1h marker (AB2 postmortem 2026-07-20:
-        # the old highest-below-pin rule stole the settled 1h anchor every
-        # mid-loop round, leaving the whole history on 5m-only coverage).
-        # Preference: (1) a 5m message marker strictly below the pin (not
-        # msg0 — the cross-instance sharing anchor — and not the tail);
-        # (2) the rolling TAIL marker itself when it is loop scrap (past the
-        # boundary; scrap-tail downshifts it to 5m under this same gate) —
-        # losing it costs at most one op billed uncached next round, and the
-        # pin takes over round-to-round chaining; (3) else decline — a
-        # skipped pin is one round without an exact entry hit, strictly
-        # cheaper than surrendering 1h coverage.
-        def _is_5m(b):
-            return (b.get("cache_control") or {}).get("ttl", "5m") == "5m"
-        last_mi = len(msgs) - 1
-        donor = next(((r, i, b) for r, i, b in reversed(markers)
-                      if r == "messages" and 0 < i < pin_idx
-                      and i != last_mi and _is_5m(b)), None)
-        if donor is None:
-            tail = next(((r, i, b) for r, i, b in reversed(markers)
-                         if r == "messages" and i == last_mi), None)
-            if (tail is not None and tail[1] > boundary
-                    and (_is_5m(tail[2]) or SCRAP_TAIL_5M)):
-                donor = tail
-        if donor is None:
-            return {"pinned": False, "reason": "budget_full_no_donor",
-                    "pin_idx": pin_idx, "head_idx": head,
-                    "markers_total": len(markers)}
-        donor[2].pop("cache_control")
-        donor_idx = donor[1]
-        mode = "migrated_tail" if donor_idx == last_mi else "migrated"
-    else:
-        mode = "added"
-    # Ladder invariant (the defect's backstop, checked AFTER donor removal):
-    # never leave the message history on 5m-only coverage. System-side 1h
-    # markers cover tools+system, not messages; without a 1h message anchor
-    # below the pin, the settled history rides 5m entries — one >5m pause
-    # re-writes it at premium, every pause. When NO message marker survives
-    # below the pin at all, write the pin itself 1h (cumulative entry covers
-    # the full prefix; one 2x write buys durable coverage — legal, nothing
-    # 5m precedes it). When a surviving 5m marker sits below, the pin MUST
-    # stay 5m (a 1h marker after a 5m one is a hard 400, longer TTLs first)
-    # — coverage there is no worse than the incoming shape.
-    if cc.get("ttl", "5m") == "5m":
-        below = [(b.get("cache_control") or {}).get("ttl", "5m")
-                 for r, i, b in markers
-                 if r == "messages" and i < pin_idx and b.get("cache_control")]
-        if not below:
-            cc = {"type": "ephemeral", "ttl": "1h"}
+        log["mode"], log["reason"] = "dropped", "halt_already_marked"
+        return log
     if needs_convert:
         tgt["content"] = [{"type": "text", "text": c}]
-    tgt["content"][-1]["cache_control"] = cc
-    return {"pinned": True, "mode": mode, "pin_idx": pin_idx, "head_idx": head,
-            "donor_msg_idx": donor_idx, "ttl": cc.get("ttl"),
-            "converted_string": needs_convert, "boundary_idx": boundary,
-            "markers_total": len(markers) + (1 if mode == "added" else 0),
-            "total_messages": len(msgs)}
+    tgt["content"][-1]["cache_control"] = {"type": "ephemeral", "ttl": "5m"}
+    log["mode"], log["ttl"] = "relocated", "5m"
+    log["converted_string"] = needs_convert
+    return log
 
 
 def _edit_result_ids(msgs):

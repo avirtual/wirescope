@@ -1335,10 +1335,11 @@ async def handler(request: Request) -> Response:
                 if spt.get("removed_thinking_blocks"):
                     changed = True
             # MID-TURN THINKING STRIP (rides the per-session L-level, like the
-            # settled strip above — no separate tier): deletes thinking behind
-            # a keep-window INSIDE the current turn, op by op. Paired with the
-            # op-1 rolling pin below so each round is an entry hit + one-op 5m
-            # write. Kill switch STRIP_MIDTURN_THINKING=0.
+            # settled strip above — no separate tier): deletes consumed
+            # thinking INSIDE the current turn (everything but the last
+            # assistant message). Paired with the marker gate below, which
+            # keeps the doomed block out of cache so this deletion never
+            # invalidates an entry. Kill switch STRIP_MIDTURN_THINKING=0.
             smt = transforms_mod._strip_midturn_thinking(obj, agent_id=agent_id)
             if smt:
                 record["strip_midturn_thinking"] = smt
@@ -1436,21 +1437,23 @@ async def handler(request: Request) -> Response:
                     record["pin_settled_breakpoint"] = psb
                     if psb.get("pinned"):
                         changed = True
-            # PIN MIDTURN BREAKPOINT (op -1, rides STRIP_MIDTURN_THINKING):
-            # anchor the current turn's already-stripped span just below the
-            # keep-window frontier so each loop round is an exact entry hit +
-            # a one-op write, instead of a bust whose depth depends on where
-            # the CLI's rolling tail happens to sit. 5m on strip sessions
-            # (loop scrap; scrap-tail below downshifts the tail on the same
-            # condition, keeping ttl ordering legal). Runs AFTER the settled
-            # pin (may borrow its slot at full budget — the u_k entry is
-            # already written; markers are placement metadata).
-            pmb = transforms_mod._pin_midturn_breakpoint(
-                obj, agent_id=agent_id,
-                strip_rec=record.get("strip_midturn_thinking"))
-            if pmb:
-                record["pin_midturn_breakpoint"] = pmb
-                if pmb.get("pinned"):
+            # MID-TURN MARKER GATE (Bogdan's placement rule, replaces the
+            # op-1 pin): when the last assistant message carries protected
+            # thinking (doomed — stripped the moment it stops being last),
+            # the CLI's rolling tail marker would cache it at premium one
+            # round before deletion and the deletion would invalidate the
+            # entry. Relocate the tail marker to the last stable message
+            # instead (drop it on the turn's first round): doomed thinking is
+            # read once at 1x, never written, never invalidated. Clean-tail
+            # rounds are byte-stock. Predicate reads only the last assistant
+            # message (which the strip never touches) -> order-safe by
+            # construction. Runs AFTER the settled pin (anchor placed on the
+            # final list), BEFORE scrap-tail (which then only sees a tail
+            # marker on clean rounds).
+            mmg = transforms_mod._midturn_marker_gate(obj, agent_id=agent_id)
+            if mmg:
+                record["midturn_marker_gate"] = mmg
+                if mmg.get("acted"):
                     changed = True
             # SCRAP-TAIL 5m (L1 strip sessions): once we know this turn's frontier
             # will be stripped+rewritten next turn, write that doomed cache at 5m

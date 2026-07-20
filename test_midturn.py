@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Mid-turn strip + op-1 pin — regression suite for the AB2 postmortem fixes
-(2026-07-20): (a) donor never steals a 1h marker (the anchor-steal defect),
-(b) sparse-texture gate (30x negative ROI on sparse turns), (c) ladder
-invariant (never 5m-only message coverage). Plus determinism/monotonicity of
-the gap gate across rounds."""
+"""Mid-turn strip + marker gate — the 2026-07-20 redesign (Bogdan's placement
+rule, replacing the op-1 pin): doomed thinking is NEVER cached. Per request:
+strip every consumed thinking block (everything but the last assistant
+message); then, if the last assistant message still carries thinking, pull the
+CLI's rolling tail marker back to the last stable message so the doomed block
+is read once at 1x instead of written at premium and invalidated (the AB2
+churn). Clean-tail rounds are byte-stock. Invariants: budget never grows, no
+marker ever sits above the halt point on a doomed round, 1h anchors are never
+touched, strip/gate cannot desync (gate predicate reads only the last
+assistant message, which the strip never mutates)."""
 import copy
 import json
 
@@ -64,38 +69,49 @@ def n_thinking(msgs):
                if isinstance(blk, dict) and blk.get("type") == "thinking")
 
 
+def msg_markers_of(b):
+    return [(i, blk["cache_control"]["ttl"]) for i, m in enumerate(b["messages"])
+            for blk in (m.get("content") if isinstance(m.get("content"), list) else [])
+            if isinstance(blk, dict) and blk.get("cache_control")]
+
+
 # force the L1 gate on for the suite (kill switches already default-on)
 t.STRIP_PRIOR_THINKING = True
 t.STRIP_MIDTURN_THINKING = True
-t.PIN_MIDTURN_BREAKPOINT = True
+t.MIDTURN_MARKER_GATE = True
 
-print("== gap gate: dense turn strips, keep-window protected ==")
-msgs = turn("task", [True, True, True, True])   # thinking every round, gap 2
+print("== strip: dense turn — all consumed blocks go, last assistant protected ==")
+msgs = turn("task", [True, True, True, True])   # thinking every round
 b = body(msgs)
 rec = t._strip_midturn_thinking(b)
 check("dense strips", rec and rec.get("stripped") is True)
-check("3 of 4 removed (keep=1)", rec and rec["removed_thinking_blocks"] == 3, str(rec))
-check("head survives", n_thinking(b["messages"]) == 1)
-check("no sparse skips", rec and rec.get("skipped_sparse_blocks") == 0)
+check("3 of 4 removed (last assistant protected)", rec and rec["removed_thinking_blocks"] == 3, str(rec))
+check("protected block survives", n_thinking(b["messages"]) == 1)
+check("protected_idx = last assistant", rec and rec.get("protected_idx") == len(msgs) - 2, str(rec))
 
-print("== gap gate: sparse turn declines (the AB2 T4 texture) ==")
-msgs = turn("task", [True] + [False] * 9 + [True])   # gap 20 > MAX_GAP
+print("== strip: clean tail strips EVERYTHING (consumed = deletable) ==")
+msgs = turn("task", [True, True, True, False])  # final round plain
 b = body(msgs)
 rec = t._strip_midturn_thinking(b)
-check("sparse declines", rec and rec.get("stripped") is False and rec.get("reason") == "sparse_turn", str(rec))
-check("nothing deleted", n_thinking(b["messages"]) == 2)
-pin = t._pin_midturn_breakpoint(body(msgs, msg_markers=((len(msgs) - 1, "5m"),)))
-check("pin declines sparse too", pin and pin.get("pinned") is False and pin.get("reason") == "sparse_turn", str(pin))
+check("all 3 removed", rec and rec["removed_thinking_blocks"] == 3, str(rec))
+check("no thinking left", n_thinking(b["messages"]) == 0)
+check("protected_idx None (clean last assistant)", rec and rec.get("protected_idx") is None, str(rec))
 
-print("== gap gate: mixed texture strips only the dense block ==")
-msgs = turn("task", [True, True] + [False] * 9 + [True])  # gaps: 2 (dense), 20 (sparse)
+print("== strip: sparse turn strips too (texture gate retired) ==")
+msgs = turn("task", [True] + [False] * 9 + [True])   # old sparse_turn shape
 b = body(msgs)
 rec = t._strip_midturn_thinking(b)
-check("mixed strips dense only", rec and rec["removed_thinking_blocks"] == 1
-      and rec["skipped_sparse_blocks"] == 1, str(rec))
-check("2 thinking remain (sparse + head)", n_thinking(b["messages"]) == 2)
+check("sparse strips now", rec and rec.get("stripped") is True
+      and rec["removed_thinking_blocks"] == 1, str(rec))
+check("only the protected head remains", n_thinking(b["messages"]) == 1)
 
-print("== determinism: round k+1 resend reproduces round k's stripped prefix ==")
+print("== strip: single thinking block at the head -> nothing consumed yet ==")
+msgs = turn("task", [True])
+b = body(msgs)
+check("declines (None)", t._strip_midturn_thinking(b) is None)
+check("body untouched", n_thinking(b["messages"]) == 1)
+
+print("== strip: determinism + monotonicity across rounds ==")
 msgs_k = turn("task", [True, True, True])
 msgs_k1 = turn("task", [True, True, True, True])       # CLI resends everything + new round
 bk, bk1 = body(msgs_k), body(msgs_k1)
@@ -108,83 +124,117 @@ check("common prefix byte-stable", same)
 check("k's head stripped in k+1 (monotone)",
       n_thinking(bk1["messages"]) == 1 and n_thinking(bk["messages"]) == 1)
 
-print("== donor: NEVER the 1h anchor; tail is the fallback donor ==")
-msgs = turn("task", [True, True, True, True])
-last = len(msgs) - 1
-# budget full: 2 system + 1h anchor on msg2 + 5m tail = 4 markers
-b = body(msgs, msg_markers=((2, "1h"), (last, "5m")))
-pin = t._pin_midturn_breakpoint(b)
-check("pin fired", pin and pin.get("pinned") is True, str(pin))
-check("donor is the TAIL, not the anchor", pin and pin.get("mode") == "migrated_tail"
-      and pin.get("donor_msg_idx") == last, str(pin))
-anchor_cc = b["messages"][2]["content"][-1].get("cache_control")
-check("1h anchor SURVIVES", anchor_cc == {"type": "ephemeral", "ttl": "1h"})
-check("pin is 5m (1h coverage below)", pin and pin.get("ttl") == "5m")
-tail_cc = b["messages"][last]["content"][-1].get("cache_control")
-check("tail marker removed", tail_cc is None)
+print("== gate: doomed round RELOCATES the tail marker below the block ==")
+msgs = turn("task", [True, True])
+last = len(msgs) - 1                     # tool_result tail
+prot = last - 1                          # thinking-bearing last assistant
+b = body(msgs, msg_markers=((last, "1h"),))
+rec = t._midturn_marker_gate(b)
+check("acted + relocated", rec and rec.get("acted") and rec.get("mode") == "relocated", str(rec))
+check("halt just below the doomed block", rec and rec.get("halt_idx") == prot - 1, str(rec))
+mm = msg_markers_of(b)
+check("single 5m marker at halt, tail gone", mm == [(prot - 1, "5m")], str(mm))
 
-print("== donor: 5m marker below pin preferred over tail ==")
-msgs = turn("task", [True, True, True, True])
-last = len(msgs) - 1
-b = body(msgs, msg_markers=((1, "5m"), (last, "5m")))   # msg1 = old 5m loop marker
-pin = t._pin_midturn_breakpoint(b)
-check("5m donor migrated", pin and pin.get("pinned") and pin.get("mode") == "migrated"
-      and pin.get("donor_msg_idx") == 1, str(pin))
-check("tail survives", b["messages"][last]["content"][-1].get("cache_control") is not None)
+print("== gate: clean tail is byte-stock (None, marker untouched) ==")
+msgs = turn("task", [True, False])
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
+snap = json.dumps(b, sort_keys=True)
+check("gate None", t._midturn_marker_gate(b) is None)
+check("body untouched", json.dumps(b, sort_keys=True) == snap)
 
-print("== donor: decline when only 1h markers available and tail not stealable ==")
-old_scrap = t.SCRAP_TAIL_5M
-t.SCRAP_TAIL_5M = False
-msgs = turn("task", [True, True, True, True])
-last = len(msgs) - 1
-b = body(msgs, msg_markers=((2, "1h"), (last, "1h")))   # 1h tail, scrap off
-pin = t._pin_midturn_breakpoint(b)
-check("declines rather than steal 1h", pin and pin.get("pinned") is False
-      and pin.get("reason") == "budget_full_no_donor", str(pin))
-check("anchor untouched on decline",
-      b["messages"][2]["content"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
-check("tail untouched on decline",
-      b["messages"][last]["content"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "1h"})
-t.SCRAP_TAIL_5M = old_scrap
+print("== gate: first thinking round -> marker DROPPED (anchor covers stable) ==")
+msgs = turn("task", [True])              # halt == boundary
+b = body(msgs, msg_markers=((0, "1h"), (len(msgs) - 1, "1h")))   # anchor + tail
+rec = t._midturn_marker_gate(b)
+check("dropped mode", rec and rec.get("acted") and rec.get("mode") == "dropped", str(rec))
+mm = msg_markers_of(b)
+check("only the boundary anchor remains", mm == [(0, "1h")], str(mm))
 
-print("== ladder invariant: no message marker below pin -> pin goes 1h ==")
-msgs = turn("task", [True, True, True, True])
-last = len(msgs) - 1
-b = body(msgs, sys_markers=2, msg_markers=((last, "5m"),))  # 3 markers, budget free
-pin = t._pin_midturn_breakpoint(b)
-check("pin fired (added)", pin and pin.get("pinned") and pin.get("mode") == "added", str(pin))
-check("pin upgraded to 1h", pin and pin.get("ttl") == "1h", str(pin))
+print("== gate: transition request (no assistant past boundary) -> stock ==")
+msgs = turn("task", [True, True]) + [{"role": "user", "content": "next task"}]
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
+check("gate None at transition", t._midturn_marker_gate(b) is None)
 
-print("== LIVE ORDER: strip mutates first, pin still fires via strip_rec ==")
-# The AB2v2 T1 regression: server runs strip BEFORE pin on the same obj; a
-# pin that recomputes targets post-strip sees keep-window-only and declines
-# every round. The pin must trust the strip's pre-mutation verdict.
+print("== gate: every marker above the halt is removed (no doomed bytes cached) ==")
+msgs = turn("task", [True, True, True])
+last = len(msgs) - 1
+prot = last - 1
+b = body(msgs, msg_markers=((prot, "5m"), (last, "1h")))   # stray marker ON the doomed msg
+rec = t._midturn_marker_gate(b)
+check("both dropped, one placed", rec and rec.get("markers_dropped") == 2, str(rec))
+mm = msg_markers_of(b)
+check("only halt marked", mm == [(prot - 1, "5m")], str(mm))
+
+print("== gate: 1h anchor below halt is never touched; ordering stays legal ==")
+msgs = turn("task", [True, True, True])
+last = len(msgs) - 1
+b = body(msgs, msg_markers=((0, "1h"), (last, "1h")))
+rec = t._midturn_marker_gate(b)
+check("relocated", rec and rec.get("mode") == "relocated", str(rec))
+mm = msg_markers_of(b)
+check("anchor 1h below, halt 5m above (legal order)",
+      mm == [(0, "1h"), (last - 2, "5m")], str(mm))
+
+print("== gate: halt already marked -> tail dropped, no duplicate ==")
+msgs = turn("task", [True, True])
+last = len(msgs) - 1
+prot = last - 1
+b = body(msgs, msg_markers=((prot - 1, "5m"), (last, "1h")))
+rec = t._midturn_marker_gate(b)
+check("dropped w/ reason", rec and rec.get("mode") == "dropped"
+      and rec.get("reason") == "halt_already_marked", str(rec))
+mm = msg_markers_of(b)
+check("single marker at halt", mm == [(prot - 1, "5m")], str(mm))
+
+print("== gate: budget never grows ==")
+for rounds, markers in (([True, True], ((3, "1h"), (4, "1h"))),
+                        ([True, True, True], ((0, "1h"), (6, "1h"))),
+                        ([True], ((2, "1h"),))):
+    msgs = turn("task", rounds)
+    b = body(msgs, msg_markers=markers)
+    before = len(msg_markers_of(b))
+    t._midturn_marker_gate(b)
+    check(f"markers {before} -> {len(msg_markers_of(b))} (<=)",
+          len(msg_markers_of(b)) <= before)
+
+print("== gate: string-content halt converts to a text block ==")
+msgs = [{"role": "user", "content": "task"},
+        think_msg(0), result_msg(0),
+        {"role": "assistant", "content": "interim answer"},   # string content
+        think_msg(1), result_msg(1)]
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
+rec = t._midturn_marker_gate(b)
+check("relocated w/ conversion", rec and rec.get("mode") == "relocated"
+      and rec.get("converted_string") is True, str(rec))
+halt = b["messages"][rec["halt_idx"]]
+check("converted shape", isinstance(halt["content"], list)
+      and halt["content"][0]["type"] == "text"
+      and halt["content"][-1].get("cache_control") == {"type": "ephemeral", "ttl": "5m"})
+
+print("== live order: strip mutates first, gate unaffected (4a0521e class dead) ==")
 msgs = turn("task", [True, True, True, True])
-b = body(msgs, sys_markers=2, msg_markers=((len(msgs) - 1, "1h"),))
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
 rec = t._strip_midturn_thinking(b)
 check("strip fired first", rec and rec.get("stripped") is True)
-pin = t._pin_midturn_breakpoint(b, strip_rec=rec)
-check("pin fires on the stripped body", pin and pin.get("pinned") is True, str(pin))
-check("pin sits at head-1 (op -1)", pin and pin.get("pin_idx") == pin.get("head_idx") - 1, str(pin))
-check("ladder: pin 1h (no msg marker below)", pin and pin.get("ttl") == "1h", str(pin))
-pin2 = t._pin_midturn_breakpoint(b, strip_rec=None)
-check("without strip_rec the regression reproduces (pin silent)", pin2 is None, str(pin2))
-
-print("== LIVE ORDER: sparse strip decline propagates to pin via strip_rec ==")
-msgs = turn("task", [True] + [False] * 9 + [True])
-b = body(msgs, msg_markers=((len(msgs) - 1, "5m"),))
+g = t._midturn_marker_gate(b)
+check("gate still fires on the stripped body", g and g.get("acted")
+      and g.get("mode") == "relocated", str(g))
+msgs = turn("task", [True, True, False])
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
 rec = t._strip_midturn_thinking(b)
-check("strip declined sparse", rec and rec.get("stripped") is False)
-pin = t._pin_midturn_breakpoint(b, strip_rec=rec)
-check("pin declines sparse via strip_rec", pin and pin.get("pinned") is False
-      and pin.get("reason") == "sparse_turn", str(pin))
+check("clean-tail strip removed all", rec and rec["removed_thinking_blocks"] == 2)
+check("gate stock on clean tail post-strip", t._midturn_marker_gate(b) is None)
 
-print("== ladder invariant: surviving 5m below keeps pin 5m (ordering legality) ==")
-msgs = turn("task", [True, True, True, True])
-last = len(msgs) - 1
-b = body(msgs, sys_markers=1, msg_markers=((1, "5m"), (last, "5m")))  # 3 markers
-pin = t._pin_midturn_breakpoint(b)
-check("pin stays 5m after 5m marker", pin and pin.get("pinned") and pin.get("ttl") == "5m", str(pin))
+print("== kill switches ==")
+msgs = turn("task", [True, True])
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
+t.MIDTURN_MARKER_GATE = False
+check("gate off -> None", t._midturn_marker_gate(b) is None)
+t.MIDTURN_MARKER_GATE = True
+t.STRIP_MIDTURN_THINKING = False
+check("strip kill also silences the gate", t._midturn_marker_gate(b) is None)
+check("strip off -> None", t._strip_midturn_thinking(b) is None)
+t.STRIP_MIDTURN_THINKING = True
 
 print(f"\n{CHECKS['pass']} passed, {CHECKS['fail']} failed")
 raise SystemExit(1 if CHECKS["fail"] else 0)
