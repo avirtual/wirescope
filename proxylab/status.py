@@ -1,24 +1,7 @@
-import asyncio
-import atexit
 import collections
-import hashlib
-import html
-import itertools
 import json
-import os
-import queue
 import re
-import sqlite3
-import threading
 import time
-import uuid
-from pathlib import Path
-
-import httpx
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
-from starlette.routing import Route
 
 from proxylab import billing as billing_mod
 from proxylab import codex as codex_mod
@@ -68,6 +51,22 @@ def _identity():
             # (whole mutation chain skipped) — the experiment's CONTROL. Analyzers
             # read this to label an arm without guessing from the env.
             "passthrough": transforms_mod.PASSTHROUGH,
+            # Control-plane auth: true = this deployment requires ENDPOINT_TOKEN
+            # on every /_ endpoint except this handshake (send Bearer or ?token=).
+            "endpoint_token": bool(core_mod.ENDPOINT_TOKEN),
+            # Honesty panel: the proxy HAS first-party content-mutation
+            # facilities (request injection, response mutation, short-circuit) —
+            # all default-off experiment flags, but a consumer integrating with
+            # an unknown deployment deserves to SEE whether they're armed rather
+            # than trust the default. Same discipline as `passthrough` (which,
+            # when true, keeps all of these inert regardless of arming).
+            "mutation_armed": {
+                "inject": bool(transforms_mod.INJECT
+                               or transforms_mod.INJECT_FILE),
+                "resp_mutate": bool(transforms_mod.RESP_APPEND
+                                    or transforms_mod.RESP_REPLACE),
+                "shortcircuit": bool(transforms_mod.SHORTCIRCUIT_DONE),
+            },
             "subscribers": subs_mod.SUBSCRIBERS,
             "warmth": warmth_mod.WARMTH_LEDGER,
             "ping": pinger_mod.WARMTH_PINGER,

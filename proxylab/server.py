@@ -1,21 +1,10 @@
 import asyncio
-import atexit
-import collections
 import contextlib
-import hashlib
-import html
-import itertools
 import json
 import os
-import queue
 import re
-import sqlite3
-import threading
 import time
-import uuid
-from pathlib import Path
 
-import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
@@ -537,6 +526,15 @@ def _compact_path_allowed(path):
                    for root in COMPACT_PATH_ROOTS)
 
 
+def _endpoint_auth_ok(auth_header, token_param):
+    """Control-plane gate predicate (see the handler's gate block). Reads
+    core_mod.ENDPOINT_TOKEN live so a scratch A/B can flip it on the module."""
+    tok = core_mod.ENDPOINT_TOKEN
+    if not tok:
+        return True
+    return auth_header == f"Bearer {tok}" or token_param == tok
+
+
 async def handler(request: Request) -> Response:
     # ---- identity: "is this our proxy?" handshake for subscribers -------------
     # GET /_identity — read-only, unauthenticated, spends nothing. Lets a
@@ -547,6 +545,19 @@ async def handler(request: Request) -> Response:
         return Response(json.dumps(res, indent=2),
                         media_type="application/json",
                         headers={"X-Wirescope-Version": core_mod.VERSION})
+
+    # ---- control-plane auth gate (opt-in; open item (g)) ----------------------
+    # ENDPOINT_TOKEN set → every /_ endpoint below this line requires it
+    # (/_identity above stays open — it's the discovery handshake and spends
+    # nothing). One rule for the whole surface instead of a per-endpoint
+    # classification to get wrong; /_subscribe's own SUBSCRIBERS_TOKEN still
+    # applies on top. Accepts Bearer header or ?token= (the HTML views are
+    # browser-visited). Unset (default) = open, exactly as before.
+    if request.url.path.rstrip("/").startswith("/_") and not _endpoint_auth_ok(
+            request.headers.get("authorization", ""),
+            request.query_params.get("token")):
+        return Response(json.dumps({"error": "unauthorized"}),
+                        status_code=401, media_type="application/json")
 
     # ---- status: what sessions are tracked + warmth/hold/identity/cost --------
     # GET /_status[?session=<id>][&all=1] — read-only, spends nothing.
@@ -1474,6 +1485,23 @@ async def handler(request: Request) -> Response:
         # count it: a persistent crash here must not look like client garbage.
         record["transform_error"] = repr(e)
         core_mod.ERROR_COUNTS["transform_errors"] += 1
+        # Fail-open has a CACHE cost the counter alone hides: on a session whose
+        # cached lineage is latched STRIPPED, the verbatim (unstripped) bytes
+        # diverge at the settled boundary → a full-depth cold write, potentially
+        # the priciest single request of the session. Say so in the record so a
+        # persistent crash on a long strip session prices as what it is. Read
+        # the latch directly (no _strip_level call — that has sticky-store side
+        # effects); annotation is best-effort, never allowed to break fail-open.
+        try:
+            sid = (writer_mod._session_ids(obj) or [None])[0] \
+                if isinstance(obj, dict) else None
+            if sid and transforms_mod._STRIP_GUARD_LATCH.get(sid):
+                record["transform_error_likely_bust"] = True
+                print(f"[transform-error] #{n} session {sid[:12]}… is "
+                      "strip-latched — verbatim forward likely busts the "
+                      "stripped lineage (full-depth cold write)", flush=True)
+        except Exception:
+            pass
         print(f"[transform-error] #{n} {agent} {type(e).__name__}: {e} — "
               "request forwarded verbatim (fail-open), transforms skipped",
               flush=True)

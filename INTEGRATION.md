@@ -19,7 +19,9 @@ In return for routing through it you get:
 - **the ability to keep a session's cache warm** between turns.
 
 Cost to you: nothing on the byte path (capture is off-thread; a dead subscriber never blocks or fails an agent's stream).
-The endpoints are **localhost, lab-grade, currently unauthenticated** — see Caveats.
+The endpoints are **localhost, lab-grade, unauthenticated by default** — see Caveats.
+A deployment MAY opt in to a control-plane token (`ENDPOINT_TOKEN` env): when armed, every `/_` endpoint **except `/_identity`** returns 401 without it — send `Authorization: Bearer <token>` (or `?token=<token>`).
+Detect via `capabilities.endpoint_token` on `/_identity` (which stays open precisely so you can discover this before your first gated call).
 
 ## Step 1 — confirm it's us (`GET /_identity`)
 
@@ -44,6 +46,8 @@ Before you integrate, probe the proxy ROOT and check the product marker:
 `capabilities.passthrough` is `true` when the deployment runs with `WIRESCOPE_PASSTHROUGH=1` (verbatim forward, all transforms off); `false` means the default transforms + directives are active.
 
 - **Branch on `product == "wirescope"`.** A different proxy 404s `/_identity` or returns a body without these fields — don't attempt wirescope-specific calls.
+- **`capabilities.endpoint_token`** (bool): this deployment requires the control-plane token on every other `/_` endpoint (see the note above Step 1).
+- **`capabilities.mutation_armed`** (`{inject, resp_mutate, shortcircuit}`): honesty panel — whether the proxy's first-party content-mutation experiment flags (request injection / response mutation / short-circuit) are LIVE on this deployment. All default off; a `true` here means forwarded conversations on this port may be altered by design. `passthrough:true` keeps them inert regardless.
 - `capabilities` are the **live** flags of *this* process (env can disable a subsystem). Gate every feature on them — e.g. only call `/_ping` when `ping` is true. `endpoints` tells you where each one lives.
 - Also returned as the `X-Wirescope-Version` response header (cheap sniff).
 

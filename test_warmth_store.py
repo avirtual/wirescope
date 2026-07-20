@@ -4286,6 +4286,25 @@ check("compact path traversal out of the root is refused (realpath, not prefix)"
       not _ok_out and not _ok_pfx)
 lp.server.COMPACT_PATH_ROOTS = _saved_roots
 
+# --- control-plane auth gate (ENDPOINT_TOKEN, opt-in) -----------------------------
+# unset = open (the lab default); set = Bearer or ?token= required, wrong/absent
+# creds refused. Flip on core (the owning module) per the shim-rebinding rule.
+_saved_tok = lp.core.ENDPOINT_TOKEN
+lp.core.ENDPOINT_TOKEN = ""
+check("endpoint gate open when no token configured",
+      lp.server._endpoint_auth_ok("", None))
+lp.core.ENDPOINT_TOKEN = "sekrit"
+check("endpoint gate accepts Bearer header",
+      lp.server._endpoint_auth_ok("Bearer sekrit", None))
+check("endpoint gate accepts token query param",
+      lp.server._endpoint_auth_ok("", "sekrit"))
+check("endpoint gate refuses wrong/absent creds",
+      not lp.server._endpoint_auth_ok("", None)
+      and not lp.server._endpoint_auth_ok("Bearer wrong", None)
+      and not lp.server._endpoint_auth_ok("sekrit", None)   # bare, not Bearer
+      and not lp.server._endpoint_auth_ok("", "wrong"))
+lp.core.ENDPOINT_TOKEN = _saved_tok
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
