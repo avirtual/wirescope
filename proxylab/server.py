@@ -1436,6 +1436,20 @@ async def handler(request: Request) -> Response:
                     record["pin_settled_breakpoint"] = psb
                     if psb.get("pinned"):
                         changed = True
+            # PIN MIDTURN BREAKPOINT (op -1, rides STRIP_MIDTURN_THINKING):
+            # anchor the current turn's already-stripped span just below the
+            # keep-window frontier so each loop round is an exact entry hit +
+            # a one-op write, instead of a bust whose depth depends on where
+            # the CLI's rolling tail happens to sit. 5m on strip sessions
+            # (loop scrap; scrap-tail below downshifts the tail on the same
+            # condition, keeping ttl ordering legal). Runs AFTER the settled
+            # pin (may borrow its slot at full budget — the u_k entry is
+            # already written; markers are placement metadata).
+            pmb = transforms_mod._pin_midturn_breakpoint(obj, agent_id=agent_id)
+            if pmb:
+                record["pin_midturn_breakpoint"] = pmb
+                if pmb.get("pinned"):
+                    changed = True
             # SCRAP-TAIL 5m (L1 strip sessions): once we know this turn's frontier
             # will be stripped+rewritten next turn, write that doomed cache at 5m
             # (1.25x) instead of 1h (2x). Runs AFTER the pin so the pin (1h) stays a

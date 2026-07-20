@@ -2520,6 +2520,28 @@ def _strip_prior_thinking(obj, agent_id=None):
 STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "0") not in ("0", "no", "off", "false")
 STRIP_MIDTURN_KEEP = max(1, int(os.environ.get("STRIP_MIDTURN_KEEP", "1")))
 
+# PIN MIDTURN BREAKPOINT — the settled-boundary machinery moved INSIDE the turn
+# (bogdan's "cache boundary at current op -1", 2026-07-20). The mid-turn strip
+# makes round k+1's bytes identical to round k's FORWARDED (stripped) bytes all
+# the way up to the previous head's thinking — that block is the only thing
+# that changed (it just became strippable). So pin a breakpoint on the message
+# IMMEDIATELY BEFORE the head thinking-bearing assistant message: next round is
+# an exact entry hit there and the write is one op's worth (the head op in
+# stripped form + its tool_result + the new head). Without it the per-round
+# bust depth is at the mercy of the CLI's rolling tail placement — the fable
+# plateau pattern (probe 2026-07-20) vs opus's monotone.
+# TTL: on an L1+ strip session the mid-turn span is LOOP SCRAP (superseded in
+# seconds, re-read within seconds) -> 5m is the reuse-gap-correct write
+# (scrap-tail's argument moved inward; scrap-tail downshifts the rolling tail
+# on the same sessions, so no 1h marker follows and ordering stays legal). On
+# a non-strip session mirror the tail's ttl (a bare 5m before a 1h tail is a
+# hard 400). Durable anchors are untouched: the turn-start boundary write and
+# the settled pin stay 1h — mid-loop the settled pin YIELDS its slot to this
+# one (server chain), safe because the u_k entry was already written by the
+# turn's first request; cache entries persist, marker placement never deletes.
+PIN_MIDTURN_BREAKPOINT = os.environ.get("PIN_MIDTURN_BREAKPOINT", "1") not in (
+    "0", "no", "off", "false")
+
 
 def _strip_midturn_thinking(obj):
     """PROBE: inside the CURRENT turn (at/after the settled boundary), delete
@@ -2556,6 +2578,101 @@ def _strip_midturn_thinking(obj):
             "touched_messages": touched, "stripped_chars": stripped_chars,
             "keep_window": STRIP_MIDTURN_KEEP, "boundary_idx": boundary,
             "current_turn_thinking_msgs": len(think_idx),
+            "total_messages": len(msgs)}
+
+
+def _midturn_head_idx(msgs, boundary):
+    """Index of the FRONTIER of the current turn's keep-window: the OLDEST
+    thinking-bearing assistant message the window still protects. That message
+    is the first thing the strip will delete next round — i.e. the exact
+    divergence point — so the pin must sit strictly before it. (With KEEP=1
+    this is simply the newest thinking message.) None when the turn has no
+    thinking yet. Shared by the mid-turn strip and pin so they cannot disagree
+    about where the moving frontier sits."""
+    idx = [i for i in range(boundary + 1, len(msgs))
+           if msgs[i].get("role") == "assistant" and _msg_thinking_chars(msgs[i])]
+    if not idx:
+        return None
+    return idx[max(0, len(idx) - STRIP_MIDTURN_KEEP)]
+
+
+def _pin_midturn_breakpoint(obj, agent_id=None):
+    """Pin a breakpoint on the message immediately BEFORE the current turn's
+    head thinking-bearing assistant message (op -1). Everything up to there is
+    in its FINAL stripped form — next round re-reads it exactly; only the head
+    op diverges. Only meaningful while the mid-turn strip is active (without
+    it the turn is append-only and the CLI's rolling tail already chains).
+    Budget-aware via donor migration (never steals system markers or the
+    rolling tail). Returns a log dict (`pinned` True/False + reason) or None
+    (disabled / no in-turn thinking yet)."""
+    if not PIN_MIDTURN_BREAKPOINT or not STRIP_MIDTURN_THINKING:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    msgs = obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    boundary = _settled_boundary(msgs)
+    head = _midturn_head_idx(msgs, boundary)
+    if head is None or head <= 0:
+        return None                       # no moving frontier to anchor
+    pin_idx = head - 1
+    if pin_idx == len(msgs) - 1:
+        return None                       # would collide with the rolling tail
+    tgt = msgs[pin_idx]
+    c = tgt.get("content")
+    needs_convert = isinstance(c, str) and bool(c)
+    if not needs_convert and (
+            not isinstance(c, list) or not c or not isinstance(c[-1], dict)):
+        return {"pinned": False, "reason": "unmarkable_content",
+                "pin_idx": pin_idx, "head_idx": head}
+    if not needs_convert and c[-1].get("cache_control"):
+        return {"pinned": False, "reason": "already_marked",
+                "pin_idx": pin_idx, "head_idx": head}
+    markers = _cache_markers(obj)
+    if not markers:
+        return {"pinned": False, "reason": "no_client_markers",
+                "pin_idx": pin_idx, "head_idx": head}
+    # TTL: loop scrap on a strip session -> 5m (scrap-tail downshifts the tail
+    # on the same sessions under the IDENTICAL gate, so no 1h marker follows
+    # and ordering stays legal). Anywhere else mirror the LAST marker's ttl —
+    # a bare 5m before a 1h marker is a hard 400 (longer TTLs must come
+    # first). Defensive: the 5m choice additionally requires the rolling tail
+    # to sit past the boundary (scrap-tail's own firing condition) — if the
+    # downshift wouldn't fire on this shape, mirror rather than assume.
+    tail_i = max((i for r, i, b in markers if r == "messages"), default=-1)
+    if (SCRAP_TAIL_5M and _strip_thinking_enabled(obj, agent_id)
+            and tail_i > boundary):
+        cc = {"type": "ephemeral", "ttl": "5m"}
+    else:
+        cc = dict(markers[-1][2]["cache_control"])
+    donor_idx = None
+    if len(markers) >= _CACHE_BREAKPOINT_BUDGET:
+        # Donor = the HIGHEST-index message marker strictly below the pin,
+        # excluding the rolling tail: typically the settled-turn anchor, whose
+        # 1h entry the turn-first request already wrote (entries persist;
+        # removing the MARKER deletes nothing) and whose prefix the op-1 pin's
+        # cumulative coverage subsumes. Deeper markers (msg0 bundle = the
+        # cross-instance sharing anchor) are kept by preference.
+        last_mi = len(msgs) - 1
+        donor = next(((r, i, b) for r, i, b in reversed(markers)
+                      if r == "messages" and i < pin_idx and i != last_mi), None)
+        if donor is None:
+            return {"pinned": False, "reason": "budget_full_no_donor",
+                    "pin_idx": pin_idx, "head_idx": head,
+                    "markers_total": len(markers)}
+        donor[2].pop("cache_control")
+        donor_idx = donor[1]
+        mode = "migrated"
+    else:
+        mode = "added"
+    if needs_convert:
+        tgt["content"] = [{"type": "text", "text": c}]
+    tgt["content"][-1]["cache_control"] = cc
+    return {"pinned": True, "mode": mode, "pin_idx": pin_idx, "head_idx": head,
+            "donor_msg_idx": donor_idx, "ttl": cc.get("ttl"),
+            "converted_string": needs_convert, "boundary_idx": boundary,
+            "markers_total": len(markers) + (1 if mode == "added" else 0),
             "total_messages": len(msgs)}
 
 
