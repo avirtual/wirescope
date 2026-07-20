@@ -333,6 +333,27 @@ t._strip_consumed_edit_acks(b_cold)
 check("cold vs incremental produce identical collapsed bytes (bust-free)",
       json.dumps(b_cold["messages"][2], sort_keys=True) ==
       json.dumps(b["messages"][2], sort_keys=True))
+
+# MARKER GATE must relocate below a LIVE frontier EDIT-ACK too (the seq10->11
+# read-drop bust: the CLI's rolling marker lands on the fresh raw ack [idx6],
+# next turn's collapse mutates that block -> the whole segment it anchors busts
+# back to the preamble. Fix: the ack joins thinking+error in the doomed set, so
+# the marker rides idx5 [one block before], leaving the doomed ack uncached.)
+b = body(copy.deepcopy(amsgs), msg_markers=((6, "1h"),))
+t._strip_consumed_edit_acks(b)            # in-turn strip runs first (as in server)
+g = t._midturn_marker_gate(b)
+check("gate acts on a live-edit-ack tail", g and g.get("acted") is True, str(g))
+check("gate flags the live edit-ack, NOT an error",
+      g and g.get("live_edit_ack") is True and g.get("live_error") is False, str(g))
+check("gate halt sits below the live ack (idx 5)", g and g.get("halt_idx") == 5, str(g))
+check("marker relocated off the doomed ack (idx 6) onto stable idx 5",
+      (6, "1h") not in msg_markers_of(b) and any(i == 5 for i, _ in msg_markers_of(b)),
+      str(msg_markers_of(b)))
+# a settled (consumed) ack with a PLAIN result tail is a clean tail -> gate stock
+b = body(copy.deepcopy(amsgs[:4]) + [result_msg(9)], msg_markers=((4, "1h"),))
+t._strip_consumed_edit_acks(b)
+check("gate stock when the frontier is a plain (non-ack) result",
+      t._midturn_marker_gate(b) is None)
 t.STRIP_PRIOR_EDIT_ACKS = False
 
 print("== kill switches ==")

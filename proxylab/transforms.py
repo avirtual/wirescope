@@ -2651,11 +2651,17 @@ def _strip_midturn_thinking(obj, agent_id=None):
 def _midturn_marker_gate(obj, agent_id=None):
     """The placement decision (see block comment above): never let the CLI's
     rolling tail marker cache a LIVE block — one the model still owes a reaction
-    to and that a later turn will therefore delete or stub. Two live classes
+    to and that a later turn will therefore delete or stub. Three live classes
     (2026-07-20 generalization, Bogdan): (a) THINKING in the last assistant
-    message (stripped the moment it stops being last), and (b) a frontier ERROR
+    message (stripped the moment it stops being last), (b) a frontier ERROR
     tool_result AFTER the last assistant message (stubbed the moment the model
-    reacts to it) — 'if current_block is thinking or error, don't write marker'.
+    reacts to it), and (c) a frontier EDIT-ACK tool_result after the last
+    assistant message (collapsed to "ok" the moment it is consumed) —
+    'if current_block is thinking or error or edit-ack, don't write marker'.
+    (c) added 2026-07-20 after a live read-drop trace: the CLI's rolling marker
+    lands on the fresh frontier ack, caches it RAW, and the next turn's collapse
+    mutates the block that marker anchors -> the whole segment behind it busts
+    (seq10->11: msg17 ack, read 46,191->38,980, 7.2k tok lost).
     Pull the tail marker back to the last stable message below the LOWEST live
     block (or drop it on the turn's first round, where the boundary anchor
     already covers everything stable). Clean-tail rounds and transition requests
@@ -2672,6 +2678,7 @@ def _midturn_marker_gate(obj, agent_id=None):
     if last_asst is None:
         return None                       # transition / turn-first: stock wire
     live = []                             # lowest-first list of LIVE block idxs
+    live_err_idx = live_ack_idx = None
     if _msg_thinking_chars(msgs[last_asst]):
         live.append(last_asst)            # (a) protected thinking
     if STRIP_PRIOR_TOOL_ERRORS or _strip_l2_enabled(obj, agent_id):
@@ -2685,7 +2692,31 @@ def _midturn_marker_gate(obj, agent_id=None):
                     and any(isinstance(b, dict) and b.get("type") == "tool_result"
                             and b.get("is_error") for b in m["content"])):
                 live.append(j)
+                live_err_idx = j
                 break
+    if STRIP_PRIOR_EDIT_ACKS or _strip_l2_enabled(obj, agent_id):
+        # (c) frontier EDIT-ACK: the lowest user tool_result AFTER last_asst that
+        # _strip_consumed_edit_acks WILL collapse to "ok" once it is consumed.
+        # SAME predicate as the strip (edit_ids pairing + fragment match) so gate
+        # and strip never disagree — a mismatch is exactly how the raw ack gets
+        # marker-anchored then busted. Only meaningful when the ack strip is active.
+        _eids = _edit_result_ids(msgs)
+        if _eids:
+            for j in range(last_asst + 1, len(msgs)):
+                m = msgs[j]
+                if not (isinstance(m, dict) and m.get("role") == "user"
+                        and isinstance(m.get("content"), list)):
+                    continue
+                if any(isinstance(b, dict) and b.get("type") == "tool_result"
+                       and b.get("tool_use_id") in _eids
+                       and not b.get("is_error")
+                       and isinstance(b.get("content"), str)
+                       and b["content"] != EDIT_ACK_MARKER
+                       and any(f in b["content"] for f in _EDIT_ACK_FRAGMENTS)
+                       for b in m["content"]):
+                    live.append(j)
+                    live_ack_idx = j
+                    break
     if not live:
         return None                       # clean tail: CLI marker stands
     lowest_live = min(live)
@@ -2711,7 +2742,8 @@ def _midturn_marker_gate(obj, agent_id=None):
             dropped += 1
     log = {"acted": True, "tail_idx": marked[-1][0], "halt_idx": halt,
            "protected_idx": last_asst, "lowest_live_idx": lowest_live,
-           "live_error": any(x > last_asst for x in live), "boundary_idx": boundary,
+           "live_error": live_err_idx is not None,
+           "live_edit_ack": live_ack_idx is not None, "boundary_idx": boundary,
            "markers_dropped": dropped, "total_messages": len(msgs)}
     if halt <= boundary:
         # first round of the turn: the boundary anchor (settled pin, advanced)
