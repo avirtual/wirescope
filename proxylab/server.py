@@ -1334,12 +1334,12 @@ async def handler(request: Request) -> Response:
                 record["strip_prior_thinking"] = spt
                 if spt.get("removed_thinking_blocks"):
                     changed = True
-            # MID-TURN THINKING STRIP PROBE (STRIP_MIDTURN_THINKING, default off,
-            # scratch-only): deletes thinking behind a keep-window INSIDE the
-            # current turn — the 400-test for the per-last-assistant-message
-            # signature hypothesis. Never enable on :7800 (unlatched: busts the
-            # warm prefix every round by design).
-            smt = transforms_mod._strip_midturn_thinking(obj)
+            # MID-TURN THINKING STRIP (rides the per-session L-level, like the
+            # settled strip above — no separate tier): deletes thinking behind
+            # a keep-window INSIDE the current turn, op by op. Paired with the
+            # op-1 rolling pin below so each round is an entry hit + one-op 5m
+            # write. Kill switch STRIP_MIDTURN_THINKING=0.
+            smt = transforms_mod._strip_midturn_thinking(obj, agent_id=agent_id)
             if smt:
                 record["strip_midturn_thinking"] = smt
                 changed = True

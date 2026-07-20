@@ -2510,15 +2510,36 @@ def _strip_prior_thinking(obj, agent_id=None):
             "boundary_idx": last_user, "total_messages": len(msgs)}
 
 
-# EXPERIMENTAL PROBE (default off; scratch ports only — no latch, no warmth
-# gate, busts the warm prefix EVERY round by design): mid-turn thinking strip.
-# Question under test (clodex 2026-07-19): is the API's tool-loop signature
-# requirement per-TURN (all current-turn thinking must ride) or per-LAST-
-# assistant-message (docs phrase it around the final assistant message)? If
-# keep-window=1 survives a multi-round tool marathon without 400s, the
-# productized version (threshold + latch, one amortized bust) becomes viable.
-STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "0") not in ("0", "no", "off", "false")
+# MID-TURN THINKING STRIP — part of how the L-levels WORK (no separate tier):
+# an L1+ session now strips thinking OP BY OP inside the current turn too,
+# behind a keep-window protecting the head (the API's signature requirement
+# binds on the LAST assistant message only — wire-proven 2026-07-20 on
+# sonnet-5/opus-4-8/fable-5, keep=1, incl. interleaved-thinking; the old
+# "current turn is untouchable" boundary was our own conservatism). Deletion
+# only, never signature edits; paired with the op-1 rolling pin below so each
+# round is an exact entry hit + a one-op 5m write instead of an unanchored
+# bust. `STRIP_MIDTURN_THINKING` is a KILL SWITCH (default on; real gate =
+# the per-session strip level, same as the settled-region strip): set =0 to
+# revert L-level sessions to settled-only stripping.
+STRIP_MIDTURN_THINKING = os.environ.get("STRIP_MIDTURN_THINKING", "1") not in ("0", "no", "off", "false")
 STRIP_MIDTURN_KEEP = max(1, int(os.environ.get("STRIP_MIDTURN_KEEP", "1")))
+
+
+def _midturn_strip_active(obj, agent_id=None):
+    """ONE gate for the mid-turn strip AND its pin (they must agree): kill
+    switch on, session at L1+, and not durably latched no-strip (a latched
+    no-strip session keeps its unstripped lineage everywhere — mid-turn
+    deletions would desync the current turn from the settled region's
+    decision). No latch yet (fresh/cold session) does not block: the current
+    turn's rounds are the freshest bytes on the wire."""
+    if not STRIP_MIDTURN_THINKING or not isinstance(obj, dict):
+        return False
+    if not _strip_thinking_enabled(obj, agent_id):
+        return False
+    sid = (writer_mod._session_ids(obj) or [None])[0]
+    if sid and _STRIP_GUARD_LATCH.get(sid) is False:
+        return False
+    return True
 
 # PIN MIDTURN BREAKPOINT — the settled-boundary machinery moved INSIDE the turn
 # (bogdan's "cache boundary at current op -1", 2026-07-20). The mid-turn strip
@@ -2543,13 +2564,14 @@ PIN_MIDTURN_BREAKPOINT = os.environ.get("PIN_MIDTURN_BREAKPOINT", "1") not in (
     "0", "no", "off", "false")
 
 
-def _strip_midturn_thinking(obj):
-    """PROBE: inside the CURRENT turn (at/after the settled boundary), delete
+def _strip_midturn_thinking(obj, agent_id=None):
+    """Inside the CURRENT turn (at/after the settled boundary), delete
     thinking blocks from every thinking-bearing assistant message EXCEPT the
     last STRIP_MIDTURN_KEEP of them. Prior turns untouched (that's
     _strip_prior_thinking's region). Whole-block deletion only — signatures
-    never edited. Returns a log dict or None."""
-    if not STRIP_MIDTURN_THINKING or not isinstance(obj, dict):
+    never edited. Gated per-session via _midturn_strip_active (L1+, same
+    channel as the settled strip). Returns a log dict or None."""
+    if not _midturn_strip_active(obj, agent_id):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
@@ -2605,9 +2627,7 @@ def _pin_midturn_breakpoint(obj, agent_id=None):
     Budget-aware via donor migration (never steals system markers or the
     rolling tail). Returns a log dict (`pinned` True/False + reason) or None
     (disabled / no in-turn thinking yet)."""
-    if not PIN_MIDTURN_BREAKPOINT or not STRIP_MIDTURN_THINKING:
-        return None
-    if not isinstance(obj, dict):
+    if not PIN_MIDTURN_BREAKPOINT or not _midturn_strip_active(obj, agent_id):
         return None
     msgs = obj.get("messages")
     if not isinstance(msgs, list) or not msgs:
