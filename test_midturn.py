@@ -155,6 +155,30 @@ pin = t._pin_midturn_breakpoint(b)
 check("pin fired (added)", pin and pin.get("pinned") and pin.get("mode") == "added", str(pin))
 check("pin upgraded to 1h", pin and pin.get("ttl") == "1h", str(pin))
 
+print("== LIVE ORDER: strip mutates first, pin still fires via strip_rec ==")
+# The AB2v2 T1 regression: server runs strip BEFORE pin on the same obj; a
+# pin that recomputes targets post-strip sees keep-window-only and declines
+# every round. The pin must trust the strip's pre-mutation verdict.
+msgs = turn("task", [True, True, True, True])
+b = body(msgs, sys_markers=2, msg_markers=((len(msgs) - 1, "1h"),))
+rec = t._strip_midturn_thinking(b)
+check("strip fired first", rec and rec.get("stripped") is True)
+pin = t._pin_midturn_breakpoint(b, strip_rec=rec)
+check("pin fires on the stripped body", pin and pin.get("pinned") is True, str(pin))
+check("pin sits at head-1 (op -1)", pin and pin.get("pin_idx") == pin.get("head_idx") - 1, str(pin))
+check("ladder: pin 1h (no msg marker below)", pin and pin.get("ttl") == "1h", str(pin))
+pin2 = t._pin_midturn_breakpoint(b, strip_rec=None)
+check("without strip_rec the regression reproduces (pin silent)", pin2 is None, str(pin2))
+
+print("== LIVE ORDER: sparse strip decline propagates to pin via strip_rec ==")
+msgs = turn("task", [True] + [False] * 9 + [True])
+b = body(msgs, msg_markers=((len(msgs) - 1, "5m"),))
+rec = t._strip_midturn_thinking(b)
+check("strip declined sparse", rec and rec.get("stripped") is False)
+pin = t._pin_midturn_breakpoint(b, strip_rec=rec)
+check("pin declines sparse via strip_rec", pin and pin.get("pinned") is False
+      and pin.get("reason") == "sparse_turn", str(pin))
+
 print("== ladder invariant: surviving 5m below keeps pin 5m (ordering legality) ==")
 msgs = turn("task", [True, True, True, True])
 last = len(msgs) - 1

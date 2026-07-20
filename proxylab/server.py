@@ -1445,7 +1445,9 @@ async def handler(request: Request) -> Response:
             # condition, keeping ttl ordering legal). Runs AFTER the settled
             # pin (may borrow its slot at full budget — the u_k entry is
             # already written; markers are placement metadata).
-            pmb = transforms_mod._pin_midturn_breakpoint(obj, agent_id=agent_id)
+            pmb = transforms_mod._pin_midturn_breakpoint(
+                obj, agent_id=agent_id,
+                strip_rec=record.get("strip_midturn_thinking"))
             if pmb:
                 record["pin_midturn_breakpoint"] = pmb
                 if pmb.get("pinned"):

@@ -2661,7 +2661,7 @@ def _midturn_head_idx(msgs, boundary):
     return idx[max(0, len(idx) - STRIP_MIDTURN_KEEP)]
 
 
-def _pin_midturn_breakpoint(obj, agent_id=None):
+def _pin_midturn_breakpoint(obj, agent_id=None, strip_rec=None):
     """Pin a breakpoint on the message immediately BEFORE the current turn's
     head thinking-bearing assistant message (op -1). Everything up to there is
     in its FINAL stripped form — next round re-reads it exactly; only the head
@@ -2680,7 +2680,18 @@ def _pin_midturn_breakpoint(obj, agent_id=None):
     if head is None or head <= 0:
         return None                       # no moving frontier to anchor
     eligible, skipped_sparse, _ = _midturn_targets(msgs, boundary)
-    if not eligible:
+    if strip_rec is not None:
+        # Live-path order: the STRIP ran first on this same obj and already
+        # deleted its targets — recomputing here sees keep-window-only and
+        # would decline every round (AB2v2 T1 regression: pin dead on the
+        # wire while the suite, pinning unstripped bodies, stayed green).
+        # Trust the strip's own pre-mutation verdict instead.
+        acted = bool(strip_rec.get("stripped"))
+        skipped_sparse = strip_rec.get("skipped_sparse_blocks",
+                                       skipped_sparse) or skipped_sparse
+    else:
+        acted = bool(eligible)
+    if not acted:
         # Texture-gated turn: the strip isn't deleting anything, so the turn
         # is append-only on the wire and the CLI's rolling tail already
         # chains it — a pin would spend budget for nothing.
