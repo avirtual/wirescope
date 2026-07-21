@@ -1452,11 +1452,24 @@ async def handler(request: Request) -> Response:
             # construction. Runs AFTER the settled pin (anchor placed on the
             # final list), BEFORE scrap-tail (which then only sees a tail
             # marker on clean rounds).
-            mmg = transforms_mod._midturn_marker_gate(obj, agent_id=agent_id)
-            if mmg:
-                record["midturn_marker_gate"] = mmg
-                if mmg.get("acted"):
-                    changed = True
+            # OWN_MOBILE_MARKER (experimental, default off) REPLACES the reactive
+            # gate: wirescope computes the mobile marker's position itself and
+            # remembers it per session (persisted for restart / anti-flap). Needs
+            # the session_id (resolved fully further down; derive it here cheaply).
+            if transforms_mod.OWN_MOBILE_MARKER:
+                _mm_sid = (writer_mod._session_ids(obj) or [None])[0]
+                omm = transforms_mod._own_mobile_marker(
+                    obj, agent_id=agent_id, session_id=_mm_sid)
+                if omm:
+                    record["own_mobile_marker"] = omm
+                    if omm.get("mode") in ("placed", "floor_only"):
+                        changed = True
+            else:
+                mmg = transforms_mod._midturn_marker_gate(obj, agent_id=agent_id)
+                if mmg:
+                    record["midturn_marker_gate"] = mmg
+                    if mmg.get("acted"):
+                        changed = True
             # (scrap-tail 5m downshift removed 2026-07-20: in-turn stripping
             # leaves the tail-covered span durable — the CLI's own ttl stands.)
             # MARKER-BUDGET INVARIANT (hard rule): never forward >4

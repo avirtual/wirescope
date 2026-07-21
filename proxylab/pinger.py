@@ -394,6 +394,7 @@ def _sweep_state(now=None):
         meta_mod._SUBAGENTS.pop(sid, None)
         meta_mod._SUBAGENT_LAST_REQ.pop(sid, None)
         _transforms_mod._ws_forget(sid)   # sticky wirescope spawn memory
+        _transforms_mod._marker_state_forget(sid)   # owned-marker anchor memory
         _fold_mod._forget(sid)            # fold maps + override
         meta_mod.writer_mod._forget_session_fp(sid)   # main-line fingerprint
     purged = heads = lr_aged = busts = 0

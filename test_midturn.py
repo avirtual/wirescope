@@ -221,6 +221,70 @@ rec = t._midturn_marker_gate(b)
 check("relocated w/ 5m inherited", rec and rec.get("mode") == "relocated"
       and rec.get("ttl") == "5m", str(rec))
 
+print("== gate: CLI OMITS its tail marker -> proxy places one at halt (seq092) ==")
+# The bug: CLI ships no rolling message tail marker, pin_settled declines
+# (single user-turn), only the msg0 bundle anchor survives -> cache floors at
+# msg0 and the stable in-turn tail re-reads cold. Fallback plants our own marker
+# on the last stable message below the live block.
+msgs = turn("task", [True, True])            # last assistant (idx 3) carries thinking
+b = body(msgs, msg_markers=((0, "1h"),))     # ONLY the bundle anchor, no tail
+rec = t._midturn_marker_gate(b)
+check("acted + tail_fallback", rec and rec.get("acted")
+      and rec.get("mode") == "tail_fallback", str(rec))
+check("halt just below the live block (idx 2)", rec and rec.get("halt_idx") == 2, str(rec))
+check("ttl mirrors the deepest existing marker (1h)", rec and rec.get("ttl") == "1h", str(rec))
+mm = msg_markers_of(b)
+check("anchor kept + new tail at halt", mm == [(0, "1h"), (2, "1h")], str(mm))
+
+print("== gate: CLI-omitted tail but halt == boundary -> decline (anchor covers) ==")
+msgs = turn("task", [True])                   # halt (0) == boundary
+b = body(msgs, msg_markers=((0, "1h"),))
+rec = t._midturn_marker_gate(b)
+check("declines, no fallback (anchor already covers stable)",
+      rec and rec.get("acted") is False
+      and rec.get("reason") == "no_inturn_tail_marker", str(rec))
+check("no marker added", msg_markers_of(b) == [(0, "1h")], str(msg_markers_of(b)))
+
+print("== gate: CLI-omitted tail, budget FULL, NO donor above boundary -> decline ==")
+msgs = turn("task", [True, True])                          # single turn, boundary 0
+b = body(msgs, sys_markers=3, msg_markers=((0, "1h"),))    # 3 sys + msg0 = 4; msg0 IS at boundary 0
+rec = t._midturn_marker_gate(b)
+check("declines (no message marker strictly above boundary to donate)",
+      rec and rec.get("acted") is False
+      and rec.get("reason") == "no_inturn_tail_marker", str(rec))
+check("still 4 total markers (no 5th)", len(t._cache_markers(b)) == 4, str(len(t._cache_markers(b))))
+
+print("== gate: CLEAN-tail CLI-omit at FULL budget -> migrate msg0 bundle to frontier ==")
+# two tasks: boundary at the 2nd real user turn (idx3); clean (plain) rounds;
+# markers = 2 sys + msg0 bundle + pin@boundary = 4 full, NO rolling tail.
+msgs = [{"role": "user", "content": "task1"}, plain_msg(0), result_msg(0),
+        {"role": "user", "content": "task2"}, plain_msg(1), result_msg(1)]
+b = body(msgs, msg_markers=((0, "1h"), (3, "1h")))
+rec = t._midturn_marker_gate(b)
+check("clean_tail_fallback acts", rec and rec.get("acted")
+      and rec.get("mode") == "clean_tail_fallback", str(rec))
+check("donor = msg0 bundle", rec and rec.get("donor_idx") == 0, str(rec))
+check("placed on frontier (idx5)", rec and rec.get("tail_idx") == 5, str(rec))
+mm = msg_markers_of(b)
+check("pin@3 kept + frontier@5, msg0 gone, still 4 total",
+      mm == [(3, "1h"), (5, "1h")] and len(t._cache_markers(b)) == 4, str(mm))
+
+print("== gate: LIVE-tail CLI-omit at FULL budget -> migrate msg0 bundle to halt ==")
+# same two-task frame but the current round carries thinking (live) -> live branch;
+# halt = just below the live block, donor = msg0.
+msgs = [{"role": "user", "content": "task1"}, plain_msg(0), result_msg(0),
+        {"role": "user", "content": "task2"}, plain_msg(1), result_msg(1),
+        think_msg(2), result_msg(2)]
+b = body(msgs, msg_markers=((0, "1h"), (3, "1h")))
+rec = t._midturn_marker_gate(b)
+check("tail_fallback acts (live)", rec and rec.get("acted")
+      and rec.get("mode") == "tail_fallback", str(rec))
+check("donor = msg0 bundle", rec and rec.get("donor_idx") == 0, str(rec))
+check("halt = 5 (below the live thinking at 6)", rec and rec.get("halt_idx") == 5, str(rec))
+mm = msg_markers_of(b)
+check("pin@3 kept + halt@5, msg0 gone, still 4 total",
+      mm == [(3, "1h"), (5, "1h")] and len(t._cache_markers(b)) == 4, str(mm))
+
 print("== live order: strip mutates first, gate unaffected (4a0521e class dead) ==")
 msgs = turn("task", [True, True, True, True])
 b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
@@ -366,6 +430,210 @@ t.STRIP_MIDTURN_THINKING = False
 check("strip kill also silences the gate", t._midturn_marker_gate(b) is None)
 check("strip off -> None", t._strip_midturn_thinking(b) is None)
 t.STRIP_MIDTURN_THINKING = True
+
+print("== OWNED MOBILE MARKER (OWN_MOBILE_MARKER) ==")
+t.OWN_MOBILE_MARKER = True
+t.STRIP_MIDTURN_THINKING = True
+_OWN = t.store_mod.OWNER
+t._MARKER_STATE.clear()
+
+
+def _omm(b, sid):
+    return t._own_mobile_marker(b, session_id=sid)
+
+
+def _state(sid):
+    return t._MARKER_STATE.get((_OWN, sid))
+
+
+# clean tail (no live block): marker planted on the LAST message, CLI tail stripped
+msgs = turn("task", [True, True, False])          # last round plain -> clean tail
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))   # CLI rolling tail present
+rec = _omm(b, "s-clean")
+last = len(msgs) - 1
+check("clean tail: placed", rec and rec.get("mode") == "placed", str(rec))
+check("clean tail: frontier = last message", rec and rec.get("frontier_idx") == last, str(rec))
+check("clean tail: our marker on last message", any(i == last for i, _ in msg_markers_of(b)))
+check("clean tail: exactly one message marker (CLI tail absorbed, not doubled)",
+      len(msg_markers_of(b)) == 1, str(msg_markers_of(b)))
+check("clean tail: ttl preserves CLI tail (1h, no silent upgrade)",
+      rec and rec.get("ttl") == "1h", str(rec))
+
+# live thinking tail: marker must sit BELOW the live block, never on it
+msgs = turn("task", [True, True, True])           # last assistant carries thinking
+b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))
+rec = _omm(b, "s-live")
+live_idx = len(msgs) - 2                            # last assistant (thinking)
+check("live tail: placed below live block", rec and rec.get("frontier_idx") == live_idx - 1, str(rec))
+check("live tail: no marker at/after the live block",
+      all(i < live_idx for i, _ in msg_markers_of(b)), str(msg_markers_of(b)))
+
+# CLI OMITTED its rolling tail entirely -> we still plant one (the whole point)
+msgs = turn("task", [True, True, False])
+b = body(msgs)                                     # NO msg markers at all
+rec = _omm(b, "s-omit")
+check("omitted tail: we plant our own anyway", rec and rec.get("mode") == "placed"
+      and len(msg_markers_of(b)) == 1, str(rec))
+
+# floor_only: turn's first round, nothing consumed beyond the boundary
+msgs = turn("task", [True])                        # single thinking head, no consumed
+b = body(msgs)
+rec = _omm(b, "s-floor")
+check("floor_only when nothing consumed beyond boundary",
+      rec and rec.get("mode") == "floor_only", str(rec))
+check("floor_only plants no message marker", len(msg_markers_of(b)) == 0, str(msg_markers_of(b)))
+
+# SELF BUDGET-AWARENESS (contrarian #5): 2 sys + msg0 bundle + pin@boundary +
+# our mobile = 5 -> we demote msg0 OURSELVES, keeping pin (boundary) + mobile.
+msgs = turn("task", [True, True, False])           # clean tail
+# boundary is msg0 (the user turn); simulate pin already placed there + msg0 bundle.
+# Here msg0 IS the boundary, so add a SECOND below-frontier CLI marker to force 5.
+msgs2 = [{"role": "user", "content": "prior turn"},
+         plain_msg(0), result_msg(0),
+         {"role": "user", "content": "task"}] + turn("", [True, True, False])[1:]
+b = body(msgs2, msg_markers=((0, "1h"), (2, "1h")))   # msg0 bundle + a stray CLI marker
+# manufacture a pin marker at the settled boundary
+bnd = t._settled_boundary(b["messages"])
+if isinstance(b["messages"][bnd].get("content"), str):
+    b["messages"][bnd]["content"] = [{"type": "text", "text": b["messages"][bnd]["content"]}]
+b["messages"][bnd]["content"][-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+rec = _omm(b, "s-budget")
+allm = t._cache_markers(b)
+check("budget: <=4 markers after self-demote", len(allm) <= 4, str([(r, i) for r, i, _ in allm]))
+check("budget: pin@boundary preserved", any(r == "messages" and i == bnd for r, i, _ in allm), str(bnd))
+check("budget: our mobile@frontier preserved",
+      any(r == "messages" and i == rec.get("frontier_idx") for r, i, _ in allm), str(rec))
+check("budget: msg0 bundle demoted (idx 0 gone)",
+      not any(r == "messages" and i == 0 for r, i, _ in allm)
+      and rec.get("demoted_msg_markers") and 0 in rec["demoted_msg_markers"], str(rec))
+
+# PERSISTENCE: remember anchor + prefix fingerprint; re-send classifies same lineage
+t._MARKER_STATE.clear()
+msgs = turn("task", [True, True, False])           # clean tail, frontier = last
+b = body(msgs)
+rec = _omm(b, "s-persist")
+saved = _state("s-persist")
+check("persist: anchor remembered", saved is not None and saved["idx"] == len(msgs) - 1, str(saved))
+check("persist: sig matches the placed block",
+      saved and saved["sig"] == t._msg_identity(b["messages"][len(msgs) - 1]))
+check("persist: prefix fingerprint stored", saved and saved.get("pfp"))
+b2 = body(msgs)                                    # identical prefix re-sent
+rec2 = _omm(b2, "s-persist")
+check("re-send: lineage classified SAME (prefix survived)",
+      rec2 and rec2.get("lineage") == "same", str(rec2))
+
+# FRONTIER ADVANCE must NOT false-alarm as changed (contrarian #2): the prefix
+# grows legitimately; lineage stays SAME, advanced=True.
+t._MARKER_STATE.clear()
+msgs_r1 = turn("task", [True, False])              # frontier at last (idx 4)
+b1 = body(msgs_r1)
+rec1 = _omm(b1, "s-adv")
+msgs_r2 = turn("task", [True, False, False])       # same prefix + a new consumed round
+b2 = body(msgs_r2)
+rec2 = _omm(b2, "s-adv")
+check("advance: lineage SAME (not falsely changed)", rec2 and rec2.get("lineage") == "same", str(rec2))
+check("advance: frontier moved deeper -> advanced flag",
+      rec2 and rec2.get("advanced") is True and rec2["frontier_idx"] > rec1["frontier_idx"], str(rec2))
+
+# LEGACY ROW (pre-pfp migration): stored row has pfp=None -> must NOT read as
+# prefix_changed on the first post-migration request (contrarian msg-154 #1).
+t._MARKER_STATE.clear()
+msgs_l = turn("task", [True, False])
+b0 = body(msgs_l)
+# seed a legacy row whose sig matches the frontier we're about to compute, pfp None
+_fr = len(msgs_l) - 1
+t._marker_state_save("s-legacy", t._msg_identity(b0["messages"][_fr]), _fr, "1h",
+                     len(msgs_l), None)
+b = body(msgs_l)
+rec = _omm(b, "s-legacy")
+check("legacy row (pfp None) -> legacy_unknown, not prefix_changed",
+      rec and rec.get("lineage") == "legacy_unknown", str(rec))
+# and it self-heals: the save wrote a real pfp, so next request is same
+rec2 = _omm(body(msgs_l), "s-legacy")
+check("legacy self-heals to same after one request", rec2 and rec2.get("lineage") == "same", str(rec2))
+
+# ANCHOR GONE (full compact / divergence): remembered anchor absent entirely
+t._MARKER_STATE.clear()
+t._marker_state_save("s-gone", "sig-not-present-anywhere", 99, "1h", 100, "oldpfp")
+msgs = turn("totally different session", [True, False])
+b = body(msgs)
+rec = _omm(b, "s-gone")
+check("anchor_gone when remembered anchor absent", rec and rec.get("lineage") == "anchor_gone", str(rec))
+
+# REPRESENTATION STABILITY (contrarian #2): the SAME message as a bare string
+# vs a singleton text block must NOT read as a lineage change.
+sig_str = t._msg_identity({"role": "user", "content": "hello"})
+sig_blk = t._msg_identity({"role": "user", "content": [{"type": "text", "text": "hello"}]})
+check("identity: string == singleton text block", sig_str == sig_blk, f"{sig_str} vs {sig_blk}")
+
+# LINEAGE CHANGE (partial compact): anchor SURVIVES but the prefix before it was
+# rewritten -> lineage:changed (honest cold-read accounting, contrarian #3).
+msgs_a = turn("task", [True, True, False])
+b = body(msgs_a)
+_omm(b, "s-lineage")
+msgs_b = copy.deepcopy(msgs_a)
+msgs_b[0] = {"role": "user", "content": "REWRITTEN earlier context (compact)"}
+b2 = body(msgs_b)                                  # same tail anchor, changed prefix
+rec = _omm(b2, "s-lineage")
+check("partial compact: lineage:prefix_changed when prefix differs (anchor survives)",
+      rec and rec.get("lineage") == "prefix_changed", str(rec))
+
+# STALE ROW cleanup (contrarian #6): unmarkable frontier forgets the row
+t._MARKER_STATE.clear()
+t._marker_state_save("s-stale", "sig", 5, "1h", 10, "pfp")
+check("stale: row present before", _state("s-stale") is not None)
+# frontier unmarkable: last message content is an empty list
+msgs = turn("task", [True, True, False])
+b = body(msgs)
+b["messages"][len(msgs) - 1]["content"] = []       # unmarkable frontier
+rec = _omm(b, "s-stale")
+check("stale: declined on unmarkable frontier",
+      rec and rec.get("mode") == "declined", str(rec))
+check("stale: row forgotten (no repeat dead lookup)", _state("s-stale") is None)
+
+# lazy load / forget round-trip
+t._marker_state_forget("s-persist")
+check("forget clears memory", _state("s-persist") is None)
+check("load after forget -> None", t._marker_state_load("s-persist") is None)
+
+# SCHEMA MIGRATION (contrarian #1): an OLD marker_state table (no pfp column)
+# must get pfp added, so load/save don't hit "no such column" forever.
+import sqlite3 as _sq
+import tempfile as _tf
+_olddb = _tf.mktemp(suffix=".sqlite")
+_oc = _sq.connect(_olddb)
+_oc.execute("CREATE TABLE marker_state (owner TEXT NOT NULL, session_id TEXT NOT "
+            "NULL, sig TEXT NOT NULL, idx INTEGER NOT NULL, ttl TEXT, msgs "
+            "INTEGER NOT NULL, set_at REAL NOT NULL, PRIMARY KEY (owner, session_id))")
+_oc.commit()
+_oc.close()
+_mig_ok = True
+try:
+    _mc = _sq.connect(_olddb)
+    # apply exactly the statements transforms registers (CREATE IF NOT EXISTS no-ops,
+    # ALTER adds the column)
+    for _stmt in ("CREATE TABLE IF NOT EXISTS marker_state (owner TEXT NOT NULL, "
+                  "session_id TEXT NOT NULL, sig TEXT NOT NULL, idx INTEGER NOT "
+                  "NULL, ttl TEXT, msgs INTEGER NOT NULL, pfp TEXT, set_at REAL "
+                  "NOT NULL, PRIMARY KEY (owner, session_id))",
+                  "ALTER TABLE marker_state ADD COLUMN pfp TEXT"):
+        try:
+            _mc.execute(_stmt)
+        except _sq.OperationalError:
+            if not _stmt.lstrip().upper().startswith("ALTER "):
+                raise
+    _mc.commit()
+    _cols = [r[1] for r in _mc.execute("PRAGMA table_info(marker_state)")]
+    _mc.close()
+except Exception as _e:
+    _mig_ok = False
+    _cols = [str(_e)]
+check("migration: old marker_state table gains pfp column", _mig_ok and "pfp" in _cols, str(_cols))
+
+# kill switch
+t.OWN_MOBILE_MARKER = False
+check("OWN_MOBILE_MARKER off -> None", _omm(body(turn("x", [True, False])), "s-off") is None)
+t.OWN_MOBILE_MARKER = False   # leave default off for the rest of the process
 
 print(f"\n{CHECKS['pass']} passed, {CHECKS['fail']} failed")
 raise SystemExit(1 if CHECKS["fail"] else 0)
