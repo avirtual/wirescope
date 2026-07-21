@@ -5,6 +5,13 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.38 — 2026-07-21
+
+- **Mid-turn thinking strip + own mobile cache marker (the marker gate).** Consumed thinking blocks (every assistant message except the last) are stripped mid-turn, and the CLI's own cache marker is relocated below the lowest LIVE block so doomed bytes are never cached in the first place — the placement fix on top of the existing strip family. Live = the model still owes a reaction: current-turn thinking, a frontier error, a frontier edit-ack (all held; consumed-vs-live classification shared with the L2 strips). Relocations inherit the CLI's own ttl (no ttl rewriting); every decline path leaves the request byte-identical.
+- Removes the strip-at-boundary deferred bill: under boundary-triggered stripping, a long turn accumulates premium-cached thinking that the FIRST next turn re-writes wholesale (measured: 19–31k tok of 1h re-write, history diverging ~msg 3). The gate strips inside the turn and advances the marker at every legal opportunity instead, so the boundary turn is an ordinary tail write.
+- **A/B validated over four self-paced twin runs** (8-task coding suites, verbosity-clamped, quality parity confirmed): vs the vendored strip-at-boundary build −27.2% / −27.7% / −16.5% (matched-verbosity run) total bill; vs no stripping at all −20.2% (behavioral-outlier task excluded) to −33.3% as-run, with final window occupancy 66k vs 99k tokens. Wire health on every run: all-1h writes, zero 5m churn, marker advanced at each legal opportunity, uncached input == the mandatory one-ride budget of freshly emitted thinking.
+- `test_midturn.py` extended to 111 checks (gate placement, ttl inheritance, consumed-vs-live classification, HEAD reachability preflight) and release-gated. Also in this tag's history: frontier edit-ack added to the doomed set (860b059), consumed-vs-live generalization (0ce3566, a099db1), ttl-inheritance + scrap-tail-5m removal (ef83937), HEAD preflight 200 (b549cc9).
+
 ## v0.6.37 — 2026-07-19
 
 Introspection-audit release: no new features — hardening, hygiene and doc catch-up from the 2026-07-19 five-agent code audit. All 8 suites green + live-smoked on a scratch instance before cut.
