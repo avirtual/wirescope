@@ -4301,6 +4301,72 @@ check("endpoint gate refuses wrong/absent creds",
       and not lp.server._endpoint_auth_ok("", "wrong"))
 lp.core.ENDPOINT_TOKEN = _saved_tok
 
+# --- ORDERING FIDELITY: compact-check hash == stamped hash on an L1 strip body --
+# The month-latent bug (wire-diagnosed 2026-07-22 on clodex a68b0455): the
+# compact-cache strip ran BEFORE the thinking strip, so `_compact_history_warmth`
+# hashed the UNSTRIPPED body while `_record_warmth` stamped the FORWARDED
+# (thinking-stripped) body. On an L1+ session the two hashes never matched -> the
+# compact check read 'absent' -> stripped a WARM compact -> re-shipped the whole
+# history at 1.0x. This pins the invariant that both hash the SAME (post-strip)
+# bytes, by running the pipeline in the fixed order: thinking-strip THEN
+# compact-check, exactly as server.py now sequences them. (Placed at the end so it
+# doesn't perturb the session_head COUNT the restart check above asserts.)
+def history_with_prior_thinking(sid):
+    """A 5-message history whose FIRST assistant turn (index 1) carries a thinking
+    block. By the time either the regular stamp turn (through a1) or the compact
+    (full) is forwarded, that thinking sits in a COMPLETED prior turn -> both strip
+    it -> both must hash the same post-strip bytes at the shared depth (4)."""
+    return {"model": "claude-fable-5",
+            "system": [{"type": "text", "text": "You are Claude Code, a CLI."}],
+            "messages": [
+                msg("user", "kick off the work " * 40),
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "let me reason " * 60,
+                     "signature": "sig-abc"},
+                    {"type": "text", "text": "done the work " * 40}]},
+                msg("user", "next step please " * 40),
+                msg("assistant", "did the next step " * 40),
+                {"role": "user", "content": [
+                    {"type": "text", "text": COMPACT_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}]},
+            ],
+            "metadata": {"user_id": json.dumps({"session_id": sid})}}
+
+_SID = "sess-order-1"
+# Opt this session into L1 stripping (deliberate override -> latch established).
+lp.transforms._strip_thinking_set_override(_SID, 1)
+
+# Regular turn (through a1): server strips the now-prior thinking on the FORWARDED
+# body, then stamps that forwarded body. Reproduce that exact order.
+turn_obj = history_with_prior_thinking(_SID)
+turn_obj["messages"] = turn_obj["messages"][:4]      # [u0, a0(thinking), u1, a1]
+_spt = lp.transforms._strip_prior_thinking(turn_obj, agent_id=None)
+check("regular turn strips its now-prior thinking", bool(_spt and _spt.get("stripped")))
+_stamp = lp._record_warmth(turn_obj, {"cache_creation_input_tokens": 4321})
+check("L1 turn stamps its forwarded (stripped) prefix",
+      _stamp is not None and lp.warmth_state(_stamp["hash"]) == "warm")
+
+# Compact request over the SAME history: server strips prior thinking FIRST
+# (mutating the body), THEN runs the compact-warmth check on that mutated body —
+# the fixed order. The check must SEE the stamped prefix as warm and DECLINE.
+comp = history_with_prior_thinking(_SID)
+lp.transforms._strip_prior_thinking(comp, agent_id=None)   # runs BEFORE the compact strip now
+_cst, _chash, _cd = lp._compact_history_warmth(comp)
+check("compact-check hashes the SAME (post-strip) bytes the stamp used",
+      _chash == _stamp["hash"])
+res = lp._strip_compact_cache(comp)
+check("L1 strip session: WARM compact history is NOT stripped (bug fixed)",
+      _cst == "warm" and res is not None and res["condition_met"] is False)
+
+# COUNTERFACTUAL: the OLD (buggy) order — compact-check on the UNSTRIPPED body —
+# reads a DIFFERENT hash and would strip the warm compact. Pin that this is exactly
+# what the reorder prevents (guards against a silent regression to the old order).
+comp_unstripped = history_with_prior_thinking(_SID)
+_ust, _uhash, _ud = lp._compact_history_warmth(comp_unstripped)   # no thinking-strip first
+check("unstripped-body compact-check mismatches the stamp (the old bug)",
+      _uhash != _stamp["hash"] and _ust == "absent")
+lp.transforms._strip_thinking_set_override(_SID, None)     # clear the override/latch
+
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILURES: {FAILS}")
