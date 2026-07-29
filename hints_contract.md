@@ -45,7 +45,11 @@ v1 providers, both **silent unless they have something to say** — a provider t
 
 ### Discovery
 
-`GET /_identity` → `capabilities.hints` = `{available, enabled, system_tail_fallback, native[], caps{}}`, and `endpoints.hints` = `/_hints`. **Gate on the capability, never on `version`.** Note `endpoints.hint` (no `s`) is an unrelated feature — the per-agent spawner-hint override. `available` says the *slot* exists; the registry is empty at rest, so it never implies anything is registered.
+`GET /_identity` → `capabilities.hints` = `{available, enabled, system_tail_fallback, native[], caps{}}`, and `endpoints.hints` = `/_hints`. **Gate on the capability, never on `version`.** Note `endpoints.hint` (no `s`) is an unrelated feature — the per-agent spawner-hint override.
+
+**`available` means the slot is REACHABLE, not that hints are working.** This is the one key on that object where truthy and operating come apart: every sibling capability (`stats`, `ping`, `prune`, …) has no registry, so a consumer generalizing correctly from them will read `hints: {available: true}` as "hints are live" and be wrong. The registry is empty at rest and `caps` describes only what you *could* register.
+
+**"Is my hint actually live?" is irreducibly a `GET /_hints?agent=<your pattern>` call, and cannot be answered by the handshake.** Not an omission to be fixed later: hints are keyed by scope, so no global count on `/_identity` could tell you whether *your* route resolves anything — that is the `misconfigured`/`seen_agent` question, and it requires a request to have arrived, while `/_identity` spends nothing by contract. Two calls, two different facts: the handshake says the channel exists; the registry read says whether your scope resolves.
 
 ### `GET /_hints?agent=<pattern>&session=<id>`
 Registry view. `agent_hints[]` / `session_hints[]` (each hint with `age_s`), `native_enabled`, `caps`, `enabled`, plus when `session=` is given: `effective[]` (the resolved set, most-specific-last) and `available_native[]`.
