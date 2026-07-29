@@ -43,6 +43,10 @@ v1 providers, both **silent unless they have something to say** — a provider t
 | `upstream_health` | ≥25% shed (429/5xx) over ≥4 requests in 120s | **Process-global by design.** A hint can only ride a request that gets a *response*, so a session at 100% shed cannot receive it — the audience is the observer deciding on a teammate's behalf. Measured on a real storm: global fires, per-route would have fired for nobody. |
 | `context_pressure` | window ≥75% full | Reuses the same helper `/_status` reads, so it cannot disagree with the dashboard. |
 
+### Discovery
+
+`GET /_identity` → `capabilities.hints` = `{available, enabled, system_tail_fallback, native[], caps{}}`, and `endpoints.hints` = `/_hints`. **Gate on the capability, never on `version`.** Note `endpoints.hint` (no `s`) is an unrelated feature — the per-agent spawner-hint override. `available` says the *slot* exists; the registry is empty at rest, so it never implies anything is registered.
+
 ### `GET /_hints?agent=<pattern>&session=<id>`
 Registry view. `agent_hints[]` / `session_hints[]` (each hint with `age_s`), `native_enabled`, `caps`, `enabled`, plus when `session=` is given: `effective[]` (the resolved set, most-specific-last) and `available_native[]`.
 
@@ -60,6 +64,9 @@ Returned on `GET /_hints?session=` and on the `turn.completed` receipt. It exist
 | **misconfigured** | `{"misconfigured": true, "unmatched_requests": N, "seen_agent": "<wire name>", "note": …}` | Requests arrived, registry non-empty, **zero matched**. Always a misconfiguration — register `seen_agent` exactly, or a glob covering it. |
 
 An **empty registry stays silent** (`requests_seen: 0`, no `misconfigured`): resting is not misconfiguration.
+
+> **`placement` is NOT a deploy check, and cannot be made into one.** With an empty registry `inject()` returns before touching anything, so it cannot also increment a counter — "`requests_seen > 0` with an empty registry" is *unsatisfiable*, and it was briefly written down as the post-deploy verification anyway (clodex's, retracted by clodex). `requests_seen: 0` is also exactly what a wrong port, a dead proxy, or an unresolved route produces, so as a deploy check it collapses the very two states this block exists to separate.
+> **Verify an empty-registry deploy without hint code at all:** `/_identity` reports the new `version` and advertises `capabilities.hints`, while `/_status` shows sessions with recent `last_seen` — the proxy's ordinary accounting proves requests are forwarding, and the injector's silence proves it didn't participate. Absence of placement state is the *correct* observation. `placement` can only ever confirm the **non-empty** case.
 
 ## Placement modes
 

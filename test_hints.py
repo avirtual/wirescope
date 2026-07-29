@@ -420,5 +420,37 @@ h.inject(o, agent="whoever", session_id="sgate2")
 check("empty registry does not even convert string content to block form",
       o["messages"][0]["content"] == "plain string content", str(o))
 
+
+# ---- 12. discovery: /_identity must ADVERTISE the surface --------------------
+# Shipped v0.6.41 with the whole tail-hint surface INVISIBLE on /_identity — no
+# capability key, and the endpoint map's `hint` is the UNRELATED spawner-hint
+# override. A consumer had no way to detect the channel except sniffing `version`,
+# which status.py explicitly tells consumers not to do. Caught post-deploy by
+# probing the live instance, not by any test. These checks exist so the gap
+# can't reopen, and they pin the `hint`/`hints` DISTINCTION (the one-letter gap
+# is the actual trap: presence-only assertions pass on the wrong key).
+print("\n[12] /_identity discovery")
+from proxylab import status as st
+
+_ident = st._identity()
+_caps, _eps = _ident["capabilities"], _ident["endpoints"]
+check("capabilities.hints present (consumers gate on this, never on version)",
+      isinstance(_caps.get("hints"), dict), str(_caps.get("hints")))
+check("capabilities.hints.available is True", _caps["hints"].get("available") is True)
+check("capabilities.hints.enabled tracks the live HINTS kill switch",
+      _caps["hints"].get("enabled") == h.HINTS)
+check("capabilities.hints.system_tail_fallback exposed (the ONLY path for a "
+      "trailing role:system consumer)",
+      _caps["hints"].get("system_tail_fallback") == h.SYSTEM_TAIL_FALLBACK)
+check("capabilities.hints.native lists the live provider names",
+      _caps["hints"].get("native") == sorted(hn.PROVIDERS))
+check("capabilities.hints.caps matches the enforced caps",
+      _caps["hints"]["caps"] == {"total_chars": h.HINTS_MAX_CHARS,
+                                 "per_hint_chars": h.HINTS_MAX_ONE,
+                                 "per_scope": h.HINTS_MAX_PER_SCOPE})
+check("endpoints.hints == /_hints", _eps.get("hints") == "/_hints")
+check("endpoints.hint stays /_hint (distinct feature, NOT tail hints)",
+      _eps.get("hint") == "/_hint")
+
 print(f"\n{'ALL PASS' if not _fails else str(len(_fails)) + ' FAILURE(S): ' + str(_fails)}")
 sys.exit(1 if _fails else 0)
