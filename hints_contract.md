@@ -29,7 +29,9 @@ So the gate is **per hint**, set on the hint object:
 
 - **Defaults to `false`** — every existing hint keeps riding every request; this is purely additive.
 - "Turn start" = the user's message is the newest thing in the window and the model has not yet acted on it. Detected from the **shared settled-turn boundary** (the same one the strips and the pin use, never re-derived), then checking for an `assistant` message after it. Correct on the opus-4-8 shape where a trailing `role:"system"` roster message sits *after* the user turn.
-- **Fails open.** If the boundary can't be judged, the hint ships. The gate is a cost optimization, not a safety property, and a hint silently never firing is the worse failure.
+- **Fails open.** If the boundary can't be judged, the hint ships. The gate is a cost optimization with no correctness content, and a hint silently never firing is the worse failure.
+
+  **This is not a general preference for failing open, and the contract deliberately does both.** The placement invariant fails **closed** — it declines rather than risk landing inside a cached segment. The rule is *fail toward whichever side's failure is recoverable*: an ungated hint costs a few tokens you can measure and stop paying, while a hint inside a cached segment is a recurring per-turn bust, and a hint that silently never fires costs the entire thing it existed for. Direction follows the blast radius, not a house style.
 - Withheld mid-loop is recorded as `declined: "turn_start_gate"` with the withheld ids — explicitly *not* counted as an unmatched-scope misconfiguration, since it is the gate working.
 - Feature-detect via `capabilities.hints.turn_start_gate` on `/_identity`. **Posting the field to a proxy without it is silently accepted and ignored** (unknown keys aren't rejected), which bills per-request — so check the capability rather than assuming.
 
