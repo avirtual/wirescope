@@ -117,7 +117,9 @@ store_mod.register_schema(
     "CREATE TABLE IF NOT EXISTS agent_hints ("
     "owner TEXT NOT NULL, agent TEXT NOT NULL, id TEXT NOT NULL, "
     "text TEXT NOT NULL, set_at REAL NOT NULL, ttl_s REAL, "
-    "PRIMARY KEY (owner, agent, id))")
+    "PRIMARY KEY (owner, agent, id))",
+    # additive migration: the turn-start gate (see _at_turn_start)
+    "ALTER TABLE agent_hints ADD COLUMN turn_start_only INTEGER")
 
 
 def _persist_agent(agent, hint):
@@ -125,11 +127,14 @@ def _persist_agent(agent, hint):
         con = store_mod.db()
         with store_mod.LOCK:
             con.execute(
-                "INSERT INTO agent_hints(owner, agent, id, text, set_at, ttl_s) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(owner, agent, id) DO UPDATE SET "
-                "text=excluded.text, set_at=excluded.set_at, ttl_s=excluded.ttl_s",
+                "INSERT INTO agent_hints(owner, agent, id, text, set_at, ttl_s, "
+                "turn_start_only) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(owner, agent, id) DO UPDATE SET "
+                "text=excluded.text, set_at=excluded.set_at, ttl_s=excluded.ttl_s, "
+                "turn_start_only=excluded.turn_start_only",
                 (store_mod.OWNER, agent, hint["id"], hint["text"],
-                 hint["set_at"], hint.get("ttl_s")))
+                 hint["set_at"], hint.get("ttl_s"),
+                 1 if hint.get("turn_start_only") else 0))
             con.commit()
     except Exception as e:
         print(f"[hints] persist failed for {agent}/{hint['id']}: {e}", flush=True)
@@ -157,15 +162,15 @@ def load_agent_hints():
         con = store_mod.db()
         with store_mod.LOCK:
             rows = con.execute(
-                "SELECT agent, id, text, set_at, ttl_s FROM agent_hints "
-                "WHERE owner=?", (store_mod.OWNER,)).fetchall()
+                "SELECT agent, id, text, set_at, ttl_s, turn_start_only "
+                "FROM agent_hints WHERE owner=?", (store_mod.OWNER,)).fetchall()
     except Exception as e:
         print(f"[hints] load failed: {e}", flush=True)
         return 0
-    for agent, hid, text, set_at, ttl_s in rows:
+    for agent, hid, text, set_at, ttl_s, tso in rows:
         _AGENT_HINTS.setdefault(agent, {})[hid] = {
             "id": hid, "text": text, "set_at": set_at, "ttl_s": ttl_s,
-            "source": "agent"}
+            "turn_start_only": bool(tso), "source": "agent"}
     if rows:
         print(f"[hints] restored {len(rows)} agent hint(s) across "
               f"{len(_AGENT_HINTS)} route(s)", flush=True)
@@ -207,9 +212,12 @@ def _validate(payload, *, require_ttl):
         elif require_ttl:
             return (f"hint {hid!r}: ttl_s is REQUIRED for session-scoped facts "
                     "(a fact with no expiry keeps shipping and reads as current)"), None
+        tso = it.get("turn_start_only", False)
+        if not isinstance(tso, bool):
+            return f"hint {hid!r}: turn_start_only must be true or false", None
         total += len(text)
         out.append({"id": hid, "text": text.strip(), "ttl_s": ttl,
-                    "set_at": time.time(),
+                    "set_at": time.time(), "turn_start_only": tso,
                     "source": "session" if require_ttl else "agent"})
     if total > HINTS_MAX_CHARS:
         return (f"hint set is {total}ch, over the {HINTS_MAX_CHARS}ch total cap "
@@ -429,7 +437,39 @@ def _matching_agent_scopes(agent):
     return out
 
 
-def effective(session, agent, obj=None):
+def _at_turn_start(msgs):
+    """True iff this request is the FIRST of its turn — the user's message is the
+    newest thing in the window and the model has not yet acted on it.
+
+    WHY THIS GATE EXISTS (clodex's use case, and the billing shape behind it):
+    hint tokens ride UNCACHED at 1x on EVERY request that carries them, and a
+    turn is not one request — a tool loop is N. A hint that answers "what did the
+    user just type" (a retrieved memory, a task fact) is relevant on request 1 and
+    is pure carriage by round 14, re-billed each round with no cache discount. A
+    constant behavioral prohibition is the opposite: it must be present at the
+    moment the model reaches for the forbidden action, which is exactly those
+    later rounds. So the gate is PER HINT, not a global mode, and defaults OFF
+    (every existing hint keeps riding every request).
+
+    Detection reuses the SHARED settled boundary — never inline it (transforms.py
+    is explicit about this: the strips and the pin must agree on where the current
+    turn starts). At turn start nothing after that boundary is an assistant
+    message; once the model emits its first tool_use, one is, and stays for the
+    rest of the turn. Scanning for `assistant` rather than comparing against
+    len(msgs)-1 is what makes this correct on the opus-4-8 wire shape, where a
+    trailing role:"system" roster message sits AFTER the user's turn."""
+    try:
+        from . import transforms as transforms_mod
+        boundary = transforms_mod._settled_boundary(msgs)
+    except Exception:
+        return None                    # can't judge -> caller declines to gate
+    if boundary < 0:
+        return None                    # no real user turn in the window at all
+    return not any(isinstance(m, dict) and m.get("role") == "assistant"
+                   for m in msgs[boundary + 1:])
+
+
+def effective(session, agent, obj=None, gate_info=None):
     """The resolved hint list for a request, most-specific-last (session facts
     read after agent prohibitions). Union by id: a narrower scope re-declaring an
     id SUPPRESSES the inherited one. Expiry is evaluated HERE, per request — so a
@@ -456,7 +496,23 @@ def effective(session, agent, obj=None):
                 nh = native_mod.render(name, session=session, obj=obj)
                 if nh:                       # a provider with nothing to say
                     merged[nh["id"]] = nh    # declines rather than shipping noise
-    return [merged[k] for k in sorted(merged)]
+    hints = [merged[k] for k in sorted(merged)]
+    gated = [h["id"] for h in hints if h.get("turn_start_only")]
+    if gated and obj is not None:
+        # FAIL OPEN on can't-judge (None): the gate is a COST optimization, not a
+        # safety property, so an unjudgeable shape should still deliver. Silently
+        # never firing is the worse failure (same reasoning as SYSTEM_TAIL_FALLBACK)
+        # and costs the one thing the gate was saving. Never annotate the hint
+        # dicts themselves — they ARE the registry entries, so a per-request note
+        # written there would persist into every later request.
+        at_start = _at_turn_start((obj or {}).get("messages") or [])
+        if gate_info is not None:
+            gate_info.update({"at_turn_start": at_start, "gated_ids": gated})
+        if at_start is False:
+            hints = [h for h in hints if not h.get("turn_start_only")]
+            if gate_info is not None:
+                gate_info["withheld"] = gated
+    return hints
 
 
 # ---- the wire transform ----------------------------------------------------
@@ -525,8 +581,13 @@ def inject(obj, agent=None, session_id=None):
         return None
     if session_id is None:
         session_id = (writer_mod._session_ids(obj) or [None])[0]
-    hints = effective(session_id, agent, obj=obj)
+    gate = {}
+    hints = effective(session_id, agent, obj=obj, gate_info=gate)
     if not hints:
+        # A turn-start-gated hint withheld mid-loop is the gate WORKING, not a
+        # misconfiguration — don't let it masquerade as an unmatched-scope error.
+        if gate.get("withheld"):
+            return {"declined": "turn_start_gate", "withheld": gate["withheld"]}
         # Registry non-empty but nothing resolved -> misconfiguration, not rest.
         if _AGENT_HINTS or _SESSION_HINTS or _NATIVE_ON:
             _note_unmatched(session_id, agent)
@@ -585,5 +646,9 @@ def inject(obj, agent=None, session_id=None):
            "msg_idx": ui, "block_idx": len(c) - 1, "mode": mode,
            "deepest_marker": list(deepest) if deepest else None,
            "uncached": True}
+    if gate.get("gated_ids"):
+        log["turn_start_gate"] = {k: gate[k] for k in
+                                  ("at_turn_start", "gated_ids", "withheld")
+                                  if k in gate}
     _note_injection(session_id, log)
     return log

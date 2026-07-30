@@ -429,6 +429,92 @@ check("empty registry does not even convert string content to block form",
 # probing the live instance, not by any test. These checks exist so the gap
 # can't reopen, and they pin the `hint`/`hints` DISTINCTION (the one-letter gap
 # is the actual trap: presence-only assertions pass on the wrong key).
+print("\n[13] turn-start gate (turn_start_only)")
+_reset()
+
+
+def _turn(*msgs):
+    return {"messages": list(msgs)}
+
+
+_U = {"role": "user", "content": [{"type": "text", "text": "do the thing"}]}
+_A_TOOL = {"role": "assistant", "content": [
+    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+_TR = {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "t1", "content": "..."}]}
+_SYS_TAIL = {"role": "system", "content": [{"type": "text", "text": "roster"}]}
+
+check("turn start: user message is newest -> True",
+      h._at_turn_start([_U]) is True)
+check("turn start survives the opus-4-8 trailing role:system roster message "
+      "(the shape a len-based check would get wrong)",
+      h._at_turn_start([_U, _SYS_TAIL]) is True)
+check("mid-loop: an assistant message after the boundary -> False",
+      h._at_turn_start([_U, _A_TOOL, _TR]) is False)
+check("mid-loop stays False deeper into the loop",
+      h._at_turn_start([_U, _A_TOOL, _TR, _A_TOOL, _TR]) is False)
+check("a NEW user turn after a completed loop is turn start again",
+      h._at_turn_start([_U, _A_TOOL, _TR, {"role": "assistant",
+                                           "content": [{"type": "text", "text": "done"}]},
+                        _U]) is True)
+check("no real user turn at all -> None (can't judge)",
+      h._at_turn_start([_TR]) is None)
+
+# the gate is PER HINT and defaults OFF
+_reset()
+h.set_hints({"hints": [{"id": "always", "text": "constant prohibition"},
+                       {"id": "memo", "text": "retrieved memory",
+                        "turn_start_only": True}]}, agent="r1")
+ids = lambda o: sorted(x["id"] for x in h.effective(None, "r1", obj=o))
+check("at turn start BOTH ride", ids(_turn(_U)) == ["always", "memo"])
+check("mid-loop the gated hint is withheld, the ungated one still rides",
+      ids(_turn(_U, _A_TOOL, _TR)) == ["always"])
+check("default (no turn_start_only) is UNGATED — existing hints unaffected",
+      "always" in ids(_turn(_U, _A_TOOL, _TR)))
+check("gate FAILS OPEN when the turn boundary can't be judged "
+      "(silently never firing is the worse failure)",
+      ids(_turn(_TR)) == ["always", "memo"])
+
+# validation + persistence round-trip
+code, body = h.set_hints({"hints": [{"id": "bad", "text": "x",
+                                     "turn_start_only": "yes"}]}, agent="r1")
+check("turn_start_only must be a bool (a truthy string is a config error)",
+      code == 400 and "turn_start_only" in body["reason"], str(body))
+_reset()
+h.set_hints({"hints": [{"id": "memo", "text": "m", "turn_start_only": True}]},
+            agent="r2")
+check("read_scope exposes turn_start_only so a consumer can see what's gated",
+      h.read_scope(agent="r2")["agent_hints"][0].get("turn_start_only") is True)
+h._AGENT_HINTS.clear()
+h.load_agent_hints()
+check("turn_start_only survives the persist/reload round-trip",
+      (h._AGENT_HINTS.get("r2") or {}).get("memo", {}).get("turn_start_only") is True,
+      str(h._AGENT_HINTS.get("r2")))
+
+# the withheld case must not masquerade as a misconfiguration
+_reset()
+h.set_hints({"hints": [{"id": "memo", "text": "m", "turn_start_only": True}]},
+            agent="r3")
+obj = _turn(_U, _A_TOOL, _TR)
+log = h.inject(obj, agent="r3", session_id="sgate")
+check("withheld mid-loop -> declined:turn_start_gate (the gate WORKING)",
+      log and log.get("declined") == "turn_start_gate", str(log))
+check("a working gate is NOT recorded as an unmatched-scope misconfiguration",
+      not h.placement_report("sgate").get("misconfigured"),
+      str(h.placement_report("sgate")))
+check("nothing was appended to the body when the hint was withheld",
+      len(obj["messages"][-1]["content"]) == 1)
+obj2 = _turn(_U)
+log2 = h.inject(obj2, agent="r3", session_id="sgate")
+check("at turn start the same hint is injected", log2 and log2.get("hint_ids") == ["memo"],
+      str(log2))
+check("the injection log reports the gate decision for attribution",
+      (log2.get("turn_start_gate") or {}).get("at_turn_start") is True, str(log2))
+check("gating never mutates the registry entry (no per-request state on it)",
+      set(h._AGENT_HINTS["r3"]["memo"]) == {"id", "text", "set_at", "ttl_s",
+                                            "turn_start_only", "source"},
+      str(h._AGENT_HINTS["r3"]["memo"]))
+
 print("\n[12] /_identity discovery")
 from proxylab import status as st
 

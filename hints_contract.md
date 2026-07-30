@@ -15,7 +15,23 @@ A short string injected as a **new trailing text block on the last user message*
 - **Never cached.** The block lands strictly downstream of the deepest `cache_control` marker. Editing a hint therefore costs nothing but its own tail tokens — that is the point of the channel: a control plane you cannot edit without paying for the edit isn't live.
 - **Never in the transcript.** Request-side only. This is structural, not empirical: the CLI writes its transcript from its own records, which never contained the addition. Do not attempt to verify it by grepping a transcript — the search can only find copies a session authored itself.
 - **One-request lifetime.** A hint rides one request and vanishes; it does not accrete. This is the feature, not a limitation — it is the opposite of PTY injection, which becomes a permanent user message re-billed every turn. Send **volatile state** here; keep **events** on PTY injection.
-- **Cost.** Uncached input tokens on every carrying request (no cache discount, by design). ~35 tokens ≈ $0.000175/request at opus rates.
+- **Cost.** Uncached input tokens on every carrying request (no cache discount, by design). ~35 tokens ≈ $0.000175/request at opus rates. **Note "per request", not "per turn"** — see the turn-start gate below.
+
+## The turn-start gate (`turn_start_only`)
+
+**A turn is not one request.** A tool loop is N, and a registered hint rides every one of them at 1× with no cache discount. That is correct for a *constant prohibition*, which has to be present at the moment the model reaches for the forbidden action — typically deep in the loop. It is wrong for anything that answers **"what did the user just type"**: a retrieved memory is relevant on request 1 and is pure carriage by round 14.
+
+So the gate is **per hint**, set on the hint object:
+
+```json
+{"hints": [{"id": "memory", "text": "…", "ttl_s": 900, "turn_start_only": true}]}
+```
+
+- **Defaults to `false`** — every existing hint keeps riding every request; this is purely additive.
+- "Turn start" = the user's message is the newest thing in the window and the model has not yet acted on it. Detected from the **shared settled-turn boundary** (the same one the strips and the pin use, never re-derived), then checking for an `assistant` message after it. Correct on the opus-4-8 shape where a trailing `role:"system"` roster message sits *after* the user turn.
+- **Fails open.** If the boundary can't be judged, the hint ships. The gate is a cost optimization, not a safety property, and a hint silently never firing is the worse failure.
+- Withheld mid-loop is recorded as `declined: "turn_start_gate"` with the withheld ids — explicitly *not* counted as an unmatched-scope misconfiguration, since it is the gate working.
+- Feature-detect via `capabilities.hints.turn_start_gate` on `/_identity`. **Posting the field to a proxy without it is silently accepted and ignored** (unknown keys aren't rejected), which bills per-request — so check the capability rather than assuming.
 
 ## Endpoints
 
