@@ -560,6 +560,15 @@ check("endpoints.hint stays /_hint (distinct feature, NOT tail hints)",
 check("capabilities.hints.pop advertises one-shot payloads (a proxy without it "
       "accepts the keys and ships the payload EVERY request instead of once)",
       _caps["hints"].get("pop") is True)
+# DRIFT GUARD: every per-feature flag the contract tells consumers to gate on
+# must actually be advertised. Asserting the KEY SET (not each key separately)
+# is what catches a capability that gets implemented and never announced —
+# v0.6.41 shipped the whole surface undiscoverable exactly that way, and a
+# per-key check passes happily while the set is short.
+check("advertised capability keys match the contract exactly",
+      set(_caps["hints"]) == {"available", "enabled", "system_tail_fallback",
+                              "turn_start_gate", "pop", "native", "caps"},
+      str(sorted(_caps["hints"])))
 
 
 # --- 14. one-shot pop protocol (once / main_line_only / expect_session) ------

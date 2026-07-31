@@ -117,6 +117,7 @@ The guard generalizes past the case that motivated it: it defends against *any* 
 - **Posting is out-of-band and never on the request path**, so an unreachable proxy fails loudly in the consumer's own HTTP call and cannot block or delay a turn.
 - **State is readable** (`armed`, `armed_at`, `delivered_session`) so *posted-but-never-served* is distinguishable from *never-posted*. `delivered_session` is reported regardless of mode, so even an unguarded pop can be audited after the fact for where it actually landed.
 - **`main_line_only` uses the raw-signal predicate** from the section above, not `role == "parent"`.
+- **Feature-detect via `capabilities.hints.pop` on `/_identity`, never on `version`.** This is not housekeeping — it is the one failure the consumer cannot see. A proxy without pop support **accepts `once`/`main_line_only`/`expect_session` silently and ignores them** (unknown keys aren't rejected), so the payload never pops and rides **every request for the life of the session**. A catalogue is the largest thing on the wire and it is uncached at 1×, so the ignored-key path is also the most expensive one, and it is invisible from the consumer side: the model receives the menu, behaves plausibly, and nothing anywhere reports an error. Check the capability before posting a one-shot.
 
 ## Endpoints
 
@@ -146,7 +147,9 @@ v1 providers, both **silent unless they have something to say** — a provider t
 
 ### Discovery
 
-`GET /_identity` → `capabilities.hints` = `{available, enabled, system_tail_fallback, native[], caps{}}`, and `endpoints.hints` = `/_hints`. **Gate on the capability, never on `version`.** Note `endpoints.hint` (no `s`) is an unrelated feature — the per-agent spawner-hint override.
+`GET /_identity` → `capabilities.hints` = `{available, enabled, system_tail_fallback, turn_start_gate, pop, native[], caps{}}`, and `endpoints.hints` = `/_hints`. **Gate on the capability, never on `version`.** Note `endpoints.hint` (no `s`) is an unrelated feature — the per-agent spawner-hint override.
+
+Each per-feature flag exists because that feature's absence is **silently accepted** rather than rejected: `turn_start_gate` off → the hint bills on every request of a turn instead of the first; `pop` off → a one-shot rides forever. A truthy `hints` says the slot exists, never that a given behavior is implemented.
 
 **`available` means the slot is REACHABLE, not that hints are working.** This is the one key on that object where truthy and operating come apart: every sibling capability (`stats`, `ping`, `prune`, …) has no registry, so a consumer generalizing correctly from them will read `hints: {available: true}` as "hints are live" and be wrong. The registry is empty at rest and `caps` describes only what you *could* register.
 
