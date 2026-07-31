@@ -5,6 +5,11 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.45 — 2026-07-31
+
+- **`release.sh`'s CHANGELOG check could never come back clean** — it warned "no `## vX.Y.Z` entry" on the v0.6.44 cut while the entry sat two lines from the top. `git show … | grep -q` under `set -o pipefail` exits **141 when the pattern IS found**: `grep -q` stops reading at the first match, `git show` takes SIGPIPE writing the remainder, and `pipefail` promotes that to the pipeline's status. Inverted by `!`, the branch was taken either way — the check had exactly one outcome. Now reads the blob into a variable and matches a herestring (no upstream process, nothing to SIGPIPE). Introduced in the same change that moved the check onto the released commit; only that one line was vulnerable, as the notes extraction pipes to `awk`, which reads to EOF. Warning only — no release shipped wrong bytes because of it.
+  - **Why 42 green checks missed it, which is the transferable part.** Case [10] *already* asserts this warning's absence, correctly, and passed — because every fixture CHANGELOG in the harness is ~30 bytes, which **fits the pipe buffer entire**, so `git show` finishes before `grep` exits and there is no SIGPIPE to surface. The precondition trap again, in a dimension nobody was watching: **SIZE**. The fixture sat outside the regime the bug lives in, leaving an assertion that was load-bearing and vacuous at once. New case [11] cuts against a >64 KiB CHANGELOG (asserted, since below the pipe buffer no SIGPIPE is possible), with a positive control in a different plane — same-size file, entry absent — proving the check can still FIRE rather than having been deleted. Mutation-proven; 46/46. Both of its new preconditions first hit the very bug they check for, and are fixed the same way.
+
 ## v0.6.44 — 2026-07-31
 
 - **Fix: `/_session` turn timestamps rendered NOTHING on any session that had compacted or `/clear`'ed** — i.e. most sessions anyone actually opens. Shipped in v0.6.43, reported against the vendored build, reproduced on two live sessions (42 turn headers, 0 stamps).
