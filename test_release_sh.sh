@@ -7,6 +7,33 @@
 # is bash. Deliberate — it builds ~10 throwaway git repos, and having a release
 # cut recursively exercise the release script is a knot rather than a check.
 # Run it by hand when release.sh changes:  ./test_release_sh.sh
+#
+# ── READ BEFORE ADDING A CASE ───────────────────────────────────────────────
+# THE TRAP THIS HARNESS SETS FOR ITS OWN AUTHOR (caught 3× while writing it):
+# release.sh REFUSES a dirty tree when HEAD is the released commit. So a case
+# that dirties the tree to prove something about the released bytes never runs
+# the code it's about — the refusal fires first and the case passes having
+# tested the refusal. **If your case makes the tree differ from what ships,
+# commit ahead of origin/main first and assert it with pre().** The general
+# form: the refusal you are testing AROUND fires before the regime you are
+# testing IN.
+#
+# Two more shapes, each of which passed here before being caught:
+#   - `not grep ... FILE` PASSES when FILE does not exist. A negative assertion
+#     is exactly where you fail to notice the target is gone — assert existence
+#     with pre() first (or count with `grep -c`, which cannot pass by absence).
+#   - Do not assert a state that merely CORRELATES with the property named in
+#     the description. "poison test was never run" was checked as "the untracked
+#     file is absent from the release worktree" — entailed by it being untracked,
+#     so it could not have come back false in ANY regime, and it passed under
+#     both mutations. Assert the observable CONSEQUENCE instead.
+#     The distinguishing question, worth asking of every check here:
+#     **could this assertion have come back false?** If not, it is not evidence.
+#
+# The canary in case [10] is mutation-proven; if you change release.sh's control
+# flow, re-run the mutations (break it deliberately, confirm a case fails BY
+# NAME). A canary nobody has seen die is not known to be alive.
+# ────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 # Resolve the script under test RELATIVE to this file, never by absolute path:
 # a hardcoded dev-tree path would silently test the wrong bytes when this suite
