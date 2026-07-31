@@ -259,6 +259,60 @@ ck "release notes came from the commit" grep -q "notes body" "$GH_NOTES"
 ck "corpus symlink removed from the frozen release" \
    [ ! -e "$D/releases/v1.0.0/logs_main" ]
 
+echo "=== [11] a PRESENT CHANGELOG entry produces NO warning (real-size file) ==="
+# REGRESSION, live-fired on the v0.6.44 cut: `git show … | grep -q` under
+# `set -o pipefail` reports 141 when the entry IS found — grep -q exits at the
+# first match, git show dies of SIGPIPE writing the remainder, pipefail
+# surfaces it. Inverted by `!`, the warning fired whether or not the entry
+# existed, so the check could not come back clean.
+#
+# WHY 42 GREEN CHECKS MISSED IT — the precondition trap a third time, now in a
+# dimension nobody was watching: SIZE. Every fixture CHANGELOG here is ~30
+# bytes, which fits the pipe buffer entire, so `git show` finishes writing
+# before grep exits and there is no SIGPIPE to surface. The fixture sat
+# OUTSIDE the regime the bug lives in. Case [10] does assert the warning's
+# absence — correctly — and still passed, because its file is small.
+# So: make the fixture bigger than the pipe buffer (64 KiB on macOS/Linux).
+D=$(new_repo r11 1)
+{ printf '## v1.0.0 first\n\nnotes body\n'
+  # ~200 KiB of trailing history, as any real CHANGELOG accumulates
+  for i in $(seq 1 4000); do
+    printf '## v0.0.%s — older entry with enough prose to fill the pipe buffer\n' "$i"
+  done
+} > "$D/CHANGELOG.md"
+git -C "$D" add -A; git -C "$D" commit -qm "real-size changelog"
+git -C "$D" push -q origin main
+pre "fixture CHANGELOG exceeds the 64 KiB pipe buffer (else no SIGPIPE is possible)" \
+   [ "$(wc -c < "$D/CHANGELOG.md")" -gt 65536 ]
+# Not a pipeline — this helper first hit the EXACT bug it exists to check for
+# (grep -q + pipefail = 141 on a match), and reported a broken precondition on
+# a file that plainly had the entry. Match a herestring instead.
+entry_present() { grep -q "^## v1.0.0" <<<"$(git -C "$D" show origin/main:CHANGELOG.md)"; }
+pre "the entry really is present at the released commit" entry_present
+export GH_LOG="$LAB/gh11.log"; : > "$GH_LOG"
+OUT=$("$D/release.sh" v1.0.0 2>&1); RC=$?
+ck "cut succeeded" [ "$RC" = 0 ]
+ck "NO changelog warning when the entry is present" \
+   not grep -q "has no '## v1.0.0' entry" <<<"$OUT"
+
+# Positive control, in a DIFFERENT PLANE from the subject: the check must still
+# be able to FIRE. Without this, deleting the check entirely would pass above.
+D=$(new_repo r11b 1)
+{ printf '## v9.9.9 unrelated\n\nnotes body\n'
+  for i in $(seq 1 4000); do
+    printf '## v0.0.%s — older entry with enough prose to fill the pipe buffer\n' "$i"
+  done
+} > "$D/CHANGELOG.md"
+git -C "$D" add -A; git -C "$D" commit -qm "real-size changelog, no v1.0.0 entry"
+git -C "$D" push -q origin main
+entry_absent() { ! grep -q "^## v1.0.0" <<<"$(git -C "$D" show origin/main:CHANGELOG.md)"; }
+pre "the entry really is ABSENT at the released commit" entry_absent
+export GH_LOG="$LAB/gh11b.log"; : > "$GH_LOG"
+OUT=$("$D/release.sh" v1.0.0 2>&1); RC=$?
+ck "POSITIVE CONTROL: warning DOES fire on a same-size file with no entry" \
+   grep -q "has no '## v1.0.0' entry" <<<"$OUT"
+ck "a missing entry still only warns, never blocks the cut" [ "$RC" = 0 ]
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$LAB"

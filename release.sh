@@ -82,7 +82,17 @@ fi
 
 # A release should tell its story: warn (don't block) when the RELEASED
 # COMMIT's CHANGELOG.md has no entry for the version being cut.
-if ! git show "$COMMIT:CHANGELOG.md" 2>/dev/null | grep -q "^## $VERSION\b"; then
+#
+# NOT a pipeline, deliberately. `git show … | grep -q` under `set -o pipefail`
+# reports 141 whenever the entry IS found: grep -q exits at the first match,
+# git show dies of SIGPIPE writing the rest, and pipefail surfaces that as the
+# pipeline's status. Inverted by `!`, the warning then fires in BOTH cases —
+# the check could not come back clean on any CHANGELOG larger than the pipe
+# buffer, which is every real one (ours: 62 KB). Live-fired on the v0.6.44 cut
+# while the entry was present two lines from the top. Read the blob into a
+# variable and match a herestring: no upstream process, so nothing to SIGPIPE.
+CHANGELOG_AT_COMMIT="$(git show "$COMMIT:CHANGELOG.md" 2>/dev/null || true)"
+if ! grep -q "^## $VERSION\b" <<<"$CHANGELOG_AT_COMMIT"; then
   echo "WARNING: CHANGELOG.md at $COMMITISH has no '## $VERSION' entry — add one (top of file) so the release is self-describing." >&2
 fi
 
