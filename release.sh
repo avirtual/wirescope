@@ -66,6 +66,20 @@ else
   echo "        those commits and any uncommitted changes are NOT published by this cut."
 fi
 
+# ── INVARIANT for everything below ──────────────────────────────────────────
+# EVERY check from here on must read the RELEASED COMMIT, never the working
+# tree: `git show "$COMMIT:path"`, or a path inside releases/$VERSION — never a
+# bare relative path, which resolves against the dev tree.
+#
+# This became load-bearing the moment the tag stopped following HEAD. Before
+# that, tree == HEAD == released commit by construction, so reading the tree was
+# harmless and nothing had to say so. Now a tree-reading check validates bytes
+# that aren't shipping, and it reads GREEN exactly when the tree and the commit
+# disagree — i.e. in the very case this script exists to support. Adding one
+# would not fail any existing test; test_release_sh.sh case [10] is the canary
+# that catches it (it cuts with every tracked file mangled in the tree).
+# ────────────────────────────────────────────────────────────────────────────
+
 # A release should tell its story: warn (don't block) when the RELEASED
 # COMMIT's CHANGELOG.md has no entry for the version being cut.
 if ! git show "$COMMIT:CHANGELOG.md" 2>/dev/null | grep -q "^## $VERSION\b"; then

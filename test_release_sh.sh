@@ -170,6 +170,58 @@ ck "refused" [ "$RC" != 0 ]
 ck "no tag" not git -C "$D" rev-parse -q --verify refs/tags/v1.0.0 >/dev/null
 ck "no worktree" [ ! -d "$D/releases/v1.0.0" ]
 
+echo "=== [10] CANARY: no step may read the working tree ==="
+# The invariant stated in release.sh above the CHANGELOG check. A future check
+# added with a bare relative path (`grep ... CHANGELOG.md`, `python3 test_x.py`)
+# would pass every other case here — tree and released commit agree in most of
+# them — and would read GREEN precisely when they disagree. So: mangle EVERY
+# tracked file in the tree, plant a poison test, and cut anyway. Anything that
+# reaches for the tree now fails, loudly, instead of shipping unvalidated bytes.
+D=$(new_repo r10 1)
+git -C "$D" ls-files | while read -r f; do
+  case "$f" in
+    release.sh) : ;;                       # the script under test must stay runnable
+    *) printf 'MANGLED-TREE-CONTENT\n' > "$D/$f" ;;
+  esac
+done
+printf 'raise SystemExit(1)\n' > "$D/test_poison.py"   # untracked: must never run
+# HEAD must be AHEAD of the released commit, or the dirty-tree refusal fires
+# first and this case never reaches the regime it is about (it did, on the
+# first run — the same trap as [6]/[7]).
+git -C "$D" -c user.email=t@t -c user.name=t commit -qam "local commit, never pushed"
+pre "tree really is mangled (else this case proves nothing)" \
+   grep -q "MANGLED-TREE-CONTENT" "$D/CHANGELOG.md"
+pre "released commit differs from HEAD (else the dirty-tree refusal fires)" \
+   [ "$(git -C "$D" rev-parse origin/main)" != "$(git -C "$D" rev-parse HEAD)" ]
+export GH_LOG="$LAB/gh10.log"; : > "$GH_LOG"
+export GH_NOTES="$LAB/notes10.txt"; : > "$GH_NOTES"
+OUT=$("$D/release.sh" v1.0.0 2>&1); RC=$?
+ck "cut succeeds with a fully mangled working tree" [ "$RC" = 0 ]
+# The poison test EXITS 1, so "the gate never ran it" is carried by the cut
+# succeeding at all — asserting only that the file is absent from the worktree
+# would pass whether or not it ran (it is untracked; it is never in there).
+# Assert the observable consequence instead, and that the poison is real.
+pre "poison test is present in the tree and does fail" \
+   [ -f "$D/test_poison.py" ]
+poison_fails() { ( cd "$D" && ! python3 test_poison.py >/dev/null 2>&1 ); }
+pre "poison test really exits nonzero" poison_fails
+ck "gate did not run the tree's poison test (cut would have failed)" [ "$RC" = 0 ]
+ck "released worktree has the COMMITTED test, not the mangled one" \
+   grep -q 'print("ok")' "$D/releases/v1.0.0/test_a.py"
+# A `not grep` against a MISSING file also "passes" — the absent-file vacuity.
+# Assert existence first so this cannot pass by the worktree not being there.
+pre "released CHANGELOG exists (else the next check passes on a missing file)" \
+   [ -f "$D/releases/v1.0.0/CHANGELOG.md" ]
+ck "released worktree has the COMMITTED changelog" \
+   not grep -q "MANGLED-TREE-CONTENT" "$D/releases/v1.0.0/CHANGELOG.md"
+ck "no CHANGELOG warning (the check read the commit, not the mangled tree)" \
+   not grep -q "has no '## v1.0.0' entry" <<<"$OUT"
+pre "notes were captured (else both note checks read an empty file)" [ -s "$GH_NOTES" ]
+ck "release notes free of tree content" not grep -q "MANGLED-TREE-CONTENT" "$GH_NOTES"
+ck "release notes came from the commit" grep -q "notes body" "$GH_NOTES"
+ck "corpus symlink removed from the frozen release" \
+   [ ! -e "$D/releases/v1.0.0/logs_main" ]
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 rm -rf "$LAB"
