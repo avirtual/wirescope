@@ -29,6 +29,10 @@
 #     both mutations. Assert the observable CONSEQUENCE instead.
 #     The distinguishing question, worth asking of every check here:
 #     **could this assertion have come back false?** If not, it is not evidence.
+#     Ask it at BOTH levels: of the assertion, and of the precondition. At the
+#     second level it also catches the drift class above — "could this fixture
+#     have been outside the clamp window / could the tree have differed from
+#     what ships?" is exactly the question whose answer was silently no.
 #
 # The canary in case [10] is mutation-proven; if you change release.sh's control
 # flow, re-run the mutations (break it deliberately, confirm a case fails BY
