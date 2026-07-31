@@ -35,6 +35,89 @@ So the gate is **per hint**, set on the hint object:
 - Withheld mid-loop is recorded as `declined: "turn_start_gate"` with the withheld ids — explicitly *not* counted as an unmatched-scope misconfiguration, since it is the gate working.
 - Feature-detect via `capabilities.hints.turn_start_gate` on `/_identity`. **Posting the field to a proxy without it is silently accepted and ignored** (unknown keys aren't rejected), which bills per-request — so check the capability rather than assuming.
 
+## Main-line scoping (`main_line_only`)
+
+**The problem it solves: subagents share the parent's `session_id` by construction.** A `?session=` hint is therefore in scope for every `Task`/`Agent` spawn of that session, and there is no finer key on the wire. For a standing prohibition that is merely wasteful. For a **one-shot payload** it is a correctness bug: a subagent's first request consumes a payload meant for the main line, and the main line never sees it.
+
+Measured on 35,405 parent-classified requests in `logs_main`: 2,107 strict cross-role overlaps across 106 sessions (top pairs `parent`/`general-purpose` 478, `parent`/`Plan` 335, `parent`/`subagent` 327). Fan-out concurrency is the normal shape of a session, not an edge case.
+
+**The main line is NOT concurrent with itself**, so a main-line-scoped one-shot lands on one request by construction. Verified at n=33,772 main-line turns: 12 residual overlaps across 10 of 502 sessions, every one a pair with identical message counts where one side's SSE truncates mid-`thinking_delta` with no `message_stop` — abandoned streams the client re-issued. Retries, not parallelism.
+
+### The predicate must be stricter than `role == "parent"`
+
+**This is the trap, and it is not visible from outside.** `writer._classify_role` is a pure function of the inbound request (system-prompt signature + the two wire signals), so it *is* available at injection time — the server already computes it at `server.py:1660` on the same object `inject()` sees, and the ordering is incidental. But it is the wrong predicate here.
+
+`_genuine_subagent` applies a **fingerprint backstop**: when a request's content fingerprint matches the session's recorded main-line fingerprint, it is filed as parent even though a raw subagent signal is present. That under-attribution is *correct for billing* — it keeps a parent turn that leaked a stale agent-id (and a fork-path sub, which clones the parent's first message and so its fingerprint) out of a subagent bucket. It is **wrong for "may this consume a one-shot payload"**, where the same request must be refused.
+
+Measured: **979 requests (2.75% of all parent-classified traffic) carry a live raw subagent signal and are still classified `parent`.** Tested against independent lineage evidence (hash of the first user message, the thing the CLI itself fingerprints on): **676 of the 979 have a lineage DIFFERENT from their session's main line** — genuine subagents the classifier files as parent — and only 303 match the same-lineage fork/leak pattern. An earlier draft of this section attributed all 979 to the fork path; that was wrong, and it mattered less than it should have only because both populations want the same treatment here. Either way the raw-signal predicate refuses them.
+
+> **One field, two consumers, opposite correctness criteria.** The dashboard's row classification and the pop predicate ask different questions of the same signal, and the answer that is right for attribution is wrong for consumption. Reuse the *signals*, not the verdict. Anyone reusing `role` for a third purpose should re-derive which of the two criteria theirs matches rather than assuming one classification serves all.
+
+So the pop predicate reads the raw signals directly and **fails closed** — decline on either, ignoring the fingerprint backstop:
+
+- `writer._billing_is_subagent(obj)` — `cc_is_subagent=true` in the billing header (system block 0), **or**
+- a present `x-claude-code-agent-id` request header.
+
+Cost of failing closed: an unserved payload on genuine fork-path main-line turns, bounded by that 2.77%. That is the recoverable side — the consumer re-posts. A mis-served payload is consumed by something that cannot act on it and, worse, is **indistinguishable from "the model ignored it"** at the consumer, so it corrupts the only instrument available for tuning retrieval. Blast radius, per the rule above.
+
+### Independently useful for standing hints
+
+A prohibition registered against a seat currently rides that seat's subagents' requests too. `main_line_only` is the opt-out, and it is the same predicate.
+
+## One-shot payloads — the pop protocol (`once`)
+
+The use case: deliver a large **ephemeral catalogue** (e.g. a memory index) that must reach the model once, influence what it asks for, and then vanish — never entering the transcript, never re-shipping. The model reads the menu, emits `load-memory 2,7`, and the consumer delivers only those bodies through its own channel. The menu itself is never carried again.
+
+```json
+POST /_hints?agent=<route>
+{"hints": [{"id": "memcat", "text": "…", "once": true,
+            "main_line_only": true, "ttl_s": 900,
+            "expect_session": "<session-uuid>"}]}
+```
+
+### Pop RESERVES at injection and COMMITS on a 200
+
+**A pop must not be consumed by a request that never completes.** Measured across 54,193 captures: **94.08% of forwarded requests reach a 200; 5.9% never do** (3.60% no response at all, 1.19% 404, 0.86% 429, 0.21% 529, 0.04% 400). And failures **cluster** rather than scattering: 426 of 795 sessions are failure-free, but there are 1,160 failure *runs* — median 1, p90 6, **max 38 consecutive**. Popping at injection would silently discard payloads through an entire shed storm.
+
+So the pop is two-phase, using the two points the server already has:
+
+1. **Reserve** — `hints.inject()` stamps the payload onto the request and marks the entry in-flight.
+2. **Commit** — `receipts.anthropic` (the single turn-finalize convergence both wires call, which already receives `status_code`, `session_id`, `role`, `agent_header_id`) pops on a 200 and **rolls back otherwise**, leaving the entry armed for the next request.
+
+Rollback is deliberately invisible to the model and visible to the consumer: the entry simply rides the retry. No re-POST needed.
+
+### Keying: agent route, with `expect_session` as the real guard
+
+The key is the **agent route**, because it is nameable in advance. (A subagent-id key was considered and dropped from v1: `x-claude-code-agent-id` is stable across an instance's turns — 594 instances, 84.8% multi-request, median 29 turns — but is *unknowable before that instance's first request*, making it reactive-only, which is the opposite of a menu you want waiting.)
+
+**A route name does not identify a conversation, and this is the load-bearing finding.** Measured on main-line traffic only (`role=parent`, `tools>0`, title side-calls excluded) across 207 routes: **516 route-level session switches between consecutive main-line requests — 117 within 10s, 250 within 60s.** Most are `/clear` rotation, which is sequential and harmless. But **53 are true interleaves**: conversation A ran, B ran, then A *resumed* on the same route — including 10 on a live per-seat Clodex route, tightest resume 27s.
+
+**What the strays are — checked, not assumed.** The first hypothesis was fork-path subagents misfiled as `parent`. **Falsified:** applying the strict predicate (drop every request carrying `cc_is_subagent=true` or `x-claude-code-agent-id`) leaves the count at **53 → 53, zero removed**. Positive control, because an unchanged number is also what a dead filter produces: the same predicate drops 90 of 6,585 parent+tools requests elsewhere, so the filter works and the null is real.
+
+Reading the bodies identified them: **one-shot CLI spawns** — own `session_id`, `cc_entrypoint=sdk-cli`, full 27-tool roster, exactly 2 messages, no subagent signal of any kind, prompt literally `hi`, firing 4–5s apart in the gaps between a long conversation's turns. Ad-hoc probe traffic sharing a live route, not harness machinery (Clodex spawns no one-shot CLI; its hooks only read stdin and write files). On a single route, 41 of 47 sessions were these.
+
+**They are genuinely main lines** — separate top-level CLI processes — so they pass `main_line_only` honestly. That is precisely why the name alone is insufficient: a name-keyed pop would be consumed by a two-message throwaway that exits immediately, the receipt would read *delivered*, and the intended conversation would never see it. **Indistinguishable, at the consumer, from "the model ignored it."**
+
+`expect_session` closes it:
+
+- **Absent** → serve to whatever main line arrives on that route. The **unsafe mode**; correct only for routes known to host exactly one conversation.
+- **Present** → serve only if the inbound `session_id` matches; otherwise **leave armed and log a decline**. Silent misdelivery becomes visible non-delivery.
+
+Not mandatory — a required field gets filled with whatever satisfies the validator, and the optional form is still right for standing hints. But **omitting it on a route that hosts spawns is a footgun**, and consumers should post with it always.
+
+> This is available *only* because the namespaces turned out to be identical. The wire `session_id` (parsed from `metadata.user_id`) **is** the CLI's `sessionId`: **758 of 788 distinct wire session_ids (96.2%) exist verbatim as `~/.claude/projects/**/<id>.jsonl` transcript filenames**; the 30 that don't are rotated/swept transcripts and codex v7 ids (codex has no CLI transcript by construction). A consumer reading the id off the transcript symlink can name the conversation it means. There is no mapping layer and no translation race.
+
+The guard generalizes past the case that motivated it: it defends against *any* unenumerated stray on a shared route, which matters because the first attempt to name the threat was wrong.
+
+### The rest of the semantics
+
+- **`ttl_s` is REQUIRED for `once` hints in both scopes** (agent scope otherwise permits `null` = never expires). A stale catalogue describes a decision that already happened — worse than no catalogue. Keep it short.
+- **One slot per purpose: use a stable `id`.** Upsert by id means re-posting `memcat` replaces the armed entry, so the newest menu is the one that rides. A fresh uuid per catalogue would leave several armed at once and put two menus on one request.
+- **Re-POST after a pop re-arms.** Under `once` a refresh and a re-arm are the same operation, so the merge-upsert ambiguity does not bite here.
+- **Posting is out-of-band and never on the request path**, so an unreachable proxy fails loudly in the consumer's own HTTP call and cannot block or delay a turn.
+- **State is readable** (`armed`, `armed_at`, `delivered_session`) so *posted-but-never-served* is distinguishable from *never-posted*. `delivered_session` is reported regardless of mode, so even an unguarded pop can be audited after the fact for where it actually landed.
+- **`main_line_only` uses the raw-signal predicate** from the section above, not `role == "parent"`.
+
 ## Endpoints
 
 ### `POST /_hints?agent=<pattern>`
@@ -102,11 +185,15 @@ A truncated hint reads as present and isn't, so an oversized set is **rejected w
 | env | default | meaning |
 |---|---|---|
 | `HINTS` | `1` | Kill switch. Registry is empty at rest, so enabled-and-unconfigured costs nothing. |
-| `HINTS_MAX_ONE` | `800` | Per-hint chars. |
-| `HINTS_MAX_CHARS` | `2000` | Total across all hints on one request. |
+| `HINTS_MAX_ONE` | `2500` | Per-hint chars. |
+| `HINTS_MAX_CHARS` | `3500` | Total across all hints on one request. |
 | `HINTS_MAX_PER_SCOPE` | `16` | Registered hints per scope. |
 
 `id` must match `^[a-z0-9][a-z0-9-]{0,63}$`. Duplicate ids in one request → 400.
+
+**The two caps are checked in different places, so their RELATIONSHIP is the invariant, not their values.** `HINTS_MAX_ONE` must stay meaningfully below `HINTS_MAX_CHARS` — otherwise a hint passes the per-hint check and then fails the total, which is a limit that says yes and means no. (Live near-miss: a 2500-char catalogue requested against a 2000-char total would have cleared one gate and died at the next.) The headroom is deliberate: the total must fit the largest single hint **plus** a standing prohibition alongside it. A test asserts `HINTS_MAX_ONE < HINTS_MAX_CHARS` with room to spare — assert the relationship, never the two numbers separately.
+
+**Overflow names its culprit.** The total is shared across scopes, which means one oversized hint can decline an unrelated standing prohibition. A bare "over cap" would attribute that to the injection rather than to the hint that ate the budget — the loud failure masking the silent one. So an over-total decline reports `over_cap` with `offender` (the hint id that pushed it over) and `dropped` (the ids that consequently did not ship). Per-scope budgets were considered and rejected: they move the effective ceiling invisibly as scopes come and go, whereas attribution fixes the actual defect.
 
 ## Conventions
 

@@ -159,10 +159,30 @@ code, body = h.set_hints({"hints": [{"id": "big", "text": "x" * (h.HINTS_MAX_ONE
 check("over-per-hint-cap is DECLINED", code == 400 and "declined" in body["reason"],
       str(body))
 check("declined set registered nothing", not h._AGENT_HINTS.get("r2"))
-many = [{"id": f"h{i}", "text": "y" * 300} for i in range(10)]
+# derive the over-total set from the CAPS, never a hardcoded size: a literal
+# 10x300 silently stopped exceeding the total the day the total was raised, so
+# the check would have passed while testing nothing.
+_one = min(h.HINTS_MAX_ONE, 300)
+many = [{"id": f"h{i}", "text": "y" * _one}
+        for i in range(h.HINTS_MAX_CHARS // _one + 1)]
+check("over-total set really exceeds the total",
+      len(many) * _one > h.HINTS_MAX_CHARS)
+check("over-total set stays under the PER-HINT cap (isolates the total)",
+      _one <= h.HINTS_MAX_ONE)
 code, body = h.set_hints({"hints": many}, agent="r3")
 check("over-total-cap is DECLINED", code == 400 and "declined" in body["reason"],
       str(body))
+
+# THE RELATIONSHIP, not the two values: a per-hint cap at or above the total
+# lets a hint clear one gate and fail the next (live near-miss: a 2500-char
+# payload requested against a 2000-char total). Headroom so the largest single
+# hint can still ride alongside a standing prohibition.
+check("per-hint cap is meaningfully below the total",
+      h.HINTS_MAX_ONE < h.HINTS_MAX_CHARS,
+      f"one={h.HINTS_MAX_ONE} total={h.HINTS_MAX_CHARS}")
+check("total leaves headroom for a max hint + a standing hint",
+      h.HINTS_MAX_CHARS - h.HINTS_MAX_ONE >= 800,
+      f"headroom={h.HINTS_MAX_CHARS - h.HINTS_MAX_ONE}")
 code, body = h.set_hints({"hints": [{"id": "Bad Id", "text": "t"}]}, agent="r4")
 check("bad id rejected", code == 400)
 code, body = h.set_hints({"hints": [{"id": "a", "text": "t"}, {"id": "a", "text": "u"}]},
@@ -537,6 +557,172 @@ check("capabilities.hints.caps matches the enforced caps",
 check("endpoints.hints == /_hints", _eps.get("hints") == "/_hints")
 check("endpoints.hint stays /_hint (distinct feature, NOT tail hints)",
       _eps.get("hint") == "/_hint")
+check("capabilities.hints.pop advertises one-shot payloads (a proxy without it "
+      "accepts the keys and ships the payload EVERY request instead of once)",
+      _caps["hints"].get("pop") is True)
+
+
+# --- 14. one-shot pop protocol (once / main_line_only / expect_session) ------
+print("\n[14] one-shot pops")
+_reset()
+
+_SUB_SYS = [{"type": "text",
+             "text": "x-anthropic-billing-header: cc_version=1.2.3; "
+                     "cc_is_subagent=true;"}]
+
+
+def _body(sys=None):
+    o = {"messages": [{"role": "user",
+                       "content": [{"type": "text", "text": "hello"}]}]}
+    if sys:
+        o["system"] = sys
+    return o
+
+
+# -- validation
+code, body = h.set_hints({"hints": [{"id": "memcat", "text": "menu", "once": True}]},
+                         agent="popr")
+check("once WITHOUT ttl_s is DECLINED in agent scope (an armed payload with no "
+      "expiry goes stale, not away)", code == 400 and "ttl_s" in body["reason"],
+      str(body))
+code, _ = h.set_hints({"hints": [{"id": "memcat", "text": "menu", "once": "yes",
+                                  "ttl_s": 60}]}, agent="popr")
+check("once must be a bool (a truthy string is a config error)", code == 400)
+
+# -- the happy path: rides ONCE, and only after a confirmed 200
+_reset()
+h.set_hints({"hints": [{"id": "memcat", "text": "MENU-BODY", "once": True,
+                        "ttl_s": 300, "main_line_only": True}]}, agent="popr")
+o = _body()
+log = h.inject(o, agent="popr", session_id="s1", req_id=901)
+check("armed one-shot is injected", log and "memcat" in (log.get("hint_ids") or []),
+      str(log))
+check("injection RESERVES rather than pops", log.get("pop_reserved") == ["memcat"])
+check("entry is still registered before confirmation (reserve != pop)",
+      "memcat" in (h._AGENT_HINTS.get("popr") or {}))
+check("readback says ARMED (posted-but-unserved != never-posted)",
+      (h.read_scope(agent="popr")["agent_hints"] or [{}])[0].get("armed") is True)
+
+# a NON-200 must roll back, leaving it armed for the retry
+roll = h.commit_pops(901, 429, session_id="s1")
+check("non-200 ROLLS BACK the reservation", roll and roll["rolled_back"] == ["memcat"]
+      and roll["popped"] == [], str(roll))
+check("rolled-back payload is STILL armed (rides the retry, no re-POST)",
+      "memcat" in (h._AGENT_HINTS.get("popr") or {}))
+
+# the retry succeeds -> commit
+o2 = _body()
+log2 = h.inject(o2, agent="popr", session_id="s1", req_id=902)
+check("retry carries the payload again", "memcat" in (log2.get("hint_ids") or []))
+done = h.commit_pops(902, 200, session_id="s1")
+check("200 COMMITS the pop", done and done["popped"] == ["memcat"], str(done))
+check("committed pop reports the delivering session",
+      done.get("delivered_session") == "s1")
+check("popped entry is GONE from the registry", not h._AGENT_HINTS.get("popr"))
+o3 = _body()
+check("a popped payload never rides again",
+      h.inject(o3, agent="popr", session_id="s1", req_id=903) is None)
+
+# -- main_line_only refuses a RAW subagent signal (not role=="parent")
+_reset()
+h.set_hints({"hints": [{"id": "memcat", "text": "MENU", "once": True,
+                        "ttl_s": 300, "main_line_only": True}]}, agent="popr")
+sub = _body(_SUB_SYS)
+log = h.inject(sub, agent="popr", session_id="s1", req_id=910)
+check("cc_is_subagent=true is REFUSED the pop",
+      log and log.get("declined") == "pop_ineligible"
+      and log["pop_declined"].get("memcat") == "subagent", str(log))
+check("refused pop leaves the payload armed",
+      "memcat" in (h._AGENT_HINTS.get("popr") or {}))
+check("a refused pop is NOT recorded as an unmatched-scope misconfiguration",
+      not h.placement_report("s1").get("misconfigured"))
+hdr = _body()
+log = h.inject(hdr, agent="popr", session_id="s1", req_id=911,
+               agent_id="sub-instance-1")
+check("x-claude-code-agent-id is REFUSED the pop (the only signal a "
+      "proxy-spawned agent carries)",
+      log and log["pop_declined"].get("memcat") == "subagent", str(log))
+check("nothing was appended to a refused body",
+      len(hdr["messages"][0]["content"]) == 1)
+main = _body()
+log = h.inject(main, agent="popr", session_id="s1", req_id=912)
+check("the MAIN line still gets it", "memcat" in (log.get("hint_ids") or []))
+
+# -- expect_session: the guard against a stray sharing the route
+_reset()
+h.set_hints({"hints": [{"id": "memcat", "text": "MENU", "once": True,
+                        "ttl_s": 300, "main_line_only": True,
+                        "expect_session": "real-convo"}]}, agent="popr")
+stray = _body()          # a `hi` probe: own session, no subagent signal at all
+log = h.inject(stray, agent="popr", session_id="stray-probe", req_id=920)
+check("a stray main-line session on the SAME ROUTE is refused",
+      log and log["pop_declined"].get("memcat") == "session_mismatch", str(log))
+check("stray refusal leaves the payload armed for the real conversation",
+      "memcat" in (h._AGENT_HINTS.get("popr") or {}))
+real = _body()
+log = h.inject(real, agent="popr", session_id="real-convo", req_id=921)
+check("the NAMED conversation receives it", "memcat" in (log.get("hint_ids") or []))
+check("the payload text actually rode the body",
+      "MENU" in json.dumps(real))
+
+# -- a one-shot must never outlive the process
+_reset()
+# a standing hint alongside it as the POSITIVE CONTROL: without one, "nothing
+# came back" would also pass if persistence were broken outright, and the check
+# would read identical either way.
+h.set_hints({"hints": [{"id": "standing", "text": "always", "ttl_s": None}]},
+            agent="popr")
+h.set_hints({"hints": [{"id": "memcat", "text": "MENU", "once": True,
+                        "ttl_s": 300}]}, agent="popr")
+h._AGENT_HINTS.clear()
+h.load_agent_hints()
+_reloaded = h._AGENT_HINTS.get("popr") or {}
+check("POSITIVE CONTROL: an ordinary agent hint DOES survive a reload",
+      "standing" in _reloaded, str(sorted(_reloaded)))
+check("one-shot payloads are NEVER persisted (an armed catalogue that survives "
+      "a restart describes a decision already made)",
+      "memcat" not in _reloaded, str(sorted(_reloaded)))
+h.clear_hints(agent="popr")
+
+# -- a pop must survive the system_tail path too (clodex's main path: its
+# SessionStart hook emits the trailing role:"system" roster message). SYNTHETIC
+# by necessity — the shape is absent from logs_main (0 of 43,111 captured
+# bodies), so a corpus-driven check here would silently prove nothing.
+_reset()
+h.set_hints({"hints": [{"id": "memcat", "text": "MENU-PAYLOAD", "once": True,
+                        "ttl_s": 300, "main_line_only": True,
+                        "expect_session": "S"}]}, agent="popr")
+_st = {"messages": [
+    {"role": "user", "content": [{"type": "text", "text": "do it"}]},
+    {"role": "system", "content": [{"type": "text", "text": "Available agent types…",
+                                    "cache_control": {"type": "ephemeral"}}]}]}
+# STATE THE PRECONDITION: an earlier section leaves the fallback off, and with it
+# off this whole case silently degrades to `declined: marker_downstream` — the
+# check would fail for a reason that has nothing to do with pops.
+_fb_saved = h.SYSTEM_TAIL_FALLBACK
+h.SYSTEM_TAIL_FALLBACK = True
+log = h.inject(_st, agent="popr", session_id="S", req_id=4001)
+check("a pop rides the system_tail path", log and log.get("mode") == "system_tail"
+      and log.get("pop_reserved") == ["memcat"], str(log))
+check("system_tail payload lands strictly deeper than every marker (never inside "
+      "a cached segment)",
+      (log["msg_idx"], log["block_idx"]) > h._deepest_marker_index(_st["messages"]))
+check("system_tail pop commits on a 200",
+      (h.commit_pops(4001, 200, session_id="S") or {}).get("popped") == ["memcat"])
+h.SYSTEM_TAIL_FALLBACK = _fb_saved
+
+# -- over-total decline NAMES the culprit
+_reset()
+big = "z" * h.HINTS_MAX_ONE
+small = "s" * 200
+code, body = h.set_hints({"hints": [{"id": "hog", "text": big},
+                                    {"id": "standing", "text": small}] +
+                          [{"id": f"f{i}", "text": small} for i in range(6)]},
+                         agent="popr")
+check("over-total decline names the OFFENDER (not just 'over cap')",
+      code == 400 and body.get("offender") == "hog", str(body))
+check("over-total decline lists what was DROPPED as a consequence",
+      "standing" in (body.get("dropped") or []), str(body))
 
 print(f"\n{'ALL PASS' if not _fails else str(len(_fails)) + ' FAILURE(S): ' + str(_fails)}")
 sys.exit(1 if _fails else 0)
