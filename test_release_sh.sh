@@ -33,6 +33,12 @@
 #     second level it also catches the drift class above — "could this fixture
 #     have been outside the clamp window / could the tree have differed from
 #     what ships?" is exactly the question whose answer was silently no.
+#   - For a POSITIVE CONTROL the question is sharper, because a control that can
+#     only fail alongside its subject proves nothing: **could this come back TRUE
+#     while the subject FAILS?** A control sharing a failure mode with the thing
+#     it controls for (both killed by the same upstream decline) reads as
+#     "everything is broken" when only the subject is. Put the control in a
+#     DIFFERENT plane from the subject, not merely a different assertion.
 #
 # The canary in case [10] is mutation-proven; if you change release.sh's control
 # flow, re-run the mutations (break it deliberately, confirm a case fails BY
