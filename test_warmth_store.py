@@ -146,14 +146,21 @@ cr_t1 = {**cr, "messages": cr["messages"][:1]}
 cr_t2 = {**cr, "messages": cr["messages"][:2]}
 cr_t3 = {**cr, "messages": cr["messages"][:3]}
 
+# Receipt sizes below are REALISTIC (tens of thousands of tokens), not the toy
+# 100/200 they used to be. The bust test is now "did the matched prefix shrink by
+# more than one cacheable block (1024)", so a fixture whose whole prefix is 100
+# tokens cannot express a bust at all — it is smaller than the minimum cacheable
+# unit. The lapse cases below therefore SHRINK cache_read the way a real lapse
+# does (a big warm read, then a collapse to near-nothing).
+
 # Turn 1: a session's FIRST turn is an initial cold start, NOT a resume.
-r1 = lp._record_warmth(cr_t1, {"cache_creation_input_tokens": 100})
+r1 = lp._record_warmth(cr_t1, {"cache_creation_input_tokens": 40_000})
 check("first turn is not counted as a resume",
       r1["cold_resume"] is False and r1["cold_resumes"] == 0
       and lp.cold_resumes("sess-cr-1") == 0)
 
 # Turn 2: prior head still warm (active session) -> no resume.
-r2 = lp._record_warmth(cr_t2, {"cache_read_input_tokens": 100})
+r2 = lp._record_warmth(cr_t2, {"cache_read_input_tokens": 40_000})
 check("a turn on a still-warm prior head is not a resume",
       r2["cold_resume"] is False and lp.cold_resumes("sess-cr-1") == 0)
 
@@ -166,7 +173,8 @@ with lp.store.LOCK:
     con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
                 (time.time() - 30, _cr_head))
     con.commit()
-r3 = lp._record_warmth(cr_t3, {"cache_creation_input_tokens": 200})
+r3 = lp._record_warmth(cr_t3, {"cache_creation_input_tokens": 40_000,
+                               "cache_read_input_tokens": 500})
 check("a turn on a lapsed prior head counts as a cold resume",
       r3["cold_resume"] is True and r3["cold_resumes"] == 1
       and lp.cold_resumes("sess-cr-1") == 1)
@@ -175,6 +183,18 @@ check("a turn on a lapsed prior head counts as a cold resume",
 check("a cold resume is classified as a `lapse` bust",
       r3["bust_class"] == "lapse")
 
+# A WARM turn on the head the lapse just re-wrote. Real traffic always has one
+# before a second lapse can happen — the lapse re-wrote 40k, so the next request
+# reads that 40k back — and the bust test needs it: two lapse receipts back to
+# back would BOTH read ~500, and a read that does not shrink is not a bust. The
+# turn is also a genuine assertion (a warm turn between two lapses must not be
+# counted as a resume), not just fixture plumbing.
+cr_t3b = {**cr, "messages": cr["messages"] + [msg("user", "warm again " * 10)]}
+r3b = lp._record_warmth(cr_t3b, {"cache_read_input_tokens": 40_500})
+check("a warm turn after a lapse is not itself a resume or a bust",
+      r3b["cold_resume"] is False and r3b["bust_class"] is None
+      and lp.cold_resumes("sess-cr-1") == 1)
+
 # Lapse again with a fresh, longer prefix -> resume #2 (counter accumulates).
 cr_t4 = {**cr, "messages": cr["messages"] + [msg("user", "more " * 10)]}
 _cr_head = lp.warmth._session_head_hash("sess-cr-1")
@@ -182,7 +202,8 @@ with lp.store.LOCK:
     con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
                 (time.time() - 30, _cr_head))
     con.commit()
-r4 = lp._record_warmth(cr_t4, {"cache_creation_input_tokens": 50})
+r4 = lp._record_warmth(cr_t4, {"cache_creation_input_tokens": 40_000,
+                               "cache_read_input_tokens": 500})
 check("the cold-resume counter accumulates across lapses",
       r4["cold_resumes"] == 2 and lp.cold_resumes("sess-cr-1") == 2)
 
@@ -218,8 +239,11 @@ rst = {"model": "claude-fable-5",
                     msg("user", "deploy-tax probe gamma " * 20)],
        "metadata": {"user_id": json.dumps({"session_id": "sess-deploy-1"})}}
 # Turn 1: establish the head (initial cold start, no bust).
+# (Realistic sizes, as above: a system swap must SHRINK the matched prefix for
+# the receipt to show a bust — the whole system[] block is upstream of the
+# history, so losing it collapses the read to ~nothing.)
 lp._record_warmth({**rst, "messages": rst["messages"][:1]},
-                  {"cache_creation_input_tokens": 100})
+                  {"cache_creation_input_tokens": 30_000})
 # Simulate a restart: bump _START_TS past the head we just wrote, so the next
 # turn's prior head reads as "written by a previous process".
 _saved_start = lp.core._START_TS
@@ -229,7 +253,7 @@ lp.core._START_TS = time.time() + 100
 rst_v2 = {**rst, "system": [{"type": "text",
                              "text": "You are Claude Code, deploy-tax v2 CHANGED."}],
           "messages": rst["messages"][:2]}
-r_dep = lp._record_warmth(rst_v2, {"cache_creation_input_tokens": 1000,
+r_dep = lp._record_warmth(rst_v2, {"cache_creation_input_tokens": 30_000,
                                    "cache_read_input_tokens": 10})
 lp.core._START_TS = _saved_start          # restore before anything else runs
 check("a system bust straddling a restart is classified `system`",
@@ -245,12 +269,18 @@ _dep_sys = next(c for c in _dep["classes"] if c["class"] == "system")
 check("per-class restart_between rides classes[] for the chip's count>restart gate",
       _dep_sys["count"] == 1 and _dep_sys["restart_between"] == 1
       and _dep_sys["fault"] == "content")
+# A warm turn on the head turn 2 re-wrote, before the next swap: the bust test
+# compares against the PRIOR receipt, and two busted receipts back to back both
+# read ~0, so without the recovery turn in between the second swap has nothing
+# to have shrunk FROM. Real traffic always has it (the re-write is read back on
+# the following request).
+lp._record_warmth(rst_v2, {"cache_read_input_tokens": 30_000})
 # Turn 3: a REAL in-session system bust (no restart) -> count exceeds restart,
 # so actionable_excl_restart goes positive = the chip should light up.
 rst_v3 = {**rst, "system": [{"type": "text",
                              "text": "You are Claude Code, deploy-tax v3 midswap."}],
           "messages": rst["messages"][:2]}
-lp._record_warmth(rst_v3, {"cache_creation_input_tokens": 1000,
+lp._record_warmth(rst_v3, {"cache_creation_input_tokens": 30_000,
                            "cache_read_input_tokens": 10})
 _dep2 = [s for s in lp._status_snapshot(session="sess-deploy-1")["sessions"]
          if s["session_id"] == "sess-deploy-1"][0]["busts"]
@@ -3624,11 +3654,17 @@ _bc_pure = lp.warmth._classify_bust
 # non-contracting message count (cur_msgs=200 vs prior 100), so each case names
 # only the ONE thing it perturbs. A 4-tuple prior is padded with prior msg_count
 # 100 for back-compat with the hash-only cases.
+# `prior_read` defaults to a big warm prefix so that any case passing a SMALL
+# `read` expresses what a bust actually is — the matched prefix shrank. (The gate
+# used to be the write fraction, which needed no baseline at all; the cases below
+# kept their original read/created numbers, and every one of them that means to
+# be a bust already reads far below this baseline.)
 def _cls(read, created, inp, *, prior, t="T", s="S", sf="SF", m="M",
-         cur_msgs=200, lapsed=False):
+         cur_msgs=200, lapsed=False, prior_read=100_000, prior_write=0):
     if prior is not None and len(prior) == 4:
         prior = (*prior, 100)                # pad prior msg_count for hash-only cases
-    return _bc_pure(read, created, inp, prior=prior, cur_tools=t, cur_sys=s,
+    return _bc_pure(read, created, inp, prior=prior, prior_read=prior_read,
+                    prior_write=prior_write, cur_tools=t, cur_sys=s,
                     cur_sysfull=sf, cur_msg0=m, cur_msgs=cur_msgs, lapsed=lapsed)
 
 
@@ -3661,8 +3697,27 @@ check("classify: a modest count drop (not past the ratio) stays conversation",
       _cls(3000, 8000, 20, prior=_ALL, cur_msgs=98) == "conversation")   # 98 > 0.5*100
 check("classify: content-divergence wins over lapse when both present",
       _cls(0, 8000, 20, prior=("T0", "S", "SF", "M"), lapsed=True) == "tools")
-check("classify: write_frac just under the gate -> append, not a bust",
-      _cls(9000, 1400, 100, prior=("T", "S", "SF", "M0")) is None)   # 1400/10500=0.133
+# The gate is prefix LOSS, not the write fraction — so a turn whose write is a
+# large share of its window is still an append while the prefix holds, and these
+# two cases pin exactly that (the old suite asserted the same verdict via a
+# 1400/10500=0.133 write fraction, which is no longer what decides it).
+check("classify: an intact prefix is an append no matter how big the write",
+      _cls(100_000, 60_000, 100, prior=("T", "S", "SF", "M0"),
+           prior_read=100_000) is None)
+check("classify: a GROWING prefix is an append too",
+      _cls(140_000, 60_000, 100, prior=("T", "S", "SF", "M0"),
+           prior_read=100_000) is None)
+check("classify: sub-block jitter around an unchanged boundary is not a bust",
+      _cls(99_500, 1_400, 100, prior=("T", "S", "SF", "M0"),
+           prior_read=100_000) is None)
+check("classify: on a cold prior turn the prior WRITE is the baseline",
+      # prior turn matched nothing and wrote 90k; this turn matched 1k -> the
+      # prefix it established is gone. Read-only baselining is blind here.
+      _cls(1_000, 9_000, 100, prior=("T", "S", "SF", "M0"),
+           prior_read=0, prior_write=90_000) == "preamble")
+check("classify: ...but the deferred tail on that baseline is tolerated",
+      _cls(88_000, 2_000, 100, prior=("T", "S", "SF", "M0"),
+           prior_read=0, prior_write=90_000) is None)
 
 
 def _bc_body(sys2, date, nmsgs, sid="sess-bc"):
