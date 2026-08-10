@@ -45,6 +45,9 @@ This is the namesake feature. You annotate **an agent's `.md` body** (a property
 | `[wirescope:keep claudemd]` | Override verb — cancel a lower-layer omit/replace for one target. |
 | `[wirescope:tools Read,Edit,Grep]` | Allowlist a subagent's tool roster (the ~33-tool / ~24k-token-per-turn lever native `--tools` can't reach for a subagent). |
 | `[wirescope:strip-tools Bash]` | Denylist — remove named tools, keep the rest. |
+| `[wirescope:keep-tools Bash]` | Override verb — cancel a lower layer's `strip-tools`, or re-admit one name to an active allowlist. |
+| `[wirescope:keep-mcp <server>]` | Re-admit one MCP server's whole `mcp__<server>__*` tool family for this agent when the deployment strips it (`STRIP_MCP_SERVERS`). |
+| `[wirescope:strip-thinking on\|off]` | Drop `thinking` blocks from **completed prior turns** (the current turn's signed chain is never touched). Measured at **~16–22% of the bill** on large sessions, before the context-occupancy win. Ships globally off — this directive is how a session opts in, and it's sticky for that session. |
 | `[wirescope:agent-name <label>]` | A human display label for the subagent in `/_admin` / `/_session`. |
 
 ```
@@ -117,13 +120,25 @@ Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`)
 |---|---|
 | `GET /_identity` | Product/version/live-capabilities handshake. |
 | `GET /_status[?session=]` | Durable JSON: per-session cost, warmth, context, model, turns, refusals. Survives restarts. |
+| `GET /_context?session=` | What's loaded right now: tool + skill rosters (biggest-first), and a per-category token breakdown of the window. `&utilization=1` adds *used vs never-called*, i.e. what to trim. |
+| `GET /_report?session=[&detail=1]` | Disk-based cost/efficiency report; prices cold sessions too. |
+| `GET /_timeline?session=` | HTML cost-**evolution** dashboard — read / write / generation over the session's life. |
+| `GET /_bust?session=` | Where a session LOST its cached prefix, and what that cost. |
+| `GET /_pot[?days=N]` | Fleet-wide "which files keep getting re-read wastefully", over a trailing N-day window. |
+| `GET /_subagents?session=&child=` | Per-subagent detail (last text/tool) for one child instance. |
 | `GET /_admin` | Live HTML dashboard (warm/cold tables, subagents, refusals). |
 | `GET /_session?session=` | HTML view of a session's captured context + cache breakpoints. |
 | `GET /_warm?session=` | Just the warmth verdict for one session. |
 | `GET/POST /_ping?session=` | Slide a session's cache TTL once (~1 token). |
-| `POST /_hold?session=&hours=N` | Arm N hours of idle keep-warm insurance. |
+| `GET/POST /_hold?session=&hours=N` | Arm N hours of idle keep-warm insurance (`hours=0` disarms). |
+| `GET/POST /_strip?session=&on=1` | Programmatic twin of `[wirescope:strip-thinking]` — opt one session in/out. |
+| `GET/POST/DELETE /_hints[?agent=&session=]` | **Tail hints** — inject a short model-visible string as an *uncached trailing* block (never enters the CLI transcript, never busts a cached prefix). |
+| `POST /_compact?session=&path=` | Offline transcript **bake**: rewrite a parked session's JSONL to a leaner, still-resumable form. Atomic, backed up, integrity-gated. |
+| `GET/POST /_prune[?older_than=&tier=]` | Capture-dir retention. `tier=receipts` drops bodies but keeps billing receipts, so `/_report` still prices those sessions. |
 | `GET/POST/DELETE /_subscribe` | Register for the push feed (see SUBSCRIBERS.md). |
 | `GET/POST /_end?session=` | Mark a session finished (wire to SessionEnd). |
+
+Action endpoints follow one convention: **HTTP status = was the request valid**; the outcome is in the body (`ok` / `armed` / `warmed` / `skipped`), so a well-formed request that declined to act is a `200` with a reason, not a `4xx`. Full surface and semantics: [`INTEGRATION.md`](./INTEGRATION.md).
 
 ## Client integration
 

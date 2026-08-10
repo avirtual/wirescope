@@ -9,6 +9,10 @@ _canary/
 HANDOFF.local.md
 *.local.md
 releases/
+# retired corpora / dead port logs / finished working notes (see archive/README.md).
+# Whole tree is maintainer-only: the patterns above already match most of what's in
+# there, but anchor the dir so nothing under it can be published by a `git add -A`.
+/archive/
 release.env
 # internal working docs / lab journals — maintainer context, not published.
 # Root-anchored so it ignores ONLY the maintainer doc, not the fixture

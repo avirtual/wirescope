@@ -24,16 +24,29 @@ Cutting a release here does NOT reach :7800.
 clodex must re-run its own `vendor-wirescope.sh` against the new tag (pushed to
 origin `avirtual/wirescope`), then a GUI restart self-applies the bump.
 So: tag + push the release, then **tell clodex** which tag to vendor.
-`run_release.sh` is a no-op for prod under this model (it still serves dev/scratch
-ports).
+`run_release.sh` plays NO part in a prod deploy under this model — it starts a
+hand-run instance, which is the thing you don't want on :7800. It still serves
+dev/scratch ports.
 
 **Legacy hand-run release model (pre-2026-07-03, still valid for dev/scratch):**
 `./release.sh vX.Y.Z` cuts a release — clean tree + test suite gated, tags, builds
 a `releases/<tag>` worktree, flips the `releases/current` symlink.
-`./run_release.sh` restarts a hand-run :7800 from `releases/current` with
-LOG_DIR/WARMTH_DB/OUT pinned to the lab root.
+`./run_release.sh` starts an instance from `releases/current` (default `PORT=7800`,
+`LOG_DIR`/`WARMTH_DB`/`OUT` pinned to the lab root; all three overridable, and off
+:7800 an explicit `LOG_DIR` is REQUIRED so a scratch arm can't write into the
+frozen `logs_main` corpus).
 **Do not hand-run :7800 while clodex manages it** — you'll collide with the managed
 instance and revert the model (that's exactly the Jul-2026 rogue-instance bug).
+
+**Ownership guard (v0.6.50).** `run_release.sh` chains to `restart_proxy.sh`, whose
+first act is `kill` on whatever LISTENS on `$PORT` — under the managed model that
+pid is clodex's proxy, so the bare script was a foot-gun that took the live proxy
+and every warm prefix with it. It now refuses unless the listener's cwd is inside
+this lab: ours → proceed, no listener → proceed, anything else (including a cwd it
+cannot read) → refuse, fail closed. `RUN_RELEASE_FORCE=1` overrides once you've
+decided the kill is right; `RUN_RELEASE_CHECK_ONLY=1` runs only the guard.
+The guard reads ownership from the LISTENER, not from config, so it stays correct
+if the deployment model changes again.
 
 ## Launching proxies (dev / scratch ports)
 
@@ -89,24 +102,36 @@ Git since 2026-06-09; commit after meaningful changes.
 Client integration ships with the proxy in `client/` (warm-cache command, statusline,
 cache-expiry + cache-state hooks, settings.example.json, install.sh + README).
 These are the canonical copies — edit there, cut a release to ship.
-Project settings reference `releases/current/client/...` so wiring upgrades with
-releases.
-`~/.claude/commands/warm-cache.md` is a symlink through `releases/current`
-(install.sh).
-The SessionEnd→`/_end` hook is installed user-level in `~/.claude/settings.json`
-(pinned to :7800; scratch ports rely on the sweeper).
+
+**What is actually wired on this machine** (verified 2026-08-11 — `client/` ships more
+than is installed, so don't read the list above as the running config):
+
+| Piece | State |
+|---|---|
+| `~/.claude/commands/warm-cache.md` | **installed** — symlink through `releases/current` (→ v0.6.49), resolves. |
+| SessionEnd → `/_end` hook | **installed** user-level in `~/.claude/settings.json`, pinned to :7800. Scratch ports rely on the sweeper instead. |
+| statusline | **not ours** — `~/.claude/statusline-workbench.sh` → `agent-workbench`. `client/status-line.sh` is shipped but not installed. |
+| `cache-expiry-hook.sh`, `cache-state-hook.sh` | shipped, **not installed** (no hook entry references them). |
+| repo `.claude/` | **empty.** Nothing here references `releases/current/client/...`, so the "wiring upgrades with releases" property holds only for the warm-cache symlink. |
+
+Installing the rest is `client/install.sh` + `client/settings.example.json`; nothing
+depends on it (everything fails soft — proxy down ⇒ statusline renders `cache ∅`,
+hooks exit 0).
 
 ## Test suites (gate every release)
 
 `release.sh` runs **every `test_*.py` in the repo root** (glob, since 2026-07-19 — a new suite is gated the day it lands; before that an explicit six-suite list had silently omitted test_bake/test_pot).
-All are offline script-style suites (`python3 test_X.py`, exit 0 + `ALL PASS`; not pytest). Run the matching one after any edit in its area:
-- `test_warmth_store.py` — the grab-bag: warmth/pricing/hold/persistence/strip-latch/path-confinement (~600 checks).
-- `test_subscribers.py` — subs/tee/server-wiring.
-- `test_fold.py` — replay corpus for the L2 strip/fold family.
-- `test_strip_tools.py`, `test_marker_budget.py` — their named transforms.
-- `test_midturn.py` — mid-turn strip + marker gate (relocations keep the CLI's own ttl; the 5m scrap-tail downshift was removed 2026-07-20).
-- `test_bake.py` — offline transcript bake (`bake_session.py` / `/_compact` core).
-- `test_pot.py` — the /_pot rollup.
+All are offline script-style suites (`python3 test_X.py`, exit 0 + `ALL PASS`; not pytest).
+
+**There is deliberately no list of them here.** One lived here and drifted twice — it omitted `test_bake`/`test_pot` (which is why the gate became a glob in the first place), and by 2026-08-11 it was 5 suites short again. A hand-maintained enumeration of a globbed set is a second source of truth that only ever decays, and the version that decays silently is the one in the doc nobody runs. So:
+
+```sh
+ls test_*.py                                   # what the gate runs, always current
+head -8 test_<name>.py                         # what that suite is for
+grep -l "<thing you touched>" test_*.py        # which suite covers your edit
+```
+
+Every suite opens with a docstring stating **what defect it guards** (several also say what the *previous* version of the check failed to catch — worth reading before you add a case). That is the authoritative description; run the one whose area you edited, and `./release.sh` runs all of them regardless.
 
 ## Offline analysis + A/B proof tooling
 
