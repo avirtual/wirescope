@@ -1317,12 +1317,6 @@ async def handler(request: Request) -> Response:
             if transforms_mod._patch_system(obj):
                 record["syspatch"] = True
                 changed = True
-            # Proxy-side `rest` split: relocate static prose to an env-independent
-            # cache prefix (byte-identical model-visible text; cache boundary only).
-            sp = transforms_mod._split_system_rest(obj)
-            if sp:
-                record["rest_split"] = sp
-                changed = True
             # Design-2: relocate env+date to a tail block, mark CLAUDE.md (model-visible).
             rel = transforms_mod._relocate_env_to_tail(obj)
             if rel:

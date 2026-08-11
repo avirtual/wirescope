@@ -253,53 +253,16 @@ def _patch_system(obj):
     return False
 
 
-# ---- PROXY-SIDE `rest` SPLIT (experimental, off by default) ---------------
-# Under org/proxy scope the CLI welds ALL static system prose + ALL dynamic
-# `# Environment` (cwd/git/dirs/platform) into ONE cached block (sys[-1], the
-# "rest" block). Any env change busts that block, so the ~2.9k-tok static prose
-# is re-WRITTEN (1.25x/2x) every change instead of READ (0.10x). This relocates
-# the static head (everything BEFORE `\n# Environment`) onto the END of the
-# preceding MARKED preamble block (sys[-2], "You are Claude Code..."), so it
-# rides a DURABLE, env-independent cache prefix. SAFE: the concatenated system
-# TEXT the model sees is byte-IDENTICAL — only a cache_control boundary moves
-# (no reorder, no behavioural change, breakpoint count unchanged). FRAGILE: the
-# split point is the `# Environment` header heuristic — version-pin + monitor
-# hit-rate per CLI bump. Fleet-local (non-vanilla layout shares only with our
-# own proxied sessions). DON'T touch block0 (attribution).
-SPLIT_SYSTEM_REST = os.environ.get("SPLIT_SYSTEM_REST") in ("1", "yes", "on", "true")
-_REST_SPLIT_MARKER = os.environ.get("SPLIT_SYSTEM_REST_MARKER", "\n# Environment")
-
-
-def _split_system_rest(obj):
-    """Move the static prose at the head of the env-bearing `rest` block onto the
-    end of the preceding marked block. Byte-identical model-visible text; only a
-    cache boundary shifts. Idempotent (once split, the marker sits at offset 0 of
-    the rest block → no-op). Returns a log dict, or None if it didn't apply."""
-    if not SPLIT_SYSTEM_REST:
-        return None
-    sys = obj.get("system")
-    if not isinstance(sys, list) or len(sys) < 2:
-        return None
-    # the `rest` block is the one carrying the env header; host = the block before
-    ri = next((i for i, b in enumerate(sys)
-               if isinstance(b, dict) and isinstance(b.get("text"), str)
-               and _REST_SPLIT_MARKER in b["text"]), None)
-    if not ri:  # None, or 0 (no preceding block to host the static prose)
-        return None
-    rest, prev = sys[ri], sys[ri - 1]
-    pt = prev.get("text")
-    rt = rest["text"]
-    if not isinstance(pt, str):
-        return None
-    idx = rt.find(_REST_SPLIT_MARKER)
-    if idx <= 0:                      # marker at very start → already split / nothing to move
-        return None
-    static = rt[:idx]
-    prev["text"] = pt + static        # host block (keeps its cache_control marker)
-    rest["text"] = rt[idx:]           # rest block now starts at "\n# Environment"
-    return {"host_block": ri - 1, "rest_block": ri, "moved_chars": len(static),
-            "static_tail": static[-48:], "dynamic_head": rest["text"][:48]}
-
+# ---- RETIRED 2026-08-11: SPLIT_SYSTEM_REST (proxy-side `rest` split) -------
+# Moved the static system prose at the head of the env-bearing block onto the
+# preceding marked block, so it rode an env-independent cache prefix. Sound and
+# byte-identical to the model — but superseded by RELOCATE_ENV_TO_TAIL below,
+# which solves the same env-poisons-static problem from the other direction and
+# ships ON. Never enabled outside its own experiment: 0 real firings in 8,000
+# sampled captures across logs_main and the live deployment (grep hits are agents
+# READING this source, not the transform running). Retired rather than left as a
+# second, fragile (`# Environment` header heuristic, version-pinned) answer to a
+# solved question. Full implementation in git history; CHANGELOG v0.6.50.
 
 # ---- DESIGN-2: relocate volatile bits to the tail + mark CLAUDE.md (experimental)
 # The CLI assembles a per-request context bundle in messages[0] (the <system-reminder>
