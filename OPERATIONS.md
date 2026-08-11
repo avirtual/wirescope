@@ -148,6 +148,12 @@ These read a capture dir offline and never touch a running proxy, so they are sa
 
 `analyze_truncations.py` — mid-stream truncation rate, and optional attribution of cuts to an externally-recorded event log: `python3 analyze_truncations.py <dir> [--events FILE] [--eligible-from ISO]`. Read the docstring before quoting any number out of it: it records the four predicate passes (every wrong one *inflated* the rate) and the three denominator traps, because the analysis is almost entirely in choosing what counts, not in the counting. Runs a randomization negative control by default and warns when the observed count sits inside the chance band. Baseline 2026-08-11: **173/76,768 = 0.226%** of started streams never finish.
 
+**Reviewer-corpus tooling** (four scripts behind `REVIEWER_OPTIMIZATION.md`, which answers "can a richer bootstrap buy the reviewer fewer requests?" — verdict: no, and the reason is relevance, not cost). All four take `--logs DIR` and default to the live clodex capture dir, so they run against any corpus, not just the one they were written for:
+- `analyze_reviewer.py` — the corpus walk + lever pricing (~10 min); `--json OUT` emits one row per session, which is what the other scripts consume.
+- `reviewer_stats.py rows.json` — distributions over those rows (percentiles by nearest rank, not interpolated — at n=64 an interpolated p90 invents a session that does not exist).
+- `reviewer_output.py` — splits the output bill into the final deliverable vs per-round loop output, using `output_tokens_details.thinking_tokens` off the wire.
+- `reviewer_batchable.py` — classifies adjacent round pairs as batchable or causally DEPENDENT (next call's target appears in the prior result), so "just batch them" is priced against what was actually independent.
+
 **A/B proof harness (transforms vs verbatim passthrough):**
 - `ab_run.py "PROMPT" --a-url … --a-dir … --b-url … --b-dir … -n N -o run.json` —
   drives the SAME `claude -p` task through two arms N times (A then B per rep),
