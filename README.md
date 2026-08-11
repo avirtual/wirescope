@@ -124,7 +124,6 @@ Confirm you're talking to wirescope (vs any other proxy on `ANTHROPIC_BASE_URL`)
 | `GET /_report?session=[&detail=1]` | Disk-based cost/efficiency report; prices cold sessions too. |
 | `GET /_timeline?session=` | HTML cost-**evolution** dashboard — read / write / generation over the session's life. |
 | `GET /_bust?session=` | Where a session LOST its cached prefix, and what that cost. |
-| `GET /_pot[?days=N]` | Fleet-wide "which files keep getting re-read wastefully", over a trailing N-day window. |
 | `GET /_subagents?session=&child=` | Per-subagent detail (last text/tool) for one child instance. |
 | `GET /_admin` | Live HTML dashboard (warm/cold tables, subagents, refusals). |
 | `GET /_session?session=` | HTML view of a session's captured context + cache breakpoints. |

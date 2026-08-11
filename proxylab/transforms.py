@@ -1007,8 +1007,6 @@ def _ws_forget(session_id):
         _delete_strip_override(session_id)
     if _STRIP_GUARD_LATCH.pop(session_id, None) is not None:
         _delete_strip_guard_latch(session_id)
-    if _RIDER_LATCH.pop(session_id, None) is not None:
-        _delete_rider_latch(session_id)
 
 
 def _ws_merged_pairs(obj, agent_id=None):
@@ -2015,139 +2013,34 @@ def _strip_guard_set_latch(session_id, strip):
     _persist_strip_guard_latch(session_id, bool(strip))
 
 
-# ---- RIDER LATCH (L2 riders go full-range, v0.6.26) -------------------------
-# The edit-ack collapse + tool-error stubs originally fired ONLY inside the
-# region the thinking-strip busted in the SAME request (busted_from) — "never
-# originate a bust, only ride one". A working /_compact bake broke that gate's
-# premise (2026-07-08, first .25 restart): the bake (correctly thinking-only;
-# stub/fold bake = durable-mutation risk class, folds_deferred) leaves acks RAW
-# on disk while the live riders had stubbed them into the warm prefix; the
-# resumed request then has NO prior thinking -> strip no-ops -> busted_from=None
-# -> riders skip -> raw acks ship against the stub-carrying warm lineage ->
-# conversation-class bust on EVERY L2 session at EVERY restart (measured:
-# write 117,758/read 20,301 on e3a2b94f; twin bust on 27de24b2 — the two L2
-# sessions; L1 sessions immune, bake⊆live-strip holds for thinking). The gate
-# inverted its own purpose: with history arriving pre-thinned, RE-APPLYING the
-# stubs is what KEEPS bytes identical to the warm prefix, and skipping is what
-# originates the bust.
-# FIX: once a session's riders have gone FULL-RANGE (latched, persisted,
-# restored at boot), they fire on every request like fold does — a
-# deterministic replay of the same decision, so live turns, restarts and baked
-# resumes all produce identical bytes. ESTABLISHMENT is cold-gated (the same
-# anti-flap pattern as the strip guard latch): full-range stubbing first
-# changes bytes in regions a thinking bust never touched (raw acks in the warm
-# lineage — including post-incident sessions whose bust re-wrote everything
-# raw), so we expand only when no incoming prefix containing the first
-# would-be-stubbed block is warm — the expansion then rides a write that was
-# happening anyway. Until latched, the old free-rider behavior continues
-# unchanged. Converges at each session's next cold moment; a consumer
-# re-enables bake-on-resume only after its sessions carry the latch.
-_RIDER_LATCH = {}
-
-store_mod.register_schema(
-    "CREATE TABLE IF NOT EXISTS rider_latch ("
-    " owner TEXT NOT NULL, session_id TEXT NOT NULL,"
-    " set_at REAL NOT NULL, PRIMARY KEY (owner, session_id))")
-
-
-def _persist_rider_latch(session_id):
-    try:
-        con = store_mod.db()
-        with store_mod.LOCK:
-            con.execute(
-                "INSERT INTO rider_latch(owner, session_id, set_at) "
-                "VALUES(?,?,?) ON CONFLICT(owner, session_id) DO NOTHING",
-                (store_mod.OWNER, session_id, time.time()))
-            con.commit()
-    except Exception as e:
-        print(f"[strip] rider-latch persist failed for {session_id[:12]}…: {e}", flush=True)
-
-
-def _delete_rider_latch(session_id):
-    try:
-        con = store_mod.db()
-        with store_mod.LOCK:
-            con.execute("DELETE FROM rider_latch WHERE owner=? AND session_id=?",
-                        (store_mod.OWNER, session_id))
-            con.commit()
-    except Exception as e:
-        print(f"[strip] rider-latch delete failed for {session_id[:12]}…: {e}", flush=True)
-
-
-def _first_rider_target_idx(msgs, last_user):
-    """Index of the first message a FULL-RANGE rider pass would mutate: a user
-    message with a raw (un-stubbed) edit-success ack, or either half of a raw
-    failed call, strictly below last_user. None when history is already fully
-    stubbed (or has nothing stubbable) — then expansion is a byte-neutral no-op."""
-    edit_ids = _edit_result_ids(msgs)
-    error_ids = {blk.get("tool_use_id")
-                 for m in msgs[:last_user] if m.get("role") == "user"
-                 and isinstance(m.get("content"), list)
-                 for blk in m["content"]
-                 if isinstance(blk, dict) and blk.get("type") == "tool_result"
-                 and blk.get("is_error")}
-    for i, m in enumerate(msgs[:last_user]):
-        c = m.get("content")
-        if not isinstance(c, list):
-            continue
-        if m.get("role") == "user":
-            for blk in c:
-                if not (isinstance(blk, dict) and blk.get("type") == "tool_result"):
-                    continue
-                body = blk.get("content")
-                if blk.get("is_error"):
-                    n = len(body) if isinstance(body, str) else len(json.dumps(body, default=str))
-                    if body != ERROR_ELIDED_MARKER and n > len(ERROR_ELIDED_MARKER):
-                        return i
-                elif (blk.get("tool_use_id") in edit_ids
-                        and isinstance(body, str) and body != EDIT_ACK_MARKER
-                        and any(f in body for f in _EDIT_ACK_FRAGMENTS)
-                        and len(body) > len(EDIT_ACK_MARKER)):
-                    return i
-        elif m.get("role") == "assistant":
-            stub_len = len(json.dumps(ERROR_CALL_STUB, default=str))
-            for blk in c:
-                if (isinstance(blk, dict) and blk.get("type") == "tool_use"
-                        and blk.get("id") in error_ids
-                        and blk.get("input") != ERROR_CALL_STUB
-                        and len(json.dumps(blk.get("input") or {}, default=str)) > stub_len):
-                    return i
-    return None
-
-
-def _rider_full_range(obj, sid, agent_id=None):
-    """(busted_from_for_riders, log_reason). Latched -> 0 (full range). Not
-    latched: try to ESTABLISH — only for an L2 session whose thinking decision
-    is already latched-strip (the stubs in its warm lineage are what full-range
-    replays), and only when no incoming prefix containing the first
-    would-be-stubbed block is warm (cold-gate: expansion rides an unavoidable
-    write, never originates one). Anything else -> None (keep free-rider
-    behavior; the caller may still pass the thinking-strip's busted_from)."""
-    if sid is not None and sid in _RIDER_LATCH:
-        return 0, "rider_latched"
-    if sid is None or not _strip_l2_enabled(obj, agent_id):
-        return None, None
-    if not _STRIP_GUARD_LATCH.get(sid):
-        return None, "no_strip_latch"      # thinking not latched-strip -> no stub lineage
-    msgs = obj.get("messages") or []
-    last_user = _settled_boundary(msgs)
-    if last_user <= 0:
-        return None, None
-    first = _first_rider_target_idx(msgs, last_user)
-    if first is None:
-        # nothing a full-range pass would change: latch NOW for free (byte-
-        # neutral) so future turns/restarts are covered before raw acks appear.
-        _RIDER_LATCH[sid] = True
-        _persist_rider_latch(sid)
-        return 0, "rider_latched_neutral"
-    warm = _incoming_thinking_prefix_warm(obj, first)
-    if warm is None:
-        return None, "rider_warmth_unknown"
-    if warm:
-        return None, "rider_warm_no_latch"
-    _RIDER_LATCH[sid] = True
-    _persist_rider_latch(sid)
-    return 0, "rider_cold_latch"
+# ---- RIDER LATCH — RETIRED 2026-08-11 (was: L2 riders go full-range, v0.6.26)
+# The machinery here (_RIDER_LATCH, its persisted `rider_latch` table, the
+# restore path, _first_rider_target_idx, _rider_full_range) is gone. It was
+# already marked vestigial in server.py: the mid-turn strip + marker gate
+# REPLACED the busted_from/rider gate it existed to widen, so _rider_full_range
+# had no caller outside its own tests. Verified before removal — no caller in
+# this repo, and none in the vendored consumer's tree either (the shim's PEP-562
+# lookup means a consumer CAN reach an internal without appearing in a local
+# grep, so that second check is the one that matters; `riders_available` on
+# /_status is unrelated — it is just `configured_level >= 2`).
+#
+# THE DURABLE LESSON, which outlives the code: the original gate fired the
+# edit-ack/tool-error stubs ONLY inside the region the thinking-strip busted in
+# the same request ("never originate a bust, only ride one"). A working
+# /_compact bake broke that premise — the bake is correctly thinking-only, so it
+# leaves acks RAW on disk while the live riders had stubbed them into the warm
+# prefix; the resumed request then carried no prior thinking, the strip no-opped,
+# busted_from came back None, the riders skipped, and raw acks shipped against a
+# stub-carrying warm lineage = a conversation-class bust on every L2 session at
+# every restart (measured: write 117,758 / read 20,301 on e3a2b94f, twin on
+# 27de24b2). The gate had inverted its own purpose: once history arrives
+# pre-thinned, RE-APPLYING a transform is what keeps bytes identical to the warm
+# prefix, and SKIPPING it is what originates the bust. Generalizes past riders —
+# any "only act when something else already busted" condition is unsafe the
+# moment a second path can pre-thin the same history. Determinism beats
+# conditional cleverness for anything that edits a cached prefix.
+# Full history: CHANGELOG v0.6.26 + v0.6.31; the incident detail is in the
+# archived journals.
 
 
 def _incoming_thinking_prefix_warm(obj, earliest):
@@ -2282,8 +2175,6 @@ def _strip_thinking_set_override(session_id, level):
         _delete_strip_override(session_id)
         _STRIP_GUARD_LATCH.pop(session_id, None)
         _delete_strip_guard_latch(session_id)
-        _RIDER_LATCH.pop(session_id, None)
-        _delete_rider_latch(session_id)
         return None
     prev = _STRIP_OVERRIDE.get(session_id)
     lvl = max(0, min(2, int(level)))     # True->1, False->0 via int(); 3->2
@@ -2291,12 +2182,6 @@ def _strip_thinking_set_override(session_id, level):
     _persist_strip_override(session_id, lvl)
     if prev != lvl:                      # genuine deliberate change -> latch now
         _strip_guard_set_latch(session_id, lvl >= 1)
-        # Any level CHANGE drops the rider latch: a demoted-then-repromoted
-        # session accumulates raw acks in its warm lineage while below L2, so
-        # a stale full-range latch would bust on re-promotion. Cold-gated
-        # establishment re-decides at the session's next cold moment.
-        if _RIDER_LATCH.pop(session_id, None) is not None:
-            _delete_rider_latch(session_id)
     return lvl
 
 
