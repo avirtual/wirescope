@@ -95,6 +95,32 @@ Capture dirs: under the managed model, live captures go to
 `~/Library/Application Support/clodex/wirescope/logs/`.
 `logs_main` is the FROZEN hand-run archive (do not expect it to grow; it briefly
 took live traffic Jul 12–15 during the rogue-instance window).
+
+**DO NOT PRUNE `logs_main`** (17 GB, 796 sessions, 2026-06-09 → 07-15). Bogdan's
+call, 2026-08-11, and it is a KEEP decision on the merits — not a deferral, and
+not the test-fixture coupling that had been blocking it. Two independent reasons,
+either sufficient:
+1. **It is the BEFORE arm of every longitudinal comparison** ("how it is vs how it
+   was"). It spans v0.1.0 → ~v0.6.3x, i.e. the proxy before most of the transform
+   stack existed, against the same operator, box and workload as today's traffic.
+   That control cannot be re-created at any price: the code that wrote it is
+   tagged and re-runnable, but the 2026-06 sessions are not.
+2. Three suites replay it (`test_fold.py`'s 67-session replay, `test_hints.py`,
+   and `test_bust_scan.py`'s corpus invariants), and `release.sh` symlinks it into
+   the release worktree — so the release gate is weaker without it.
+
+`--older-than 30d` would take **14.49 GB of the 17 GB**, and every capture in here
+is older than 30 days, so an age-based prune reads as routine hygiene and is
+actually the whole archive. The prune tooling exists and works; this corpus is
+simply not what it is for. Point it at live capture dirs instead.
+
+**Provenance is by DATE, not by stamp:** captures carry model/agent/session/billing
+but NO proxy version, and this dir is frozen, so a version stamp added now could
+not label it retroactively. Date the sessions against `git tag --sort=creatordate`
+to know which release wrote a given day. If a longitudinal claim ever needs the
+proxy version inline, stamp it in the writer MID-record — `ts` is the 2nd key and
+`summary` is the last, and v0.6.48's fast `/_bust` scan reads both by byte offset
+(200-byte head, 4 KB tail).
 `logs` = :7799.
 Old experiment captures live in `logs_archive/` (logs_live, logs_chatty,
 logs_compact_warmth, logs_inject, logs_codexprobe, …; retired port→corpus map in
