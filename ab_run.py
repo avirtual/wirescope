@@ -48,11 +48,31 @@ def _identity(url):
         return None
 
 
+# Client-side byte-idle stall timeout. Proxied traffic sits on a 300s FLOOR
+# (CLI 2.1.227 `DxS`: max(env,300000), clamp [1, 1800000]); a stream silent for
+# that long is cut with "API Error: Response stalled mid-stream" and RETRIED
+# with backoff [15s,30s,60s,120s]. That is a confound here specifically, not
+# just a nuisance: a retried turn re-ships and re-bills its whole prefix, and
+# ab_analyze prices arms from the captured billing blocks — so one arm eating a
+# stall shows up as treatment cost. Pin it to the ceiling so a stall can't be
+# mistaken for a result. Setting this ALSO bypasses the remote-config lookup
+# (`tengu_byte_stream_idle_timeout_ms`), which otherwise can move the threshold
+# under a running experiment with no local change. Measured on this box: unset
+# -> cuts at 304.5/304.0/302.3s; set -> completions at 675-696s.
+STREAM_IDLE_MS = os.environ.get("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "1800000")
+
+
 def _run_one(prompt, base_url, extra):
-    env = dict(os.environ, ANTHROPIC_BASE_URL=base_url)
+    env = dict(os.environ, ANTHROPIC_BASE_URL=base_url,
+               CLAUDE_STREAM_IDLE_TIMEOUT_MS=STREAM_IDLE_MS)
     cmd = ["claude", "-p", prompt, "--output-format", "json", *extra]
     t0 = time.time()
     try:
+        # NB: this timeout is time.monotonic()-based, which on macOS pauses
+        # during system sleep — so it does NOT bound wall time. A run that
+        # sleeps mid-flight can exceed it several-fold and never raise.
+        # It bounds compute, not the clock on the wall; don't read a completed
+        # run as evidence it finished inside 1800s.
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=1800)
     except FileNotFoundError:
         sys.exit("`claude` CLI not found on PATH")
