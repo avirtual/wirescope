@@ -23,7 +23,12 @@ To confirm which model is actually live, check the cwd of the :7800 LISTEN pid:
 Cutting a release here does NOT reach :7800.
 clodex must re-run its own `vendor-wirescope.sh` against the new tag (pushed to
 origin `avirtual/wirescope`), then a GUI restart self-applies the bump.
-So: tag + push the release, then **tell clodex** which tag to vendor.
+**That script lives in the CLODEX repo (`wb-wrap-ui`), not here — this repo cannot
+run it and must not try.** Vendoring is clodex's action on clodex's timeline; a
+GUI restart busts every warm prefix Bogdan has open, so it is his call to schedule,
+not something a release here should imply.
+So: tag + push the release, then **tell clodex** which tag to vendor, and name the
+surface you touched so they can diff it rather than spot-check.
 `run_release.sh` plays NO part in a prod deploy under this model — it starts a
 hand-run instance, which is the thing you don't want on :7800. It still serves
 dev/scratch ports.
@@ -135,8 +140,13 @@ Every suite opens with a docstring stating **what defect it guards** (several al
 
 ## Offline analysis + A/B proof tooling
 
-`analyze_tools.py` — offline tool-utilization ledger:
-`python3 analyze_tools.py <dir> --by role|session`. Prices deadweight.
+These read a capture dir offline and never touch a running proxy, so they are safe against the live `LOG_DIR`.
+
+`analyze_tools.py` — offline tool-utilization ledger: `python3 analyze_tools.py <dir> --by role|session`. Prices deadweight (the live per-session twin is `/_context?utilization=1`).
+
+`analyze_churn.py` — read/edit churn ledger: `python3 analyze_churn.py <dir> [--by tool|session] [--top N] [--bash]`. Ranks tool_results by re-carriage cost — how much a result costs *per turn* to keep re-shipping in the cached prefix, which is the number that decides whether a transform is worth writing. Detects the `STRIP_PRIOR_READS` marker so a pre-stripped corpus is reported rather than silently miscounted.
+
+`analyze_truncations.py` — mid-stream truncation rate, and optional attribution of cuts to an externally-recorded event log: `python3 analyze_truncations.py <dir> [--events FILE] [--eligible-from ISO]`. Read the docstring before quoting any number out of it: it records the four predicate passes (every wrong one *inflated* the rate) and the three denominator traps, because the analysis is almost entirely in choosing what counts, not in the counting. Runs a randomization negative control by default and warns when the observed count sits inside the chance band. Baseline 2026-08-11: **173/76,768 = 0.226%** of started streams never finish.
 
 **A/B proof harness (transforms vs verbatim passthrough):**
 - `ab_run.py "PROMPT" --a-url … --a-dir … --b-url … --b-dir … -n N -o run.json` —
