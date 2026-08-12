@@ -198,6 +198,143 @@ def test_carriage_multiplier_counts_the_calls_that_re_sent_it():
        "&times;" in views_mod._call_label(9, {9: 5}, 5), False)
 
 
+def _visible(html):
+    """The text a reader actually SEES — tags stripped, tooltips dropped. The
+    tooltip legitimately names the carrying call ('ships back as input on call
+    3'), so a raw substring check over the whole label cannot tell a correct
+    tooltip from a wrong headline."""
+    import re
+    return re.sub(r"<[^>]*>", "", html).strip()
+
+
+def _u(*kinds):
+    """A user message whose content blocks are of the given types."""
+    return {"role": "user", "content": [{"type": k} for k in kinds]}
+
+
+def _a():
+    return {"role": "assistant", "content": [{"type": "text", "text": "x"}]}
+
+
+def test_assistant_blocks_are_dated_by_their_emitter_not_their_carriage():
+    """Bogdan's catch. Every block first hits the wire in the REQUEST of some
+    call, which is what `debut` measures — but an assistant message was
+    PRODUCED as the response to the PREVIOUS call and only ships back as input
+    here. Wire-proven: capture 058's response emitted 2 Bash tool_use at
+    12:29:13, and 059's request carries that same message at index 6 at
+    12:29:30. Labelling it `call 3` dates it 17 s late and credits the wrong
+    round trip."""
+    lab = views_mod._call_label(6, {6: 3}, 5, role="assistant")
+    ck("an assistant block reads as the response that emitted it",
+       _visible(lab).startswith("reply 2"), True)
+    ck("...and NOT as the call that merely re-carried it",
+       "call 3" in _visible(lab), False)
+    ck("the carrying call stays in the tooltip — it is still a true fact",
+       "on call 3 of 5" in lab, True)
+    ck("the carriage multiplier survives — it was always per-call",
+       "&times;3" in lab, True)
+    ck("a user block on the same call still reads as that call",
+       _visible(views_mod._call_label(7, {7: 3}, 5, role="user")
+                ).startswith("call 3"), True)
+
+
+def test_assistant_on_the_first_captured_call_has_no_emitter_to_name():
+    """A resumed or swept session's payload opens with assistant turns whose
+    emitting response predates the lineage. `reply 0` would be a lie; the label
+    must fall back to the carriage fact and say which fact it is stating."""
+    lab = views_mod._call_label(1, {1: 1}, 4, role="assistant")
+    ck("no reply-0 is invented", "reply 0" in lab, False)
+    ck("falls back to the carriage form", "call 1" in lab, True)
+    ck("and the tooltip says the emitter is off-lineage",
+       "predates the captured lineage" in lab, True)
+
+
+def test_model_initiated_calls_are_distinguished_from_operator_ones():
+    """THE DECOMPOSITION. One request shape, two causes: a call triggered by a
+    real user turn is one the operator asked for; a call triggered by
+    tool_result blocks is one the MODEL's own previous response demanded by
+    emitting tool_use. Both re-carry the whole window at full price."""
+    msgs = [_u("text"),                  # call 1 — operator
+            _a(),
+            _u("tool_result"),           # call 2 — model asked for it
+            _a(),
+            _u("tool_result", "tool_result"),   # call 3 — model again
+            _a(),
+            _u("text")]                  # call 4 — operator
+    debut = {0: 1, 1: 2, 2: 2, 3: 3, 4: 3, 5: 4, 6: 4}
+    c = views_mod._call_causes(msgs, debut, 4)["cause"]
+    if not pre("the fixture really mixes both causes (else nothing is probed)",
+               len(set(c.values())) == 2):
+        return
+    ck("every call is attributed", sorted(c), [1, 2, 3, 4])
+    ck("the causes are read off the trigger message",
+       [c[k] for k in (1, 2, 3, 4)],
+       ["operator", "model", "model", "operator"])
+    ck("2 of 4 round trips were the model's own idea",
+       sum(1 for v in c.values() if v == "model"), 2)
+
+
+def test_the_trigger_is_the_last_user_message_the_call_introduced():
+    """A call can debut several messages. The one that TRIGGERED it is the last
+    USER message — 'last user' and not 'last message', because the opus-4.8
+    wire ships a trailing mid-conversation `role:"system"` roster that debuts
+    after the trigger without being one."""
+    msgs = [_u("text"),
+            _a(),
+            _u("tool_result"),
+            {"role": "system", "content": "agent roster"}]
+    debut = {0: 1, 1: 2, 2: 2, 3: 2}
+    got = views_mod._call_causes(msgs, debut, 2)
+    if not pre("the trailing system message really does debut on the call it "
+               "must not be credited with", debut[3] == 2):
+        return
+    ck("the system roster does not become the trigger",
+       got["trigger"].get(3), None)
+    ck("the tool_result does, so the call reads as model-initiated",
+       got["cause"][2], "model")
+    ck("and it is the block that carries the cause mark",
+       got["trigger"].get(2), 2)
+
+
+def test_a_call_that_added_no_user_message_is_not_guessed_at():
+    """A retry re-sends an identical payload and debuts nothing. Assigning it a
+    cause anyway would invent an operator turn that never happened, so it is
+    simply absent — and operator+model may total less than the call count."""
+    msgs = [_u("text"), _a()]
+    c = views_mod._call_causes(msgs, {0: 1, 1: 2}, 3)["cause"]
+    ck("only the calls with a known trigger are classified", sorted(c), [1])
+    ck("the unattributed call is omitted, not defaulted", c.get(3), None)
+
+
+def test_tool_result_only_detection_is_not_fooled_by_mixed_content():
+    """The CLI can attach a system-reminder alongside a tool_result. A message
+    carrying ANY real text is something a human could have said, so it must not
+    be silently reclassified as the model talking to itself."""
+    ck("pure tool_result", views_mod._is_tool_result_only(_u("tool_result")),
+       True)
+    ck("tool_result plus text is NOT model-only",
+       views_mod._is_tool_result_only(_u("tool_result", "text")), False)
+    ck("plain text is not", views_mod._is_tool_result_only(_u("text")), False)
+    ck("a string-content message is not",
+       views_mod._is_tool_result_only({"role": "user", "content": "hi"}), False)
+    ck("an empty message is not",
+       views_mod._is_tool_result_only({"role": "user", "content": []}), False)
+
+
+def test_cause_marks_only_the_triggering_block():
+    """The cause is a fact about the CALL. Stamping it on every block would
+    repeat it once per tool_result in a fan-out message."""
+    trig = views_mod._call_label(4, {4: 3}, 5, role="user", cause="model")
+    plain = views_mod._call_label(4, {4: 3}, 5, role="user", cause=None)
+    ck("the trigger block carries the model-initiated mark",
+       "&#8635;" in trig, True)
+    ck("a non-trigger block on the same call does not",
+       "&#8635;" in plain or "&#9679;" in plain, False)
+    ck("an operator trigger is marked distinctly",
+       "&#9679;" in views_mod._call_label(0, {0: 1}, 5, role="user",
+                                          cause="operator"), True)
+
+
 def test_unattributable_message_falls_back_to_the_index():
     """A swept capture dir must degrade the LABEL, never the page: the bare
     payload index is exactly what /_session rendered before."""
@@ -232,6 +369,13 @@ if __name__ == "__main__":
               test_utility_side_calls_are_not_round_trips_of_this_conversation,
               test_from_stem_clamps_to_the_rendered_turn,
               test_carriage_multiplier_counts_the_calls_that_re_sent_it,
+              test_assistant_blocks_are_dated_by_their_emitter_not_their_carriage,
+              test_assistant_on_the_first_captured_call_has_no_emitter_to_name,
+              test_model_initiated_calls_are_distinguished_from_operator_ones,
+              test_the_trigger_is_the_last_user_message_the_call_introduced,
+              test_a_call_that_added_no_user_message_is_not_guessed_at,
+              test_tool_result_only_detection_is_not_fooled_by_mixed_content,
+              test_cause_marks_only_the_triggering_block,
               test_unattributable_message_falls_back_to_the_index,
               test_malformed_captures_are_skipped_not_fatal):
         print(f"=== {t.__name__} ===")
