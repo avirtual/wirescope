@@ -3640,7 +3640,14 @@ check("nav: out-of-range index clamps to the last turn",
       _nvC[3]["i"] == 4)
 check("nav: unknown session -> empty nav, no entry",
       lp.views._load_request_by_index("nope", 0) == (None, None, None,
-            {"i": None, "n": 0, "prev": None, "next": None, "seq": None, "ts": None}))
+            {"i": None, "n": 0, "prev": None, "next": None, "seq": None,
+             "ts": None, "stem": None}))
+# `stem` (added v0.6.51) is what clamps _call_ordinals to the turn being
+# rendered, so a navigator view never numbers an old turn against calls that
+# had not happened yet. Asserted on the LOADED case too: the empty-nav check
+# above is exact-equality, so it pins the key's presence but never its value.
+check("nav: a loaded turn carries the stem its ordinals clamp to",
+      _nv0[3]["stem"] and _nvL[3]["stem"] and _nv0[3]["stem"] != _nvL[3]["stem"])
 
 # --- LIVE bust classifier (_record_warmth -> session_bust -> bust_summary) -----
 # The per-request twin of report.bust_series: classify each turn's cache event
