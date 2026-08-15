@@ -210,8 +210,31 @@ Anthropic sessions:
       },                                    // null for side-calls/subagents
       "warmth": {                           // prompt-cache state of the session prefix
         "warm": true, "ttl_s": 300, "remaining_s": 281.5
-      }                                     // ADVISORY: stamped off-thread, may lag one turn
+      },                                    // ADVISORY: stamped off-thread, may lag one turn
+      "quota": {                            // ACCOUNT plan consumption, off the API's
+                                            // own response headers. null when the
+                                            // deployment isn't tracking it.
+        "status": "allowed_warning",        // the API's OWN escalation word
+        "representative_window": "7d",      // the window that BINDS right now
+        "primary": {"window": "7d", "used_pct": 93.0, "remaining_pct": 7.0,
+                    "status": "allowed_warning", "resets_in_s": 255872},
+        "used_pct": {"5h": 23.0, "7d": 93.0},  // fraction CONSUMED, per window
+        "resets_in_s": 255872,
+        "age_s": 0.2                        // reading's age; see the two traps below
+      }
     }
+
+`quota` is **account-scoped, not session-scoped** — every agent on the box spends
+the same plan, so keep ONE copy, not one per session. `used_pct` is the fraction
+CONSUMED (`remaining_pct` is pre-computed so nobody has to invert it). Colour off
+`status`, which is the server's own escalation, not a threshold you invent.
+
+Two traps: (1) the numbers move only when a turn is forwarded, so `age_s` is part
+of the reading — an idle fleet's is stale and should render dimmed; (2) **a 429
+carries no quota headers at all** (measured 102/102), so the very response that
+proves you hit the wall cannot raise the percentage — `/_status` keeps the last
+good reading and records the rejection separately as `last_429`. Full contract +
+the discovered-windows rule: INTEGRATION.md § Plan quota.
 
 OpenAI/codex sessions (caching is server-side; cost is the API-EQUIVALENT
 estimate — ChatGPT-plan traffic is never dollar-billed, the proxy prices the
