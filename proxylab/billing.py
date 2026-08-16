@@ -5,11 +5,48 @@ import time
 from proxylab import core as core_mod
 from proxylab import writer as writer_mod
 
+def _json_message(raw_bytes):
+    """The response body as a plain JSON message object, or None if it isn't one.
+
+    A `"stream": false` request answers with ONE bare JSON object, not an SSE
+    event stream — no `data:` prefixes, so an SSE-only line-walk reads nothing
+    out of it and every usage field comes back None. That is not cosmetic: a
+    None `cache_read_input_tokens` trips `warmth._record_warmth`'s receipt
+    guard (`created <= 0 and read <= 0` -> don't stamp), so a non-streaming
+    turn that genuinely READ the cache never refreshes the ledger and the
+    session reads 'cold' on /_admin while its prefix is demonstrably warm.
+    It also prices the turn at est_usd 0.0.
+
+    Found 2026-08-16 on clodex session d48e988f: an external keep-warm pinger
+    sends `stream:false, max_tokens:1`; 190 such pings over 12 days, 173 with
+    a real `cache_read > 0` upstream, and NOT ONE stamped the ledger (0 of 190
+    wrote a .warmth.json, vs 14,521 of 14,717 streaming turns). Detect the
+    shape, don't assume the wire dialect."""
+    try:
+        obj = json.loads(raw_bytes.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    # only the terminal shapes: a completed message, or an error envelope
+    if isinstance(obj, dict) and obj.get("type") in ("message", "error"):
+        return obj
+    return None
+
+
 def _parse_usage_from_sse(raw_bytes):
-    """Pull usage out of the captured SSE stream (message_start + message_delta)."""
+    """Pull usage out of a captured response — an SSE stream (message_start +
+    message_delta) or a non-streaming JSON message (see `_json_message`)."""
     usage = {"input_tokens": None, "output_tokens": None,
              "cache_creation_input_tokens": None, "cache_read_input_tokens": None,
              "stop_reason": None}
+    whole = _json_message(raw_bytes)
+    if whole is not None:
+        u = whole.get("usage") or {}
+        for k in ("input_tokens", "output_tokens",
+                  "cache_creation_input_tokens", "cache_read_input_tokens"):
+            if u.get(k) is not None:
+                usage[k] = u[k]
+        usage["stop_reason"] = whole.get("stop_reason")
+        return usage
     try:
         text = raw_bytes.decode("utf-8", "replace")
     except Exception:
@@ -65,6 +102,31 @@ def _parse_response_meta(raw_bytes):
             "usage_start": None, "usage_final": None,
             "content_block_types": [], "tool_uses": [], "error": None,
             "text": ""}     # leading text, capped — enough for the title call
+    whole = _json_message(raw_bytes)
+    if whole is not None:
+        if whole.get("type") == "error":
+            meta["error"] = whole.get("error") or whole
+            return meta
+        meta["message_id"] = whole.get("id")
+        meta["resolved_model"] = whole.get("model")
+        meta["role"] = whole.get("role")
+        meta["stop_reason"] = whole.get("stop_reason")
+        meta["stop_sequence"] = whole.get("stop_sequence")
+        meta["stop_details"] = whole.get("stop_details")
+        # ONE usage object here, carrying both what message_start and
+        # message_delta split across a stream — report it as both so the
+        # `usage_final or usage_start` readers downstream see the same facts.
+        meta["usage_start"] = meta["usage_final"] = whole.get("usage")
+        for cb in whole.get("content") or []:
+            if not isinstance(cb, dict):
+                continue
+            meta["content_block_types"].append(cb.get("type"))
+            if cb.get("type") == "tool_use":
+                meta["tool_uses"].append(cb.get("name"))
+            elif cb.get("type") == "text" and len(meta["text"]) < _META_TEXT_CAP:
+                meta["text"] += cb.get("text") or ""
+        meta["text"] = meta["text"][:_META_TEXT_CAP]
+        return meta
     try:
         text = raw_bytes.decode("utf-8", "replace")
     except Exception:
