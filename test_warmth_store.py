@@ -1767,9 +1767,15 @@ check("bootstrap fires for an unknown account",
 check("bootstrap declines while one is in flight",
       lp._bootstrap_decision("acct-z", now=NOW,
                              state={**BST, "inflight": True})[0] is False)
-check("bootstrap declines past max attempts",
+# `last_ts` must be pinned to the outage. The budget is per OUTAGE, so
+# "attempts spent" is only a decline while those attempts are RECENT; the old
+# fixture left last_ts=0.0 (a state _auth_bootstrap cannot produce — it always
+# stamps last_ts when it increments attempts), which now reads as a budget spent
+# at the epoch, i.e. long finished. Staleness is covered in test_hold_tick.py.
+check("bootstrap declines past max attempts spent in THIS outage",
       lp._bootstrap_decision("acct-z", now=NOW,
-                             state={**BST, "attempts": lp._AUTH_BOOTSTRAP_MAX})[0] is False)
+                             state={**BST, "attempts": lp._AUTH_BOOTSTRAP_MAX,
+                                    "last_ts": NOW})[0] is False)
 check("bootstrap respects the cooldown",
       lp._bootstrap_decision("acct-z", now=NOW,
                              state={**BST, "attempts": 1, "last_ts": NOW - 5})[0] is False)
