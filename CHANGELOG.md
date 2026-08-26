@@ -5,6 +5,25 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.56 — 2026-08-26 — the billing header is out-of-band: say so in the UI
+
+From Bogdan, on the daily-CLI-release churn: `system[0]` is `x-anthropic-billing-header: cc_version=2.1.245.ff6; cc_entrypoint=cli;`, Anthropic ships new builds most days, and the block sits at the head of `system[]` — so the obvious read is "every upgrade busts every session's cache; wirescope should pin the version per session and only adopt a new one when cold."
+
+**Measured instead of assumed, and the premise is false: `cc_version` is not part of the cache key.** 8-week corpus, 184,336 captures, 113,306 tool-carrying. Isolating the natural experiment — turns where the version string changed and NOTHING else in the prefix did (24 of them) — and splitting by whether the cache could still be alive:
+
+| idle gap | n | turns that hit cache | mean read | mean write |
+|---|---|---|---|---|
+| **< 55min (TTL live)** | 17 | **17 / 17** | 92,704 tok | 1,875 tok |
+| ≥ 55min (TTL expired) | 7 | 1 / 7 | 853 tok | 81,926 tok |
+
+17 of 17 hit, some reading 148k+ tokens with zero write. If the header were hashed, not one could have. The 7 misses are plain TTL expiry (447–1,119 min idle) — the version is incidental to them. **So no version-pinning feature was built: it would buy nothing while forging a value Anthropic bills against.**
+
+- **What actually costs money on a CLI upgrade is the BINARY swap, not the string.** Of 74 version-change turns in the 14d window, only 9 changed `system[0]` alone; the other 65 also moved `tools[]` (15), the system prose, or `messages[0]` (46 as `sysrest|msg0`). A new build emits different tool schemas and a different system prompt — `cc_version` is the *announcement* of that change, not its cause. Control: on 600 consecutive same-version turns, 98.0% of prefixes were byte-stable. Mitigation is to pin the CLI build for the fleet and upgrade at rest — a launcher policy, not a proxy feature.
+- **The defect that WAS ours is the display.** Rendering the block as a bare `system[0]`, in sequence with the real breakpoints, implied it led the cached prefix — which is exactly what made version-pinning look like a lever. `/_session` now renders it dimmed + dashed (`.oob`) with an `out-of-band · not cached` badge and "excluded from the cache key, a version bump does not bust"; `/_bust`'s `report._system_label` says `billing-header (out-of-band, not cached)`. The real `cache_control` blocks keep their green `cache <ttl>` badge and their breakpoint dividers, unchanged.
+- **The fingerprints were already correct** — `warmth._stable_sys_text` has always filtered the block by prefix, `_segment_hashes` filters it independently, and `report._content_first_diff` skips it via `skip_billing=True`. Confirmed behaviourally across all six fingerprints (`_prefix_hash`, `_sys_full_hash`, `_msg0_hash`, `_stable_sys_text`, `_segment_hashes`, `_sys_tools_fingerprint`) rather than by reading the source. No hash changed; this release is display + docs + a regression guard.
+- `test_billing_header_oob.py` (new): mutate only `cc_version` → assert no fingerprint moves, **plus a control asserting each fingerprint DOES move on the change it exists to detect** (else "nothing moved" passes vacuously for a fingerprint that is simply broken). Display checks assert the RENDERED page, not the source text — and assert the row count first, because the renderer reads `entry["obj"]` and a wrong key silently falls into the no-entry branch where there are no system rows and every check below passes vacuously. Red-to-green verified: 3 display FAILs before the fix.
+- Method note for anyone re-running this: bucket version churn by `(session_id, x-claude-code-agent-id)`. At session granularity concurrent subagents interleave and a stable-per-process suffix reads as violent flip-flopping (one session showed `ec1→d06` 154 times); per process it is constant. Un-bucketed, churn over-reports ~30×.
+
 ## v0.6.55 — 2026-08-16 — a non-streaming turn was weightless: no ledger stamp, no bill
 
 From Bogdan: clodex session `d48e988f` runs a permanent keep-warm, its pings visibly work, and `/_admin` shows the session **cold**. Both readings were honest reports of what they measured — the ledger had simply never been told. `_parse_usage_from_sse` walked `data:` lines only, so a `"stream": false` response (ONE bare JSON object, no `data:` prefixes) read as all-None, and nothing crashed; the turn just stopped counting.
