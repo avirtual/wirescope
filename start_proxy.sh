@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./start_proxy.sh                 # THE proxy: port 7800 -> logs_main, all levers on
-#   PORT=7802 LOG_DIR=logs_scratch STRIP_COMPACT_CACHE=0 ./start_proxy.sh   # experiment arm
+#   PORT=7802 LOG_DIR=logs_scratch WARMTH_BLOCK_COLD_PING=0 ./start_proxy.sh   # experiment arm
 #
 # Bare invocation = the one canonical proxy. Every feature is an env var
 # (see the flag table in CLAUDE.md); any var you set overrides the default
@@ -67,7 +67,7 @@ fi
 
 # Canonical defaults for flags that are off in code ("-" not ":-" so an
 # explicit empty/0 from the caller — or a release.env line above — is respected):
-export STRIP_COMPACT_CACHE="${STRIP_COMPACT_CACHE-1}"
+# STRIP_COMPACT_CACHE retired 2026-09-02 (v0.6.58): hard-off in code, env ignored.
 export WARMTH_BLOCK_COLD_PING="${WARMTH_BLOCK_COLD_PING-1}"
 export WARMTH_LOG_FILE="${WARMTH_LOG_FILE-1}"
 # Collapse prior-turn Edit/Write success acks to "ok" (current turn kept). Pure

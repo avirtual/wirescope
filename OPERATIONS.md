@@ -58,7 +58,7 @@ if the deployment model changes again.
 Proxies launch via `./start_proxy.sh` / `./restart_proxy.sh` (nohup+disown → PPID 1).
 A `run_in_background` Bash job dies with the CLI — never launch the proxy that way.
 `start` refuses a bound port; `restart` kills + starts.
-Script defaults add `STRIP_COMPACT_CACHE=1 WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1
+Script defaults add `WARMTH_BLOCK_COLD_PING=1 WARMTH_LOG_FILE=1
 WS_SPAWNER_HINT=1 WS_OMIT_DEFAULT=useremail STRIP_MCP_SERVERS=claude_design`, via
 `${VAR-default}` so an explicit 0/empty sticks — note this means every scratch arm
 also strips the `claude_design` connector unless you pass `STRIP_MCP_SERVERS=`.

@@ -78,43 +78,43 @@ check("confirmed response stamps the history prefix",
       rec is not None and rec["hash"] == h_hist)
 check("stamped prefix reads 'warm'", lp.warmth_state(h_hist) == "warm")
 
-# --- compact gate ---------------------------------------------------------
+# --- compact gate: RETIRED 2026-09-02 (hard-off, env flag ignored) ------------
+# Measured net -$42/14d on the live corpus (60 false-cold : 27 true-cold); see the
+# header comment above STRIP_COMPACT_CACHE in transforms.py. The depth-scan still
+# works (kept for the harness), but the SERVER GATE must return None on EVERY
+# state -- warm, cold, absent -- and regardless of STRIP_COMPACT_CACHE=1 in env.
 st, hh, d = lp._compact_history_warmth(obj)
-check("depth-scan finds the warm history prefix", (st, hh, d) == ("warm", h_hist, 2))
-res = lp._strip_compact_cache(compact_obj())
-check("WARM declines the strip", res is not None and res["condition_met"] is False)
+check("depth-scan still finds the warm history prefix (harness)",
+      (st, hh, d) == ("warm", h_hist, 2))
+check("STRIP_COMPACT_CACHE is hard-off even with the env flag set",
+      lp.transforms.STRIP_COMPACT_CACHE is False
+      and lp.transforms._STRIP_COMPACT_CACHE_ENV is True)
+check("retired: WARM compact -> None (no log, no mutation)",
+      lp._strip_compact_cache(compact_obj()) is None)
 
-# lapse the row in place -> 'cold' (row present, expired) must STRIP
 con = lp.store.db()
 with lp.store.LOCK:
     con.execute("UPDATE warmth SET expires_at=? WHERE hash=?",
                 (time.time() - 30, h_hist))
     con.commit()
 check("lapsed row reads 'cold'", lp.warmth_state(h_hist) == "cold")
-res = lp._strip_compact_cache(compact_obj())
-check("COLD strips the discarded history marker",
-      res is not None and res["condition_met"] is True
-      and res["removed_message_markers"] == 1)
+_co = compact_obj()
+check("retired: COLD compact -> None, marker untouched",
+      lp._strip_compact_cache(_co) is None
+      and _co["messages"][-1]["content"][0].get("cache_control") is not None)
 
-# the housekeeping purge removes the lapsed row -> 'absent' must STRIP THE SAME
-# (this is the regression the old semantic sweeper failed: cold evidence reaped
-# at bare ttl flipped the gate to decline)
 with lp.store.LOCK:
     con.execute("DELETE FROM warmth")
     con.commit()
 check("purged row reads 'absent'", lp.warmth_state(h_hist) == "absent")
-res = lp._strip_compact_cache(compact_obj())
-check("ABSENT strips identically (purge never changes the decision)",
-      res is not None and res["condition_met"] is True)
+check("retired: ABSENT compact -> None",
+      lp._strip_compact_cache(compact_obj()) is None)
 
-# ledger off -> 'off' must DECLINE (can't judge != evidence of bust)
-_saved = lp.WARMTH_LEDGER
-lp.warmth.WARMTH_LEDGER = False
-res = lp._strip_compact_cache(compact_obj())
-check("ledger OFF declines the strip",
-      res is not None and res["condition_met"] is False
-      and res["warmth_state"] == "off")
-lp.warmth.WARMTH_LEDGER = _saved
+# even a forced-on experiment override no longer strips on the server path
+os.environ["STRIP_COMPACT_FORCE"] = "1"
+check("retired: STRIP_COMPACT_FORCE=1 cannot re-enable the strip",
+      lp._strip_compact_cache(compact_obj()) is None)
+os.environ.pop("STRIP_COMPACT_FORCE", None)
 
 # --- session head index + /_end + durability ----------------------------------
 sobj = compact_obj(sid="sess-test-1")
@@ -4385,9 +4385,10 @@ lp.transforms._strip_prior_thinking(comp, agent_id=None)   # runs BEFORE the com
 _cst, _chash, _cd = lp._compact_history_warmth(comp)
 check("compact-check hashes the SAME (post-strip) bytes the stamp used",
       _chash == _stamp["hash"])
-res = lp._strip_compact_cache(comp)
-check("L1 strip session: WARM compact history is NOT stripped (bug fixed)",
-      _cst == "warm" and res is not None and res["condition_met"] is False)
+check("L1 strip session: compact-check reads the stamped prefix as WARM",
+      _cst == "warm")
+check("retired strip returns None on the warm L1 compact",
+      lp._strip_compact_cache(comp) is None)
 
 # COUNTERFACTUAL: the OLD (buggy) order — compact-check on the UNSTRIPPED body —
 # reads a DIFFERENT hash and would strip the warm compact. Pin that this is exactly
