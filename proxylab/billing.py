@@ -180,6 +180,17 @@ def _parse_response_meta(raw_bytes):
 # NOTE: opus REPRICED at 4.5 — $15/$75 is 4.0/4.1 ONLY; 4.5+ is $5/$25. Until
 # this split, all opus-4.5+ captures (logs_opus) were over-priced ~3x.
 PRICES = {
+    # fable/mythos 5.1 (2026-09-01) BREAK THE UNIVERSAL 0.1x READ MULTIPLIER:
+    # reads are 0.025x base ($0.25/MTok), everything else identical to 5.0.
+    # These rows MUST come before/alongside the bare "claude-fable-5" entry and
+    # are matched by LONGEST prefix — "claude-fable-5" IS a prefix of
+    # "claude-fable-5-1", so without these lines 5.1 traffic silently prices at
+    # the 5.0 read rate (4x over) with NO unpriced warning to catch it. The
+    # inverse of the opus-5 trap above: there the legacy row was too short to
+    # match, here the legacy row matches too much.
+    "claude-fable-5-1":  {"in": 10.0, "out": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 0.25},
+    "claude-mythos-5-1": {"in": 10.0, "out": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 0.25},
+    "claude-mythos-5": {"in": 10.0, "out": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 1.00},
     "claude-fable-5":  {"in": 10.0, "out": 50.0, "cache_write_5m": 12.5,  "cache_write_1h": 20.0, "cache_read": 1.00},
     # opus-5 (2026-07-24): SAME rates as 4.8, but it needs its OWN entry —
     # longest-PREFIX matching means "claude-opus-5" does NOT match the legacy
@@ -275,11 +286,15 @@ PRICES_SPEED_FAST = {
 }
 
 PRICES_DATED = {
-    # sonnet-5 intro rate ends 2026-08-31; standard (== sonnet-4) after.
-    "claude-sonnet-5": [("2026-09-01", {"in": 3.0, "out": 15.0,
-                                        "cache_write_5m": 3.75,
-                                        "cache_write_1h": 6.0,
-                                        "cache_read": 0.30})],
+    # WITHDRAWN 2026-09-01: the scheduled sonnet-5 increase to $3/$15 on
+    # 2026-09-01 WILL NOT OCCUR — Anthropic made the $2/$10 "introductory"
+    # rate the standard price (docs pricing page, note
+    # #claude-sonnet-5-introductory-pricing). This entry had already fired
+    # (today IS the effective date), so every sonnet-5 receipt priced from
+    # here on would have been 1.5x over. Kept as an empty registry rather
+    # than deleted: the mechanism is still wanted for the next real
+    # repricing, and the withdrawal is worth recording where the next
+    # session looks. The base PRICES row ($2/$10) is now simply correct.
 }
 
 

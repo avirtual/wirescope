@@ -404,6 +404,26 @@ check("fable-5 priced (2x opus)",
                                           "cache_read": 1.00})
 check("longest prefix wins: opus-4-8 gets 4.5+ rates, not legacy",
       lp._price_for("claude-opus-4-8")["in"] == 5.0)
+# fable/mythos 5.1 (2026-09-01): reads are 0.025x base, NOT the universal 0.1x.
+# "claude-fable-5" is a prefix of "claude-fable-5-1", so a missing 5.1 row
+# silently prices 5.1 traffic at 5.0's $1.00 read (4x over) with no unpriced
+# warning. Assert the RATE, so the guard survives a table reshuffle.
+check("fable-5.1 reads at 0.025x base ($0.25), not 5.0's $1.00",
+      lp._price_for("claude-fable-5-1")["cache_read"] == 0.25)
+check("fable-5.1 dated id does not fall back to the 5.0 read rate",
+      lp._price_for("claude-fable-5-1-20260901")["cache_read"] == 0.25)
+check("mythos-5.1 shares the 0.025x read; mythos-5 keeps $1.00",
+      lp._price_for("claude-mythos-5-1")["cache_read"] == 0.25
+      and lp._price_for("claude-mythos-5")["cache_read"] == 1.00)
+check("fable-5.1 is otherwise identical to fable-5 (in/out/writes)",
+      all(lp._price_for("claude-fable-5-1")[k] == lp._price_for("claude-fable-5")[k]
+          for k in ("in", "out", "cache_write_5m", "cache_write_1h")))
+# sonnet-5's scheduled 2026-09-01 increase to $3/$15 was WITHDRAWN — $2/$10 is
+# now the standard rate. Pinned at a date PAST the old cutover so a resurrected
+# PRICES_DATED entry fails here instead of silently over-pricing every receipt.
+check("sonnet-5 stays $2/$10 after the withdrawn 2026-09-01 repricing",
+      lp._price_for("claude-sonnet-5",
+                    now=time.mktime(time.strptime("2027-01-01", "%Y-%m-%d")))["in"] == 2.0)
 check("legacy opus-4-1 keeps $15 rates",
       lp._price_for("claude-opus-4-1-20250805")["in"] == 15.0)
 check("unknown model -> None (not a silent default)",
