@@ -5,6 +5,16 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.59 — 2026-09-07 — proactive OAuth refresh: holds no longer die on an idle night
+
+Two perpetual clodex holds died 04:10–04:26 today: every ping tick was declined `credential-expired` (10 declines, 0 sends, nothing errored). The CLI's OAuth ACCESS token (~8h) lapsed on the idle box, and only a CLI-originated request performs the refresh-token exchange — the first real turn of the morning refreshed the keychain at 04:26:13, three seconds after the coordinator's 1h prefix expired. wirescope's existing bootstrap was REACTIVE (fires from the proxy's own hold driver on a replay 401) and clodex arms its holds in its own port, so it was dead code in that deployment; each side assumed the other refreshes.
+
+- **`WARMTH_AUTH_REFRESH` (default on):** on the hold-loop cadence the proxy reads ONLY `expiresAt` from the CLI's credential store (plaintext file, else login keychain — the token string is never read out, logged or stored) and, once it lapses, spends the existing bootstrap turn (haiku, ~$0.04) so the CLI rewrites the keychain for every seat on the box. Unconditional — no dependence on a proxy-side hold being armed. Success is verified by re-reading `expiresAt`; a lapsed token no spawn moves surfaces as `stalled` (dead refresh token → human login owed). Same budget/cooldown as the reactive path (2/h, 10 min).
+- **Fires AFTER expiry, not before** — wire-probed today: a CLI turn with 2h20m left on the token did not refresh it. `WARMTH_AUTH_REFRESH_LEAD` exists but buys nothing on CLI 2.1.263. First tick after lapse + ~15s bootstrap fits inside a consumer's ping margin (clodex: 5 min).
+- `claude` resolved via `shutil.which` with `~/.local/bin/claude` fallback: a managed instance inherits the host app's PATH, which did not include the CLI's install dir.
+- `/_identity` → `capabilities.auth_refresh`; `/_status` → `proxy.auth_refresh` `{token_expires_in_s, token_lapsed, last_outcome, refreshed, stalled, read_error}`. INTEGRATION.md § keep-warm documents the consumer contract.
+- New suite `test_auth_refresh.py` (behavioural: injected reader/bootstrap, asserts spawn counts, verification-by-reread, budget → stalled, reset after outage, read-failure decline, kill switch, endpoint exposure).
+
 ## v0.6.57 — 2026-09-01 — fable 5.1 breaks the 0.1x read multiplier, and a scheduled repricing that was cancelled
 
 Anthropic shipped Fable 5.1 / Mythos 5.1 today. Pure pricing-table release: no transform, endpoint, schema or fingerprint changed. Two defects found, both of the class that never announces itself — a WRONG rate is silent, only a MISSING one warns (`_warn_unpriced` → `est_usd=None`, `unpriced_requests`).

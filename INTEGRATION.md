@@ -34,7 +34,8 @@ Before you integrate, probe the proxy ROOT and check the product marker:
       "protocols": { "identity": 2, "subscribers": 1, "wirescope": 1 },
       "capabilities": { "passthrough": false, "subscribers": true,
                         "warmth": true, "ping": true,
-                        "hold": true, "stats": true, "session_view": true,
+                        "hold": true, "auth_refresh": true,
+                        "stats": true, "session_view": true,
                         "codex": true, "codex_websocket": true,
                         "wirescope": { "agent_name": true, "omit": true,
                                        "replace": true, "keep": true,
@@ -112,6 +113,12 @@ Rules of thumb:
   `POST /_hold?session=&hours=N` — arm once and let the proxy keep the prefix warm for N idle hours; the simplest programmatic option (you don't run the loop, the proxy does). Like `/_ping`, it **won't arm a cold/absent prefix** (replies `200` with `armed:false, skipped:<state>`): there's nothing to keep warm until a real turn establishes the cache — pass `force=1` to arm anyway. On success the reply's `pingable:true` confirms there's a replayable request + live auth to ping. Rely on those structured fields, not the human `ack` string.
   `GET/POST /_ping` — one-shot TTL slide if you'd rather own the cadence and cost yourself.
   `/warm-cache <hours>` — the bundled client's slash command; same hold as `/_hold`, but armed in-band by injecting a `<proxy:warm-cache hours=N>` sentinel into a forwarded turn (so it also donates auth + rewrites the cache). Use this when a human/agent is at the CLI; use `/_hold` from code.
+- **Holds that outlive one OAuth access-token lifetime need the proxy's auth refresh** (gate on `capabilities.auth_refresh`, since v0.6.59).
+  A ping is a byte replay to the API; only a CLI-originated request performs the refresh-token exchange, and on an idle box nothing originates one.
+  So the access token (~8h) lapses overnight, a consumer running its own ping loop correctly declines a dead bearer, and the prefix goes cold anyway (measured 2026-09-07: 10 declines, 0 sends).
+  With `auth_refresh:true` the proxy reads only the token's `expiresAt` from the CLI's credential store on its hold cadence and, once it lapses, spends one bootstrap turn (haiku, ~$0.04, account-scoped so it refreshes every seat) so the CLI rewrites the keychain; a consumer that re-reads the credential per ping then picks the fresh bearer up on its next tick with no change on its side.
+  Readout: `/_status` → `proxy.auth_refresh` `{enabled, token_expires_in_s, token_lapsed, last_outcome, refreshed, stalled, read_error}`. **`stalled:true`** = lapsed token that no bootstrap could move (dead refresh token, or `claude` not spawnable): a human login is owed — surface it.
+  Timing you can rely on: the refresh fires on the first tick (60s) after expiry, and the bootstrap turn takes ~10-20s, so a consumer's ping margin of >= 2 minutes covers it. Kill switch `WARMTH_AUTH_REFRESH=0`; `WARMTH_AUTH_REFRESH_LEAD=<s>` fires it early, which is pointless as of CLI 2.1.263: wire-probed 2026-09-07, a turn with 2h20m left on the token did not refresh it, so the exchange happens only after lapse.
 
 ## Plan quota (the 5h / 7d windows)
 
