@@ -361,6 +361,87 @@ def test_malformed_captures_are_skipped_not_fatal():
         f.close()
 
 
+def _fixture_sent():
+    """The epoch of the fixture's fixed head `ts` (what _call_ordinals reads)."""
+    import time as _t
+    return _t.mktime(_t.strptime("2026-08-12T00:00:00", "%Y-%m-%dT%H:%M:%S"))
+
+
+def test_call_times_pair_each_call_with_its_own_receipt_by_stem():
+    """A call's receipt is the .warmth.json written NEXT TO its request (same
+    stem). Pairing through a {message_count: ts} map instead read 1,540 s
+    latencies on the live coordinator: subagents share the parent's capture
+    dir, so the newest sidecar for a small count was a subagent's."""
+    f = Fixture()
+    try:
+        sent = _fixture_sent()
+        stems = f.calls([2, 4, 6])
+        for k, st in enumerate(stems, start=1):
+            if k == 2:
+                continue                       # call 2: receipt never landed
+            (f.dir / f"{st}.warmth.json").write_text(
+                json.dumps({"n_messages_hashed": 2 * k, "ts": sent + k}))
+        # a SUBAGENT sidecar with n=4 and a much later ts: must never be
+        # mistaken for main-line call 2's receipt
+        (f.dir / "0099-sub-x-m-000000.warmth.json").write_text(
+            json.dumps({"n_messages_hashed": 4, "ts": sent + 1540}))
+        o = views_mod._call_ordinals(f.sid)
+        ck("each call carries its capture path",
+           all(c.get("path", "").endswith(".request.json") for c in o["calls"]), True)
+        t = views_mod._call_times(o["calls"])
+        ck("call 1 paired with its own sidecar", t[1], {"sent": sent, "got": sent + 1})
+        ck("call 3 paired with its own sidecar", t[3], {"sent": sent, "got": sent + 3})
+        ck("call 2 has no receipt -> None, not the subagent's n=4 sidecar",
+           t[2], {"sent": sent, "got": None})
+    finally:
+        f.close()
+
+
+def test_call_times_drop_a_receipt_that_predates_its_send():
+    """A receipt earlier than the send is a wrong pairing, not a fast answer;
+    an absent file is simply no receipt."""
+    f = Fixture()
+    try:
+        sent = _fixture_sent()
+        st = f.calls([2])[0]
+        (f.dir / f"{st}.warmth.json").write_text(
+            json.dumps({"n_messages_hashed": 2, "ts": sent - 30}))
+        t = views_mod._call_times(views_mod._call_ordinals(f.sid)["calls"])
+        ck("earlier-than-send receipt dropped", t[1]["got"], None)
+        ck("absent file -> got None, sent kept",
+           views_mod._call_times([{"n": 2, "ts": 500.0,
+                                   "path": "/nonexistent/x.request.json"}]),
+           {1: {"sent": 500.0, "got": None}})
+    finally:
+        f.close()
+
+
+def test_block_when_follows_the_emitter_rule():
+    """Same rule as the label: user/system blocks happened when their debut
+    call was SENT; an assistant block happened when the PREVIOUS call's
+    response was RECEIVED; on call 1 (emitter off-lineage) or with no receipt
+    for the emitting call, fall back to first re-send and say which."""
+    times = {1: {"sent": 100.0, "got": 104.0}, 2: {"sent": 110.0, "got": None},
+             3: {"sent": 120.0, "got": 125.0}}
+    debut = {0: 1, 1: 1, 2: 2, 3: 2, 4: 3, 5: 3}
+    bw = views_mod._block_when
+    ck("user on call 2 = call 2 sent", bw(2, "user", debut, times), (110.0, "sent"))
+    ck("assistant on call 2 = call 1's receipt",
+       bw(3, "assistant", debut, times), (104.0, "emitted"))
+    ck("assistant on call 1 = carried (emitter off-lineage)",
+       bw(1, "assistant", debut, times), (100.0, "carried"))
+    ck("assistant on call 3 with no receipt for call 2 = resent fallback",
+       bw(5, "assistant", debut, times), (120.0, "resent"))
+    ck("system block = sent", bw(4, "system", debut, times), (120.0, "sent"))
+    ck("unknown debut = nothing", bw(9, "user", debut, times), (None, None))
+    ck("no chip when unknown", views_mod._when_html(9, "user", debut, times), "")
+    chip = views_mod._when_html(3, "assistant", debut, times)
+    ck("emitted chip is not marked estimated", "clk est" in chip, False)
+    ck("emitted tooltip names the latency", "4s after call 1" in chip, True)
+    ck("fallback chip is marked estimated",
+       "clk est" in views_mod._when_html(5, "assistant", debut, times), True)
+
+
 if __name__ == "__main__":
     for t in (test_one_call_carrying_two_messages_is_one_call,
               test_equal_lengths_do_not_end_the_lineage,
@@ -377,7 +458,10 @@ if __name__ == "__main__":
               test_tool_result_only_detection_is_not_fooled_by_mixed_content,
               test_cause_marks_only_the_triggering_block,
               test_unattributable_message_falls_back_to_the_index,
-              test_malformed_captures_are_skipped_not_fatal):
+              test_malformed_captures_are_skipped_not_fatal,
+              test_call_times_pair_each_call_with_its_own_receipt_by_stem,
+              test_call_times_drop_a_receipt_that_predates_its_send,
+              test_block_when_follows_the_emitter_rule):
         print(f"=== {t.__name__} ===")
         t()
     print(f"\nPASS={PASS} FAIL={FAIL}")
