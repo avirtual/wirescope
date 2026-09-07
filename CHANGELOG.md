@@ -5,6 +5,12 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.60 — 2026-09-07 — a probe's 429 is not the plan wall
+
+- **`quota.last_429` no longer stamps from the CLI's startup quota probe.** Claude Code fires a 1-token `"quota"` message (no system, no tools, `max_tokens: 1`) at boot/clear/resume; seats booting in the same second trip the per-second burst limit on it and their first real turn succeeds seconds later. Live corpus: 5,081 of 5,114 429s were probes, ~30 real refusals since July — clodex's "rate-limited Nm ago" chip was reporting a boot collision as the plan wall ~170× more often than the wall was hit. Probe 429s now land in **`last_429_probe`** (+`_age_s`) on `/_status` `quota`; `last_429` means a REAL turn was refused. Both persist and survive the next good reading. (`quota.note(probe=)`, fed by receipts from the existing `meta._is_probe_call` classification.)
+- **`upstream_health` native hint ignores probe outcomes** for the same reason: a fleet boot is 20 probe 429s in a second, which met the storm threshold (≥25% shed of ≥4 in 120s) without any real turn failing. Never fired live (0 in the log), but the evidence base was wrong.
+- Tests: `test_quota.py` (probe vs turn 429 separation, persistence across a good reading), `test_hints.py` (probe storm stays silent).
+
 ## v0.6.59 — 2026-09-07 — proactive OAuth refresh: holds no longer die on an idle night
 
 Two perpetual clodex holds died 04:10–04:26 today: every ping tick was declined `credential-expired` (10 declines, 0 sends, nothing errored). The CLI's OAuth ACCESS token (~8h) lapsed on the idle box, and only a CLI-originated request performs the refresh-token exchange — the first real turn of the morning refreshed the keychain at 04:26:13, three seconds after the coordinator's 1h prefix expired. wirescope's existing bootstrap was REACTIVE (fires from the proxy's own hold driver on a replay 401) and clodex arms its holds in its own port, so it was dead code in that deployment; each side assumed the other refreshes.

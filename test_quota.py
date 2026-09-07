@@ -133,6 +133,26 @@ q.note({"content-type": "application/json"}, status_code=429)
 check("a 429 with no prior reading yields no snapshot (never a fabricated 0%)",
       q.snapshot() is None)
 
+# -- the CLI's startup probe: 99% of all 429s, none of them the plan wall ------
+print("\n[probe 429 never reaches last_429]")
+_reset()
+q.note(_hdrs())
+q.note({"content-type": "application/json"}, status_code=429, probe=True)
+snap = q.snapshot()
+check("a probe 429 does NOT stamp last_429", snap.get("last_429") is None, str(snap))
+check("...but is visible as last_429_probe",
+      snap.get("last_429_probe") is not None and snap.get("last_429_probe_age_s") is not None)
+q.note({"content-type": "application/json"}, status_code=429)
+snap = q.snapshot()
+check("a real turn's 429 still stamps last_429", snap.get("last_429") is not None)
+q.note(_hdrs())
+snap = q.snapshot()
+check("both facts survive the next good reading",
+      snap.get("last_429") is not None and snap.get("last_429_probe") is not None, str(snap))
+_reset()
+q.note({"content-type": "application/json"}, status_code=429, probe=True)
+check("a probe 429 with no prior reading yields no snapshot", q.snapshot() is None)
+
 # -- header-less responses (models stub / count_tokens / codex) ----------------
 print("\n[responses without quota headers]")
 _reset()

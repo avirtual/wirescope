@@ -237,6 +237,15 @@ eff = h.effective("sx", None)
 check("enabled native provider joins effective() while the storm is live",
       [x["id"] for x in eff] == ["upstream_health"], str([x["id"] for x in eff]))
 check("native hint is sourced as native", eff[0]["source"] == "native:upstream_health")
+# a fleet booting in one second trips the burst limit on every seat's 1-token
+# quota probe (5,081 of 5,114 live 429s) — that is not the upstream shedding
+hn._OUTCOMES.clear()
+for _ in range(10):
+    hn.note_outcome(200)
+for _ in range(20):
+    hn.note_outcome(429, probe=True)
+check("upstream_health ignores probe 429s (a fleet boot is not a storm)",
+      hn.render("upstream_health") is None)
 
 # --- 7. attribution ---------------------------------------------------------
 print("\n[7] attribution (a hint that fires must be recorded)")
