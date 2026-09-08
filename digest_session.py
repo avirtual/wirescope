@@ -915,15 +915,17 @@ def events_from_messages(msgs, opts):
                 current[2].append(Event(ts, "line", f"← subagent finished ({tid.group(1) if tid else '?'})"))
                 stripped_reminder_removed = ""
             if visible and stripped_reminder_removed and not has_tool_result:
-                is_continuation = stripped_reminder_removed.startswith(
-                    "This session is being continued from a previous conversation")
                 flush_tool_run(current)
-                if is_continuation:
-                    current[2].append(Event(ts, "compact", "── context compacted ──"))
-                    heading = trim(stripped_reminder_removed, 300)
+                if stripped_reminder_removed.startswith(
+                        "This session is being continued from a previous conversation"):
+                    # the CLI's synthetic continuation prompt is the compact
+                    # itself, not something the user typed: fold it into the
+                    # marker (once -- a transcript's compact_boundary line
+                    # usually precedes it and already emitted one)
+                    if not (current[2] and current[2][-1].kind == "compact"):
+                        current[2].append(Event(ts, "compact", "── context compacted ──"))
                 else:
-                    heading = trim(stripped_reminder_removed, 200)
-                ensure_section(heading, ts)
+                    ensure_section(trim(stripped_reminder_removed, 200), ts)
             continue
 
         if role == "assistant":

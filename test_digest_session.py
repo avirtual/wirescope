@@ -424,8 +424,10 @@ def test_compact_marker_is_plain_line_not_heading():
     rc, text = run_digest(path)
     ck("compact marker rendered as a plain line, not a heading",
         "## ── context compacted ──" not in text and "── context compacted ──" in text)
-    ck("continuation summary becomes its own heading",
-        "## This session is being continued" in text)
+    ck("continuation summary folds into the marker, not a heading",
+        "## This session is being continued" not in text)
+    ck("one compact marker for one compact", text.count("── context compacted ──"), 1)
+    ck("post-compact assistant text still rendered", "continuing" in text)
 
 
 def test_local_time_default_vs_utc():
