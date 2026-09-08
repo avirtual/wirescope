@@ -1121,11 +1121,11 @@ def _no_final_reply(msgs):
 
 
 def main(argv):
-    if len(argv) < 2:
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
         print("usage: digest_session.py <transcript.jsonl | capture_dir> "
               "[-o out.md] [--thinking] [--full] [--max-text N] [--utc] [--last N]",
               file=sys.stderr)
-        return 1
+        return 0 if len(argv) >= 2 else 1
     path = argv[1]
     out_file = None
     thinking = False
