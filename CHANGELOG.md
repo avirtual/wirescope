@@ -5,6 +5,11 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.63 — 2026-09-08 — /_session: tool calls render as fields, not a JSON blob
+
+- **`tool_use` blocks on the session timeline are now human-readable.** The collapsed summary carries a gist instead of the first 90 chars of `{"command": "…`: Bash's `description` (else the command's first line), the file path for Read/Edit/Write, the pattern for Glob/Grep, the url for WebFetch, the description for Agent/Task; unknown tools use their first string argument. Expanded, the body is one row per argument with the value as real text — a `node -e` script reads as the script, not as one line of `\n` escapes; nested values are indented JSON. Size badge unchanged (wire size of the input). Same treatment for openai `function_call` when its arguments string parses as an object. `views._tool_use_html` / `_tool_gist`; `test_tool_use_view.py` (16 assertions on what the reader sees).
+- v0.6.62 is an empty tag (identical to v0.6.61): the cut ran against origin/main before this commit was pushed. Nothing to vendor there.
+
 ## v0.6.61 — 2026-09-07 — /_session: a wall-clock on every message, derived from the capture series (no per-block state)
 
 Bogdan's question: the page is regenerated from one whole request body, so nothing says WHEN a given block happened; should the proxy track per-request deltas as blocks with a birth timestamp? Assessed and answered without new state: every request is already captured with its `ts`, and its receipt sidecar (`.warmth.json`, same stem) has the response `ts`. Within a lineage a message's debut call is fixed (`_call_ordinals`, already on the page as `call k`), so its time IS its debut call's — derived at view time, works on a cold session from disk, zero cost on the request path.
