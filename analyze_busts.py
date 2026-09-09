@@ -38,9 +38,19 @@ bust only when the lineage IS the previous forwarded turn; on a cold resume the
 locus can point at a legitimate tail while the receipt says the head lapsed,
 which is why the class comes from BOTH signals (report._transition_class).
 
+KEEP-WARM PINGS get their own ledger at the end. A ping is a seat's request
+replayed at `max_tokens: 1` (both pingers build that shape); it is billed like
+a request and it is not a turn, so until v0.6.65 it hid inside the turn totals.
+The ping section prices them per seat (cached read vs uncached tail vs any
+write), flags DIRTY pings (a write, or an uncached span larger than the tail —
+a ping is supposed to be a pure cache read), and names LOOPS: runs of pings
+spaced at the hold tick (<= 2 min) with no organic turn between, which is what a
+5m-TTL stash under a perpetual hold looks like (152 pings / $7.53 in one night
+on one seat, 2026-09-09, keeping a pre-compact history warm).
+
 Usage:
   python3 analyze_busts.py [--logs DIR] [--since DAYS] [--session ID] [--top N]
-                           [--json OUT] [--min-usd X]
+                           [--json OUT] [--min-usd X] [--no-pings] [--pings-json OUT]
 Defaults: the live clodex capture root, last 14 days, top 15 per table.
 """
 import argparse
@@ -124,10 +134,16 @@ def _proxy_state(rec):
     return (None, None)
 
 
+_ROLE_SEP_RE = re.compile(r"-(parent|subagent|unknown|codex|ext)-")
+
+
 def _agent_of(stem):
-    # <seq>-<agent>-<agent_id>-<role>-<model>-<hhmmss>
-    parts = stem.split("-")
-    return parts[1] if len(parts) > 1 else "?"
+    # <seq>-<agent...>-<role>-<model>-<hhmmss>; the route name itself carries
+    # dashes (clodex-wirescope-597e9059), so cut at the role token, not the
+    # first dash
+    head = stem.split("-", 1)[1] if "-" in stem else "?"
+    m = _ROLE_SEP_RE.search("-" + head + "-")
+    return head[: m.start() - 1] if m and m.start() > 1 else head.split("-")[0]
 
 
 def price_bust(t, receipt, billing):
@@ -169,7 +185,7 @@ def scan(logs, since_days, only_session, report, billing, min_usd=0.0):
     for d in sorted(root.iterdir()):
         if not d.is_dir() or d.name.startswith("_"):
             continue
-        if only_session and d.name != only_session:
+        if only_session and not d.name.startswith(only_session):
             continue
         try:
             if d.stat().st_mtime < cutoff:
@@ -245,6 +261,190 @@ def _group(rows, keyf):
     return groups
 
 
+_MAX_TOKENS_RE = re.compile(rb'"max_tokens":\s*(\d+)')
+PING_LOOP_GAP_S = 120        # two hold ticks: pings this close with no turn between = a loop
+PING_LOOP_MIN = 5
+
+
+def _is_ping_capture(path, report):
+    """Cheap keep-warm test for one request capture: the summary flag when the
+    capture carries one (v0.6.65+), else a head read for `max_tokens` — the CLI
+    and both pingers put it before `messages`, so 8 KB reaches it; a miss
+    falls through to a full parse (correct slow path)."""
+    summ = report._tail_summary(path)
+    if summ and "keepwarm" in summ:
+        return bool(summ["keepwarm"]), summ
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False, summ
+    k = head.find(b'"body"')
+    m = _MAX_TOKENS_RE.search(head, k if k >= 0 else 0)
+    if m is not None and summ is not None:
+        return (int(m.group(1)) == 1 and bool(summ.get("n_tools"))), summ
+    rec = _request_record(path.parent, path.name[: -len(".request.json")])
+    body = rec.get("body") if isinstance(rec, dict) else None
+    ok = isinstance(body, dict) and bool(body.get("tools")) and body.get("max_tokens") == 1
+    return ok, (rec.get("summary") if isinstance(rec, dict) else summ)
+
+
+def scan_pings(logs, since_days, only_session, report, billing):
+    """Every keep-warm ping in the window, priced off its receipt, with the
+    organic-turn context needed to call a run of them a loop."""
+    root = Path(logs)
+    cutoff = time.time() - since_days * 86400 if since_days else 0
+    rows = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith("_"):
+            continue
+        if only_session and not d.name.startswith(only_session):
+            continue
+        try:
+            if d.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        # chronological walk of the dir: a ping's "previous request" decides
+        # whether it extends a loop or follows an organic turn
+        files = []
+        for rf in d.glob("*.request.json"):
+            try:
+                mt = rf.stat().st_mtime
+            except OSError:
+                continue
+            if mt < cutoff:
+                continue
+            files.append((mt, rf))
+        files.sort()
+        prev_kind = {}          # agent -> ("ping"|"turn", mtime)
+        for mt, rf in files:
+            ping, summ = _is_ping_capture(rf, report)
+            agent = _agent_of(rf.name)
+            if not ping:
+                if summ and summ.get("n_tools"):
+                    prev_kind[agent] = ("turn", mt)
+                continue
+            stem = rf.name[: -len(".request.json")]
+            rc = _receipt(d, stem)
+            bill = rc.get("billing") or {}
+            t = bill.get("tokens") or {}
+            model = bill.get("model") or (summ or {}).get("model")
+            rates = billing._price_for(model) if model else None
+            rd = t.get("cache_read_input_tokens") or 0
+            inp = t.get("input_tokens") or 0
+            w5 = t.get("cache_write_5m_tokens") or 0
+            w1 = t.get("cache_write_1h_tokens") or 0
+            wr = (w5 + w1) or (t.get("cache_write_flat_tokens") or 0)
+            wj = _load_json(d / f"{stem}.warmth.json")
+            pk = prev_kind.get(agent)
+            rows.append({
+                "session": d.name, "agent": agent, "stem": stem, "mtime": mt,
+                "status": rc.get("status_code"), "model": model,
+                "ttl": (wj or {}).get("ttl"),
+                "read_tokens": rd, "uncached_input": inp, "write_tokens": wr,
+                "read_usd": (_usd_of(rd, rates["cache_read"]) if rates else None),
+                "uncached_usd": (_usd_of(inp, rates["in"]) if rates else None),
+                "write_usd": ((_usd_of(w5, rates["cache_write_5m"])
+                               + _usd_of(w1, rates["cache_write_1h"])) if rates else None),
+                "est_usd": bill.get("est_usd"),
+                # dirty = not a pure cache read: it wrote, or it re-read more
+                # than a tail's worth uncached (the tail is ~2k tok on a seat)
+                "dirty": bool(wr) or inp > 4096,
+                "after": pk[0] if pk else None,
+                "gap_s": round(mt - pk[1]) if pk else None,
+            })
+            prev_kind[agent] = ("ping", mt)
+    return rows
+
+
+def _load_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _usd_of(tokens, rate):
+    return round((tokens or 0) * rate / 1e6, 6)
+
+
+def ping_loops(rows):
+    """Runs of >= PING_LOOP_MIN pings on one seat, each within PING_LOOP_GAP_S
+    of the previous PING (no organic turn between). Returns [(agent, session,
+    [rows])], costliest first."""
+    by_seat = defaultdict(list)
+    for r in rows:
+        by_seat[(r["agent"], r["session"])].append(r)
+    loops = []
+    for (agent, sess), L in by_seat.items():
+        L.sort(key=lambda r: r["mtime"])
+        run = []
+        for r in L:
+            if run and r["after"] == "ping" and r["gap_s"] is not None and r["gap_s"] <= PING_LOOP_GAP_S:
+                run.append(r)
+            else:
+                if len(run) >= PING_LOOP_MIN:
+                    loops.append((agent, sess, run))
+                run = [r]
+        if len(run) >= PING_LOOP_MIN:
+            loops.append((agent, sess, run))
+    loops.sort(key=lambda x: -sum(r["est_usd"] or 0 for r in x[2]))
+    return loops
+
+
+def render_pings(rows, top, since_days):
+    print(f"\n# Keep-warm pings — last {since_days} days · {len(rows)} pings"
+          f" · {_usd(sum(r['est_usd'] or 0 for r in rows))}")
+    if not rows:
+        return
+    ok = [r for r in rows if r["status"] == 200]
+    dirty = [r for r in ok if r["dirty"]]
+    print(f"clean (200, pure cache read): {len(ok) - len(dirty)} · dirty (wrote, or >4k uncached):"
+          f" {len(dirty)} · failed (non-200): {len(rows) - len(ok)}")
+    by = defaultdict(lambda: {"n": 0, "usd": 0.0, "read": 0.0, "unc": 0.0, "wr": 0.0,
+                              "dirty": 0, "ttl": set(), "gaps": []})
+    for r in rows:
+        g = by[(r["agent"], r["session"][:8])]
+        g["n"] += 1
+        g["usd"] += r["est_usd"] or 0
+        g["read"] += r["read_usd"] or 0
+        g["unc"] += r["uncached_usd"] or 0
+        g["wr"] += r["write_usd"] or 0
+        g["dirty"] += 1 if r["dirty"] else 0
+        if r["ttl"]:
+            g["ttl"].add(r["ttl"])
+        if r["after"] == "ping" and r["gap_s"] is not None:
+            g["gaps"].append(r["gap_s"])
+    print(f"\n{'seat':28} {'sess':8} {'pings':>5} {'usd':>7} {'read$':>6} {'unc$':>6} {'write$':>6}"
+          f" {'dirty':>5} {'ttl':>9} {'ping→ping p50':>13}")
+    for (agent, sess), g in sorted(by.items(), key=lambda kv: -kv[1]["usd"])[:top]:
+        gaps = sorted(g["gaps"])
+        p50 = f"{gaps[len(gaps) // 2]}s" if gaps else "-"
+        ttl = "/".join(str(x) for x in sorted(g["ttl"])) or "-"
+        print(f"{agent[:28]:28} {sess:8} {g['n']:5} {g['usd']:7.2f} {g['read']:6.2f} {g['unc']:6.2f}"
+              f" {g['wr']:6.2f} {g['dirty']:5} {ttl:>9} {p50:>13}")
+    loops = ping_loops(rows)
+    if loops:
+        print(f"\n== Ping loops (>= {PING_LOOP_MIN} pings <= {PING_LOOP_GAP_S}s apart, no organic"
+              " turn between): a hold whose stash TTL is inside the ping margin")
+        for agent, sess, run in loops[:top]:
+            cost = sum(r["est_usd"] or 0 for r in run)
+            hrs = (run[-1]["mtime"] - run[0]["mtime"]) / 3600
+            t0 = time.strftime("%m-%d %H:%M", time.localtime(run[0]["mtime"]))
+            t1 = time.strftime("%H:%M", time.localtime(run[-1]["mtime"]))
+            ttl = run[0]["ttl"]
+            rd = run[0]["read_tokens"]
+            print(f"  {agent[:28]:28} {sess[:8]} {t0}→{t1} {len(run):4} pings {hrs:4.1f}h"
+                  f" {_usd(cost):>8}  ttl={ttl}  read/ping={rd:,} tok")
+    if dirty:
+        print("\n== Dirty pings (a ping should be a pure cache read)")
+        for r in sorted(dirty, key=lambda r: -(r["write_tokens"] + r["uncached_input"]))[:top]:
+            print(f"  {r['session'][:8]} {r['stem'][:44]} write={r['write_tokens']:,}"
+                  f" uncached={r['uncached_input']:,} read={r['read_tokens']:,} ttl={r['ttl']}")
+
+
 def render(sessions, rows, top, since_days, logs):
     total = sum(r["marginal_usd"] or 0 for r in rows)
     gross = sum(r["gross_write_usd"] or 0 for r in rows)
@@ -307,6 +507,8 @@ def main():
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--min-usd", type=float, default=0.0)
     ap.add_argument("--json", default=None, help="write the per-bust rows here")
+    ap.add_argument("--no-pings", action="store_true", help="skip the keep-warm ping ledger")
+    ap.add_argument("--pings-json", default=None, help="write the per-ping rows here")
     a = ap.parse_args()
     report, billing = _boot(a.logs)
     sessions, rows = scan(a.logs, a.since, a.session, report, billing, a.min_usd)
@@ -315,6 +517,13 @@ def main():
             json.dump(rows, f, indent=1, default=str)
         print(f"[json] {len(rows)} rows -> {a.json}", file=sys.stderr)
     render(sessions, rows, a.top, a.since, a.logs)
+    if not a.no_pings:
+        prow = scan_pings(a.logs, a.since, a.session, report, billing)
+        if a.pings_json:
+            with open(a.pings_json, "w", encoding="utf-8") as f:
+                json.dump(prow, f, indent=1, default=str)
+            print(f"[json] {len(prow)} ping rows -> {a.pings_json}", file=sys.stderr)
+        render_pings(prow, a.top, a.since)
 
 
 if __name__ == "__main__":

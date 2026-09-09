@@ -74,10 +74,73 @@ def test_proxy_state_names_the_unanchored_shape():
     ck("the rebased shape is recognised", ab._proxy_state(rec4)[0], "gate_rebased")
 
 
+def _ping_row(agent, mtime, after, gap, usd=0.1, **kw):
+    return {"agent": agent, "session": "s1", "stem": f"{int(mtime)}-x", "mtime": mtime,
+            "after": after, "gap_s": gap, "est_usd": usd, "ttl": 300, "read_tokens": 100_000,
+            "uncached_input": 2000, "write_tokens": 0, "dirty": False, "status": 200,
+            "model": "claude-fable-5-1", "read_usd": 0.1, "uncached_usd": 0.02,
+            "write_usd": 0.0, **kw}
+
+
+def test_agent_of_keeps_the_dashed_route_name():
+    ck("route name with dashes survives", ab._agent_of("4646-clodex-wirescope-597e9059-parent-fable-5-1-011932"),
+       "clodex-wirescope-597e9059")
+    ck("a subagent stem too", ab._agent_of("12-clodex-clodex.t735.review-r2-560cda28-subagent-opus-5-212842"),
+       "clodex-clodex.t735.review-r2-560cda28")
+    ck("no role token: first segment", ab._agent_of("7-a-x"), "a")
+
+
+def test_ping_loops_need_tick_spacing_and_no_turn_between():
+    t0 = 1_000_000.0
+    # six pings 60s apart, each after a ping -> one loop
+    rows = [_ping_row("a", t0, "turn", 3000)] + [
+        _ping_row("a", t0 + 60 * i, "ping", 60) for i in range(1, 6)]
+    loops = ab.ping_loops(rows)
+    ck("a 60s run of six pings is one loop", len(loops), 1)
+    ck("the loop holds all six", len(loops[0][2]), 6)
+    # hourly pings (a healthy 1h hold) are not a loop
+    hourly = [_ping_row("b", t0 + 3360 * i, "ping" if i else "turn", 3360) for i in range(8)]
+    ck("56-minute spacing is a hold doing its job, not a loop", ab.ping_loops(hourly), [])
+    # a real turn in the middle splits the run below the minimum
+    split = [_ping_row("c", t0 + 60 * i, "ping" if i not in (0, 3) else "turn", 60)
+             for i in range(6)]
+    ck("an organic turn between pings breaks the run", ab.ping_loops(split), [])
+
+
+def test_ping_capture_detection_reads_flag_then_shape():
+    d = Path(tempfile.mkdtemp())
+    try:
+        flagged = d / "1-seat-x.request.json"
+        flagged.write_text(json.dumps({"seq": 1, "body": {"max_tokens": 1, "tools": [{"name": "Bash"}],
+                                                          "messages": []},
+                                       "summary": {"keepwarm": True, "n_tools": 1}}))
+        legacy = d / "2-seat-x.request.json"
+        legacy.write_text(json.dumps({"seq": 2, "body": {"max_tokens": 1, "tools": [{"name": "Bash"}],
+                                                         "messages": []},
+                                      "summary": {"n_tools": 1}}))
+        turn = d / "3-seat-x.request.json"
+        turn.write_text(json.dumps({"seq": 3, "body": {"max_tokens": 32000, "tools": [{"name": "Bash"}],
+                                                       "messages": []},
+                                    "summary": {"n_tools": 1}}))
+        probe = d / "4-seat-x.request.json"
+        probe.write_text(json.dumps({"seq": 4, "body": {"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]},
+                                     "summary": {"n_tools": 0}}))
+        from proxylab import report
+        ck("v0.6.65 capture: the summary flag decides", ab._is_ping_capture(flagged, report)[0], True)
+        ck("pre-flag capture: max_tokens:1 + tools off the head", ab._is_ping_capture(legacy, report)[0], True)
+        ck("a real turn is not a ping", ab._is_ping_capture(turn, report)[0], False)
+        ck("the tool-less quota probe is not a ping", ab._is_ping_capture(probe, report)[0], False)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     for t in (test_marginal_is_paid_minus_read_at_the_receipt_ttl,
               test_pattern_key_folds_digits_and_restart,
-              test_proxy_state_names_the_unanchored_shape):
+              test_proxy_state_names_the_unanchored_shape,
+              test_agent_of_keeps_the_dashed_route_name,
+              test_ping_loops_need_tick_spacing_and_no_turn_between,
+              test_ping_capture_detection_reads_flag_then_shape):
         print(f"=== {t.__name__} ===")
         t()
     print(f"\nPASS={PASS} FAIL={FAIL}")

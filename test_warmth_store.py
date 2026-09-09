@@ -563,6 +563,20 @@ check("max pings -> disarm",
                         True, warm_due, NOW)[0] == "disarm")
 check("consecutive failures -> disarm",
       lp._hold_decision({**HOLD, "failures": 2}, True, warm_due, NOW)[0] == "disarm")
+# A 5m row is inside the 300s margin from the instant it is stamped, so without
+# a TTL guard every tick pings and every ping re-stamps 300s: a ping loop until
+# the next organic turn (152 pings / $7.53 on one seat overnight, 2026-09-09).
+short_due = (NOW - 200, 300, NOW + 100)          # remaining 100s < margin, ttl 300
+short_fresh = (NOW, 300, NOW + 300)              # just stamped, remaining == ttl
+check("5m ttl, due -> skip (never a ping loop)",
+      lp._hold_decision(HOLD, True, short_due, NOW)[0] == "skip")
+check("5m ttl, just stamped -> skip, and the reason names the ttl guard",
+      "margin" in lp._hold_decision(HOLD, True, short_fresh, NOW)[1])
+check("ttl one second past the margin still pings when due",
+      lp._hold_decision(HOLD, True, (NOW - 200, lp.WARMTH_HOLD_MARGIN + 1, NOW + 100),
+                        NOW)[0] == "ping")
+check("ttl guard runs before the cold check (a lapsed 5m row is still skip)",
+      lp._hold_decision(HOLD, True, (NOW - 600, 300, NOW - 300), NOW)[0] == "skip")
 
 # --- hold-warm: arm/disarm bookkeeping -------------------------------------------
 ack, rec = lp._arm_hold("sess-hold-1", "arm", 2.0)
@@ -1550,6 +1564,51 @@ check("no max_tokens is NOT a probe (e.g. a count_tokens-shaped body)",
 check("multi-message body is NOT a probe", lp._is_probe_call(
     {"max_tokens": 1, "messages": [{"role": "user", "content": "a"},
                                    {"role": "assistant", "content": "b"}]}) is False)
+
+# --- keep-warm ping detection + apart-pricing -----------------------------------
+# Both pingers replay the seat's full request (tools + system + history) at
+# max_tokens:1. It is billed, it is not a turn, and until it was priced apart
+# a 60s ping loop read as ordinary traffic (152 pings / $7.53, 2026-09-09).
+seat_req = {"system": [{"type": "text", "text": "You are Claude Code"}],
+            "tools": [{"name": "Bash"}], "max_tokens": 1,
+            "messages": [{"role": "user", "content": "a"},
+                         {"role": "assistant", "content": "b"},
+                         {"role": "user", "content": "c"}]}
+check("seat request at max_tokens:1 is a keep-warm ping",
+      lp._is_keepwarm_ping(seat_req) is True)
+check("the same seat request at a real max_tokens is not",
+      lp._is_keepwarm_ping({**seat_req, "max_tokens": 32000}) is False)
+check("a tool-less 1-token body is the quota probe, not a ping",
+      lp._is_keepwarm_ping({"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]}) is False
+      and lp._is_probe_call({"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]}) is True)
+kw_bill = lp._billing("messages", model_resolved="claude-fable-5",
+                      usage_final={"input_tokens": 2000, "output_tokens": 1,
+                                   "cache_read_input_tokens": 100_000,
+                                   "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                                      "ephemeral_1h_input_tokens": 0}})
+tot_kw = lp._new_totals()
+lp._bump(tot_kw, kw_bill, stop={"stop_reason": "max_tokens", "is_turn": False, "keepwarm": True})
+lp._bump(tot_kw, kw_bill, stop={"stop_reason": "end_turn", "is_turn": True})
+check("a ping is inside requests/est_usd AND priced apart under keepwarm",
+      tot_kw["requests"] == 2 and tot_kw["keepwarm"]["requests"] == 1
+      and tot_kw["keepwarm"]["est_usd"] == kw_bill["est_usd"]
+      and tot_kw["est_usd"] == round(2 * kw_bill["est_usd"], 6))
+check("a ping never counts as a turn; the real turn still does",
+      tot_kw["turns"] == 1)
+check("keepwarm bucket carries read / uncached / write tokens (write stays 0 on a clean ping)",
+      tot_kw["keepwarm"]["cache_read_tokens"] == 100_000
+      and tot_kw["keepwarm"]["input_tokens"] == 2000
+      and tot_kw["keepwarm"]["write_tokens"] == 0)
+tot_old = {k: v for k, v in lp._new_totals().items() if k != "keepwarm"}   # pre-feature _session.json
+lp._bump(tot_old, kw_bill, stop={"keepwarm": True})
+check("totals restored from a pre-feature snapshot grow the bucket on first ping",
+      tot_old["keepwarm"]["requests"] == 1)
+lp._upsert_session_meta("sess-kw-1", cwd="/tmp/kw", model="claude-fable-5")
+lp._bump(lp._SESSION_TOTALS["sess-kw-1"], kw_bill, stop={"keepwarm": True})
+st_kw = lp._status_snapshot(session="sess-kw-1")["sessions"][0]
+check("/_status cost.keepwarm exposes the apart-priced bucket",
+      st_kw["cost"]["keepwarm"]["requests"] == 1
+      and st_kw["cost"]["keepwarm"]["est_usd"] == kw_bill["est_usd"])
 
 # --- a probe must not resurrect an ended session nor clobber its identity ----------
 # The post-restart "odd page": SessionEnd stamps _ENDED, then the editor's quota

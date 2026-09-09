@@ -81,7 +81,8 @@ class Fixture:
         core_mod.LOG_DIR = self.root
 
     def turn(self, ts, messages, read=50_000, write=1_000, role="parent",
-             status=200, body=True, tools=None, system=None, pad_kb=0):
+             status=200, body=True, tools=None, system=None, pad_kb=0,
+             keepwarm=False):
         """One captured turn. `ts` is an epoch float here and is written as the
         ISO-8601 string the writer actually emits (`time.strftime`, server.py) —
         the head read matches that format, so a float fixture would test a shape
@@ -101,9 +102,11 @@ class Fixture:
                "path": "/v1/messages", "client": None, "request_headers": {}}
         if body:
             rec["body"] = {"model": "claude-opus-5", "messages": msgs,
-                           "tools": tools, "system": system or []}
+                           "tools": tools, "system": system or [],
+                           **({"max_tokens": 1} if keepwarm else {})}
             # the writer emits `summary` LAST and only for a dict body
-            rec["summary"] = {"model": "claude-opus-5", "session_id": self.sid,
+            rec["summary"] = {"keepwarm": keepwarm,
+                              "model": "claude-opus-5", "session_id": self.sid,
                               "role": role, "system_chars": 0, "system_blocks": 0,
                               "n_messages": len(msgs), "messages_chars": 0,
                               "n_tools": len(tools or []),
@@ -307,6 +310,25 @@ def test_side_calls_are_not_the_seat_lineage():
         res = report_mod.bust_series(f.sid, detail=True)
         ck("side-calls are excluded from the transition chain", res["count"], 1)
         ck("the seat's warm turn after a side-call is not a bust", res["n_busts"], 0)
+    finally:
+        f.close()
+
+
+def test_keepwarm_pings_are_not_the_seat_lineage():
+    """A keep-warm ping replays the seat's request at max_tokens:1. It is the
+    same prefix, so it is not a transition; and once a stale stash is pinged
+    after the seat moved on (a 5m compact stash under a perpetual hold,
+    2026-09-09), pairing the ping against the seat's newer turn reads the
+    seat's own next warm read as a bust of the ping's window."""
+    f = Fixture()
+    try:
+        f.turn(1000.0, msgs(6), read=90_000, write=500)
+        f.turn(1060.0, msgs(6), read=90_500, write=0, keepwarm=True)      # a clean ping
+        f.turn(1120.0, msgs(4), read=60_000, write=0, keepwarm=True)      # a stale-stash ping
+        f.turn(1180.0, msgs(8), read=90_500, write=700)                   # the seat continues
+        res = report_mod.bust_series(f.sid, detail=True)
+        ck("pings are excluded from the transition chain", res["count"], 1)
+        ck("the seat's warm turn after a stale ping is not a bust", res["n_busts"], 0)
     finally:
         f.close()
 
