@@ -5,7 +5,7 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
-## Unreleased — 2026-09-09 — the bust ledger, and what it found the first time it ran
+## v0.6.64 — 2026-09-09 — the bust ledger, and what it found the first time it ran
 
 `analyze_busts.py` aggregates `/_bust` across a capture root (see OPERATIONS.md). Its first run over 3 days of clodex traffic (517 busts, $227 marginal) read as "self-inflicted transform flapping, $101" and "content busts, $105". Both headlines were wrong, and the reasons are four separate defects, three in the offline classifier and one live on the wire:
 
