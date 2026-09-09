@@ -153,6 +153,22 @@ check("dropped mode", rec and rec.get("acted") and rec.get("mode") == "dropped",
 mm = msg_markers_of(b)
 check("only the boundary anchor remains", mm == [(0, "1h")], str(mm))
 
+print("== gate: first round with ONLY tail markers -> rebased onto the boundary, never marker-less ==")
+msgs = turn("task", [True])              # halt == boundary; live thinking on the tail
+last = len(msgs) - 1
+b = body(msgs, msg_markers=((last - 1, "1h"), (last, "1h")))   # the CLI's rolling pair, no pin, no msg0
+rec = t._midturn_marker_gate(b)
+check("acted, rebased", rec and rec.get("acted") and rec.get("mode") == "dropped_rebased", str(rec))
+mm = msg_markers_of(b)
+check("one marker survives, on the boundary message", mm == [(0, "1h")], str(mm))
+check("messages region is never left without an anchor", len(mm) >= 1)
+
+print("== gate: same round with a pin anchor present -> plain drop (anchor already covers) ==")
+msgs = turn("task", [True])
+b = body(msgs, msg_markers=((0, "1h"), (len(msgs) - 1, "1h")))
+rec = t._midturn_marker_gate(b)
+check("plain dropped when an anchor exists", rec and rec.get("mode") == "dropped", str(rec))
+
 print("== gate: transition request (no assistant past boundary) -> stock ==")
 msgs = turn("task", [True, True]) + [{"role": "user", "content": "next task"}]
 b = body(msgs, msg_markers=((len(msgs) - 1, "1h"),))

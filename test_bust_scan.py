@@ -89,6 +89,8 @@ class Fixture:
         genuinely reading past it (a 4 KB tail on a 200-byte file proves nothing)."""
         import datetime as _dt
         ts = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
+        if tools is None:
+            tools = [{"name": "Bash", "input_schema": {}}]
         self.seq += 1
         stem = f"{self.seq:05d}-a-{self.sid[:8]}-{role}-opus-5-{self.seq:06d}"
         msgs = list(messages)
@@ -99,12 +101,16 @@ class Fixture:
                "path": "/v1/messages", "client": None, "request_headers": {}}
         if body:
             rec["body"] = {"model": "claude-opus-5", "messages": msgs,
-                           "tools": tools or [], "system": system or []}
+                           "tools": tools, "system": system or []}
             # the writer emits `summary` LAST and only for a dict body
             rec["summary"] = {"model": "claude-opus-5", "session_id": self.sid,
                               "role": role, "system_chars": 0, "system_blocks": 0,
                               "n_messages": len(msgs), "messages_chars": 0,
-                              "n_tools": len(tools or []), "tool_names": [],
+                              "n_tools": len(tools or []),
+                           # a seat always carries client tools; a tool-less
+                           # 1-2 message record is a side-call and leaves the chain
+                           "tool_names": [t.get("name") for t in (tools or [])
+                                          if isinstance(t, dict)],
                               "agent_id": None}
         else:
             rec["parse_error"] = "not json"
@@ -287,6 +293,40 @@ def test_non_main_and_failed_turns_are_filtered():
         f.close()
 
 
+def test_side_calls_are_not_the_seat_lineage():
+    """A WebSearch side-call (one server tool) or a title/summarize side-call (no
+    tools) captures on the parent line. Pairing it with the seat's next turn
+    reads the seat's normal warm read as a "bust" of the side-call's window."""
+    f = Fixture()
+    try:
+        client = [{"name": "Bash", "input_schema": {}}]
+        f.turn(1000.0, msgs(4), read=90_000, write=500, tools=client)
+        s2 = f.turn(1010.0, msgs(1), read=0, write=800, tools=[{"type": "web_search_20250305", "name": "web_search"}])
+        s3 = f.turn(1020.0, msgs(1), read=0, write=300, tools=[])
+        s4 = f.turn(1030.0, msgs(6), read=90_500, write=600, tools=client)
+        res = report_mod.bust_series(f.sid, detail=True)
+        ck("side-calls are excluded from the transition chain", res["count"], 1)
+        ck("the seat's warm turn after a side-call is not a bust", res["n_busts"], 0)
+    finally:
+        f.close()
+
+
+def test_block_to_string_rewrite_is_not_a_divergence():
+    """The CLI rewrites a settled `[{type:text}]` message to a bare string one
+    turn later; the cache treats both as the same bytes, so must the locus."""
+    a = {"role": "user", "content": [{"type": "text", "text": "hi",
+                                      "cache_control": {"type": "ephemeral"}}]}
+    b = {"role": "user", "content": "hi"}
+    ck("single text block == bare string", report_mod._bust_canon(a), report_mod._bust_canon(b))
+    c = {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": "x"}]}
+    ck("two blocks stay distinct from the string", report_mod._bust_canon(c) != report_mod._bust_canon(b), True)
+    body_a = {"tools": [], "system": [], "messages": [a, {"role": "assistant", "content": "ok"}]}
+    body_b = {"tools": [], "system": [], "messages": [b, {"role": "assistant", "content": "ok"},
+                                                      {"role": "user", "content": "next"}]}
+    loc = report_mod._first_divergence(body_a, body_b)
+    ck("locus is the appended tail, not msg[0]", loc and loc["appended"] and loc["index"] == 2, True)
+
+
 # --------------------------------------------------------------- end-to-end
 
 def _reference_series(session):
@@ -408,6 +448,8 @@ def main():
                test_message_counts_come_from_the_sidecar,
                test_order_is_by_timestamp_not_by_seq,
                test_non_main_and_failed_turns_are_filtered,
+               test_side_calls_are_not_the_seat_lineage,
+               test_block_to_string_rewrite_is_not_a_divergence,
                test_scan_matches_full_parse,
                test_detail_gates_transitions_only,
                test_empty_and_missing_sessions):

@@ -85,6 +85,8 @@ class Fixture:
 
     def turn(self, ts, n_msgs, read, write, inp=0, tools=None, system=None):
         import datetime as _dt
+        if tools is None:
+            tools = [{"name": "Bash", "input_schema": {}}]
         ts = _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
         self.seq += 1
         stem = f"{self.seq:05d}-a-{self.sid[:8]}-parent-opus-5-{self.seq:06d}"
@@ -93,11 +95,14 @@ class Fixture:
         rec = {"seq": self.seq, "ts": ts, "agent": "a", "method": "POST",
                "path": "/v1/messages", "client": None, "request_headers": {},
                "body": {"model": "claude-opus-5", "messages": ms,
-                        "tools": tools or [], "system": system or []},
+                        "tools": tools, "system": system or []},
                "summary": {"model": "claude-opus-5", "session_id": self.sid,
                            "role": "parent", "system_chars": 0, "system_blocks": 0,
                            "n_messages": len(ms), "messages_chars": 0,
-                           "n_tools": len(tools or []), "tool_names": [],
+                           "n_tools": len(tools),
+                           # a seat always carries client tools; a tool-less
+                           # 1-2 message record is a side-call and leaves the chain
+                           "tool_names": [t.get("name") for t in tools if isinstance(t, dict)],
                            "agent_id": None}}
         (self.dir / f"{stem}.request.json").write_text(json.dumps(rec))
         (self.dir / f"{stem}.response.json").write_text(json.dumps({
@@ -142,9 +147,16 @@ def test_growth_is_not_a_bust():
 
 
 def test_silent_lapse_is_a_bust():
-    """A lapse re-reads a static floor and writes little: write_frac ~0, and the
-    old rule stayed silent while 138k tokens of prefix evaporated. Real numbers
-    from corpus session a68b0455 (read 154,327 -> 16,218 at write_frac 0.00)."""
+    """A collapsed read that writes NOTHING: write_frac ~0, and the old rule
+    stayed silent while 138k tokens of prefix evaporated. Real numbers from
+    corpus session a68b0455 (read 154,327 -> 16,218 at write_frac 0.00).
+
+    Re-read 2026-09-09: that request (seq 1190) shipped with ZERO message-level
+    cache markers, which is WHY it wrote nothing — the history re-read at 1x
+    because nothing anchored it. A genuine TTL lapse re-writes what it re-reads
+    (24/24 gap>1h busts in the corpus wrote >=96% of the uncached span; 133/133
+    gap<5min ones wrote ~0). So the zero-write shape is the `unanchored` class
+    (ours), and the lapse case below carries the write a lapse always has."""
     f = Fixture()
     try:
         f.turn(1000.0, 257, read=154_327, write=0)
@@ -156,8 +168,34 @@ def test_silent_lapse_is_a_bust():
            t["lost_tokens"], 138_109)
         ck("...and the write fraction that missed it is still ~0",
            t["write_frac"] < 0.15, True)
-        ck("...classified as a lapse (bytes unchanged, prefix just died)",
-           t["class"], "lapse")
+        ck("...classified as unanchored (re-read at 1x, nothing re-written)",
+           t["class"], "unanchored")
+        ck("...which is OUR fault, not the environment's",
+           t["fault"], "self")
+    finally:
+        f.close()
+    f = Fixture()
+    try:
+        f.turn(1000.0, 257, read=154_327, write=0)
+        f.turn(9000.0, 259, read=16_218, write=138_000, inp=2_000)
+        t = f.series()[0]
+        ck("a collapsed read that RE-WRITES the prefix is a lapse", t["class"], "lapse")
+    finally:
+        f.close()
+
+
+def test_shorter_history_is_a_compact_even_when_msg0_changed():
+    """After a compact msg[0] IS the continuation summary, so the msg[0] locus
+    rule (`preamble`, "peel the volatile line") fired on every compact whose
+    history shrank by less than the contraction ratio — 110 of 120 preamble
+    busts in a 3-day corpus were compacts."""
+    f = Fixture()
+    try:
+        f.turn(1000.0, 120, read=150_000, write=500)
+        f.turn(1100.0, 90, read=17_000, write=60_000, inp=2)
+        t = f.series()[0]
+        ck("shrinking history classifies as compact", t["class"], "compact")
+        ck("...an environment fault with no per-turn fix", t["fault"], "environment")
     finally:
         f.close()
 
