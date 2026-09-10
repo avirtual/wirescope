@@ -1565,6 +1565,94 @@ check("multi-message body is NOT a probe", lp._is_probe_call(
     {"max_tokens": 1, "messages": [{"role": "user", "content": "a"},
                                    {"role": "assistant", "content": "b"}]}) is False)
 
+# --- auto-mode permission classifier side-call ------------------------------------
+# A seat launched WITHOUT --dangerously-skip-permissions grades every tool call
+# with a tool-less one-shot on a cheaper model (127k-char "security monitor"
+# system prompt, one <transcript> user message, max_tokens 64 / stop </severity>).
+# It shares the seat's session_id and used to classify as a parent turn: it
+# became the replayable last request, so /_session, /_context and the model on
+# /_status showed the monitor instead of the seat (clodex-ios hand t7, 2026-09-10:
+# 46 of 122 requests, $0.64 of $7.25).
+_cls_sys = [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.267;"},
+            {"type": "text", "cache_control": {"type": "ephemeral", "ttl": "1h"},
+             "text": "You are a security monitor for autonomous AI coding agents.\n\n## Context\n…"},
+            {"type": "text", "text": "\n\n## Session Context\n- **User identity**: `u`."}]
+cls_req = {"model": "claude-sonnet-5", "max_tokens": 64, "stop_sequences": ["</severity>"],
+           "system": _cls_sys, "thinking": {"type": "disabled"},
+           "messages": [{"role": "user", "content": [
+               {"type": "text", "text": "<transcript>\n"},
+               {"type": "text", "text": '{"Bash":"git status"}\n'}]}]}
+check("classifier stage-1 call detected", lp._is_classifier_call(cls_req) is True)
+check("classifier stage-2 call (8192 max_tokens, no stop) detected",
+      lp._is_classifier_call({**cls_req, "max_tokens": 8192, "stop_sequences": []}) is True)
+check("a seat turn carrying tools is NOT a classifier call even with that prose",
+      lp._is_classifier_call({**cls_req, "tools": [{"name": "Bash"}]}) is False)
+check("a seat whose prompt merely MENTIONS the monitor line is NOT one",
+      lp._is_classifier_call({"system": [{"type": "text", "text":
+          "You are Claude Code. Note: You are a security monitor for autonomous AI coding agents is a phrase."}],
+          "messages": []}) is False)
+check("string-form system prompt detected too",
+      lp._is_classifier_call({"system": _cls_sys[1]["text"], "messages": []}) is True)
+check("_transient_kind vocabulary: classifier / title / probe / None",
+      lp._transient_kind(cls_req) == "classifier"
+      and lp._transient_kind({"system": [{"type": "text",
+                             "text": "Generate a concise, sentence-case title (3-7 words)"}],
+                             "messages": []}) == "title"
+      and lp._transient_kind({"max_tokens": 1, "messages": [{"role": "user", "content": "quota"}]}) == "probe"
+      and lp._transient_kind({"system": [{"type": "text", "text": "You are Claude Code"}],
+                             "tools": [{"name": "Bash"}], "max_tokens": 8000,
+                             "messages": [{"role": "user", "content": "2+2"}]}) is None)
+check("the classifier is role=parent on the wire (tool-less, mentions Claude Code) — the "
+      "side-call gate, not the role, is what keeps it off the main line",
+      lp._classify_role({**cls_req, "system": [{"type": "text", "text":
+          _cls_sys[1]["text"] + "\n- **Primary use of Claude Code**: software development"}]})
+      in ("parent", "unknown"))
+# priced apart, never a turn
+cls_bill = lp._billing("messages", model_resolved="claude-sonnet-5",
+                       usage_final={"input_tokens": 90, "output_tokens": 9,
+                                    "cache_read_input_tokens": 43_000,
+                                    "cache_creation": {"ephemeral_5m_input_tokens": 0,
+                                                       "ephemeral_1h_input_tokens": 387}})
+tot_cls = lp._new_totals()
+lp._bump(tot_cls, cls_bill, stop={"stop_reason": "stop_sequence", "is_turn": False,
+                                  "keepwarm": False, "sidecall": "classifier"})
+lp._bump(tot_cls, cls_bill, stop={"stop_reason": "end_turn", "is_turn": True, "sidecall": None})
+check("a classifier call is inside requests/est_usd AND priced apart under classifier",
+      tot_cls["requests"] == 2 and tot_cls["classifier"]["requests"] == 1
+      and tot_cls["classifier"]["est_usd"] == cls_bill["est_usd"]
+      and tot_cls["keepwarm"]["requests"] == 0
+      and tot_cls["est_usd"] == round(2 * cls_bill["est_usd"], 6)
+      and tot_cls["turns"] == 1)
+tot_old_cls = {k: v for k, v in lp._new_totals().items() if k != "classifier"}
+lp._bump(tot_old_cls, cls_bill, stop={"sidecall": "classifier"})
+check("totals restored from a pre-feature snapshot grow the classifier bucket",
+      tot_old_cls["classifier"]["requests"] == 1)
+lp._upsert_session_meta("sess-cls-1", cwd="/tmp/cls", model="claude-opus-5")
+lp._bump(lp._SESSION_TOTALS["sess-cls-1"], cls_bill, stop={"sidecall": "classifier"})
+st_cls = lp._status_snapshot(session="sess-cls-1")["sessions"][0]
+check("/_status cost.classifier exposes the apart-priced bucket",
+      st_cls["cost"]["classifier"]["requests"] == 1
+      and st_cls["cost"]["classifier"]["est_usd"] == cls_bill["est_usd"])
+# the identity gate: a classifier call on an opus seat must not flip the model
+psid_cls = "c1a55f1e-0000-1111-2222-333333333333"
+lp._capture_session_meta(psid_cls,
+                         {"system": [{"type": "text", "text": "You are Claude Code"}],
+                          "tools": [{"name": "Bash"}],
+                          "messages": [{"role": "user", "content": "real work"}]},
+                         "claude-opus-5", role="parent")
+lp._WRITE_Q.join()
+lp._capture_session_meta(psid_cls, cls_req, "claude-sonnet-5", role="parent",
+                         side_call=(lp._transient_kind(cls_req) is not None))
+lp._WRITE_Q.join()
+st_cls2 = lp._status_snapshot(session=psid_cls)["sessions"][0]
+check("classifier side-call does NOT overwrite the seat's model (stays opus, not sonnet)",
+      st_cls2["model"] == "claude-opus-5")
+check("report.is_classifier_pair reads the summary tag, falls back to the body shape",
+      lp.report.is_classifier_pair({"summ": {"sidecall": "classifier"}}) is True
+      and lp.report.is_classifier_pair({"summ": {"sidecall": None}, "req": {"body": cls_req}}) is False
+      and lp.report.is_classifier_pair({"summ": {}, "req": {"body": cls_req}}) is True
+      and lp.report.is_classifier_pair({"summ": {}, "req": {"body": {"tools": [{"name": "Bash"}]}}}) is False)
+
 # --- keep-warm ping detection + apart-pricing -----------------------------------
 # Both pingers replay the seat's full request (tools + system + history) at
 # max_tokens:1. It is billed, it is not a turn, and until it was priced apart
