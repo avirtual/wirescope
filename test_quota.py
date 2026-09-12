@@ -248,6 +248,7 @@ if not files:
 else:
     _reset()
     seen_windows, parsed_n, with_hdrs = set(), 0, 0
+    orgs = set()    # quota is ORG-scoped: one account per distinct org id
     for f in files:
         try:
             d = json.load(open(f))
@@ -256,6 +257,8 @@ else:
         h = d.get("response_headers") or {}
         if any(k.startswith(P) for k in h):
             with_hdrs += 1
+            if h.get("anthropic-organization-id"):
+                orgs.add(h["anthropic-organization-id"])
         p = q._parse(h)
         if p:
             parsed_n += 1
@@ -271,8 +274,11 @@ else:
         check("every real window's used_pct is a sane percentage",
               all(w["used_pct"] is None or 0 <= w["used_pct"] <= 100
                   for w in s["windows"].values()), str(s["windows"]))
-        check("real traffic yields exactly one account (org-scoped, not session)",
-              s["accounts"] == 1, str(s["accounts"]))
+        # Until 2026-09-12 this asserted == 1; a box running seats on two
+        # subscriptions (clodex per-account seats) legitimately has two orgs,
+        # and the property worth pinning is org-scoping, not a world with one org.
+        check("real traffic yields one account PER ORG (org-scoped, not session)",
+              s["accounts"] == max(1, len(orgs)), f"accounts={s['accounts']} orgs={len(orgs)}")
 
 print(f"\n{'ALL PASS' if not _fails else str(len(_fails)) + ' FAILURE(S): ' + str(_fails)}")
 sys.exit(1 if _fails else 0)
