@@ -4916,6 +4916,82 @@ _nc = lp._context_snapshot("sess-window-1", utilization=True)["agents"][0]
 check("no compact yet -> window == lifetime, neither basis goes empty",
       _nc["utilization"]["evaluable_turns"]
       == _nc["utilization"]["lifetime"]["evaluable_turns"] == 5)
+
+# ---- the LIFETIME memo -----------------------------------------------------
+# The window pass is cheap by construction; the lifetime pass walks the whole
+# dir, which only grows (measured 7.35s at 3.08 GB, +0.74s/day -> back inside a
+# 20s consumer timeout in ~17 days). It folds incrementally instead, which is
+# exact because captures are write-once.
+lp.status._LIFETIME_MEMO.clear()
+_lm_a = lp.status._lifetime_scan("sess-window-1")
+_lm_b = lp.status._lifetime_scan("sess-window-1")
+_lm_w = lp.status._lifetime_scan("sess-window-1", memo=False)
+def _lm_norm(t, kind):
+    return {k: (g["evaluable_turns"], dict(g[kind])) for k, g in t.items()}
+check("lifetime memo: the fold is byte-equal to a full walk",
+      _lm_norm(_lm_b[0], "by_tool") == _lm_norm(_lm_w[0], "by_tool")
+      and _lm_norm(_lm_b[1], "by_skill") == _lm_norm(_lm_w[1], "by_skill"))
+check("lifetime memo: basis names which path served it (clodex renders it)",
+      _lm_a[2] == "walk" and _lm_b[2] == "memo"
+      and _lm_w[2] == "walk")
+
+# THE incremental check. It exists because a lexical high-water mark PASSED a
+# naive "is it fast + equal" test and still silently stopped folding: capture
+# seq numbers are not zero-padded, so "9998-…" sorts above "20322-…" and every
+# later turn is missed forever, undercounting with no error. Appending a turn
+# and re-comparing to a full walk is what caught it; assert that, not speed.
+#
+# The fixture must REPRODUCE that ordering: fold a high-lexical stem first, then
+# append a numerically-later but lexically-EARLIER one. Without the 9998 turn
+# below, every appended stem happens to sort last and a high-water mark passes
+# this check — which is exactly what it did on the first draft. Mutation-proven:
+# swapping the stem set back for a high-water mark fails this line.
+_write_window_turn("9998-w", "2026-09-19T11:00:00", ["Bash"])
+lp.status._LIFETIME_MEMO.clear()
+lp.status._lifetime_scan("sess-window-1")        # fold, high-water := "9998-w"
+_lm_new = os.path.join(_w_dir, "20322-x-parent-m-999999")
+with open(_lm_new + ".request.json", "w") as _fh:
+    json.dump({"ts": "2026-06-13T19:30:00", "body": {},
+               "summary": {"role": "parent", "n_tools": 4}}, _fh)
+with open(_lm_new + ".response.json", "w") as _fh:
+    json.dump({"status_code": 200, "meta": {"tool_uses": ["Glob", "Glob"]}}, _fh)
+with open(_lm_new + ".response.sse", "w") as _fh:
+    _fh.write("")
+_lm_c = lp.status._lifetime_scan("sess-window-1")
+_lm_c2 = lp.status._lifetime_scan("sess-window-1", memo=False)
+check("lifetime memo: a capture appended out of lexical order is still folded",
+      _lm_norm(_lm_c[0], "by_tool") == _lm_norm(_lm_c2[0], "by_tool")
+      and _lm_c[0]["main"]["by_tool"]["Glob"]
+          == _lm_c2[0]["main"]["by_tool"]["Glob"])
+
+# A receipts-prune deletes exactly what this scan reads, so a naive rescan would
+# report a collapsed tally as if the turns never happened. The fold keeps the
+# pre-prune truth and SAYS so, rather than quietly serving a smaller number.
+os.unlink(_lm_new + ".request.json")
+_lm_d = lp.status._lifetime_scan("sess-window-1")
+_lm_d2 = lp.status._lifetime_scan("sess-window-1", memo=False)
+check("lifetime memo: a pruned session keeps its tally and declares the basis",
+      _lm_d[2] == "memo-pre-prune"
+      and _lm_d[0]["main"]["evaluable_turns"]
+          > _lm_d2[0]["main"]["evaluable_turns"])
+check("lifetime memo: pre-prune basis is STICKY (a later call cannot forget)",
+      lp.status._lifetime_scan("sess-window-1")[2] == "memo-pre-prune")
+# The memo hands its tally to _apply_utilization, which SORTS and STAMPS in
+# place. Without a defensive copy the first render would corrupt the cache for
+# every later call — and, being a cache, it would stay corrupt. Mutate the
+# returned object the way a caller does and check the memo is unmoved.
+_lm_e = lp.status._lifetime_scan("sess-window-1")[0]
+_lm_before = (_lm_e["main"]["evaluable_turns"], dict(_lm_e["main"]["by_tool"]))
+_lm_e["main"]["evaluable_turns"] = -999
+_lm_e["main"]["by_tool"]["Read"] = -999
+check("lifetime memo: a caller mutating the result cannot corrupt the cache",
+      (lambda t: (t["main"]["evaluable_turns"], dict(t["main"]["by_tool"])))(
+          lp.status._lifetime_scan("sess-window-1")[0]) == _lm_before)
+_lm_snap = lp._context_snapshot("sess-window-1", utilization=True)
+check("lifetime basis reaches the wire as scan.lifetime_basis",
+      _lm_snap["scan"]["lifetime_basis"] == "memo-pre-prune"
+      and _lm_snap["scan"]["basis"] == "live-scan")   # window half unchanged
+lp.status._LIFETIME_MEMO.clear()
 lp._LAST_REQUEST.pop("sess-window-1", None)
 
 print()
