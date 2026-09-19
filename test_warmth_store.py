@@ -2616,9 +2616,15 @@ check("/_context composition: None for openai/codex body",
 
 # --- /_context skills: per-skill roster + utilization (v0.4.14) ---------------
 # The per-skill twin of the tool roster/utilization above. Roster parsed from the
-# injected skills list (both wire shapes); utilization scanned from assistant
-# `tool_use` blocks where name=="Skill" (skill name in input["skill"], deduped by
-# tool_use id across the history that re-ships it every turn).
+# injected skills list (both wire shapes); utilization read off the RESPONSE SSE
+# of the turn that issued the Skill call (2026-09-19: was a scan of assistant
+# `tool_use` blocks in re-shipped request history, deduped by tool_use id —
+# correct but it had to parse every request BODY to get there, which is what put
+# /_context past its consumer's timeout). The SSE carries the name on the issuing
+# turn, so a call is seen exactly once and no dedup set is needed to stay right.
+# These fixtures therefore write BOTH: the history a real capture would contain,
+# and the SSE it was issued on — so a regression that reverts to counting history
+# is visible as double-counting rather than hidden by a body-less fixture.
 _SKILLS_BLOCK = ("<system-reminder>\nThe following skills are available for use "
                  "with the Skill tool:\n- alpha-skill: " + "A" * 400
                  + "\n- beta-skill: " + "B" * 200
@@ -2659,8 +2665,40 @@ _sk_dir = os.path.join(os.environ["LOG_DIR"], "sess-skill-1")
 os.makedirs(_sk_dir, exist_ok=True)
 
 
-def _write_skill_turn(seq, role, has_skills, status, skill_calls, agent_id=None):
-    # skill_calls: list of (tool_use_id, skill_name) present in this body's history
+def _skill_sse(issued):
+    """The wire shape a Skill call streams as: the name arrives in
+    input_json_delta fragments, SPLIT across deltas (the real wire fragments
+    mid-token), so a reader that only handles whole-JSON deltas fails here."""
+    out = []
+    for i, sk in enumerate(issued):
+        payload = json.dumps({"skill": sk, "args": "x"})
+        head, tail = payload[:6], payload[6:]
+        out += [
+            'event: content_block_start',
+            'data: ' + json.dumps({"type": "content_block_start", "index": i,
+                                   "content_block": {"type": "tool_use",
+                                                     "id": f"t{i}",
+                                                     "name": "Skill",
+                                                     "input": {}}}),
+            'event: content_block_delta',
+            'data: ' + json.dumps({"type": "content_block_delta", "index": i,
+                                   "delta": {"type": "input_json_delta",
+                                             "partial_json": head}}),
+            'event: content_block_delta',
+            'data: ' + json.dumps({"type": "content_block_delta", "index": i,
+                                   "delta": {"type": "input_json_delta",
+                                             "partial_json": tail}}),
+            'event: content_block_stop',
+            'data: ' + json.dumps({"type": "content_block_stop", "index": i}),
+        ]
+    return "\n".join(out) + "\n"
+
+
+def _write_skill_turn(seq, role, has_skills, status, skill_calls, agent_id=None,
+                      issued=()):
+    # skill_calls: (tool_use_id, skill_name) carried in this body's HISTORY — a
+    # faithful capture, and the old scan's input. `issued`: the skills this turn
+    # actually INVOKED, streamed on its own SSE — what the tally reads now.
     base = os.path.join(_sk_dir, f"{seq:03d}-t")
     first = ({"role": "user", "content": [{"type": "text", "text": _SKILLS_BLOCK}]}
              if has_skills else {"role": "user", "content": "go"})
@@ -2670,22 +2708,29 @@ def _write_skill_turn(seq, role, has_skills, status, skill_calls, agent_id=None)
             {"type": "tool_use", "id": tid, "name": "Skill",
              "input": {"skill": sk, "args": "x"}}]})
     with open(base + ".request.json", "w") as fh:
-        json.dump({"summary": {"role": role, "agent_id": agent_id},
-                   "body": {"messages": msgs}}, fh)
+        json.dump({"body": {"messages": msgs},
+                   "summary": {"role": role, "agent_id": agent_id}}, fh)
     with open(base + ".response.json", "w") as fh:
         json.dump({"status_code": status}, fh)
+    with open(base + ".response.sse", "w") as fh:
+        fh.write(_skill_sse(issued))
 
 
-# main: alpha invoked (u1, repeats turn3 -> dedup), beta invoked (u2), gamma dead.
+# main: alpha invoked on turn 2, beta on turn 3; gamma never (deadweight).
+# Turn 3 still CARRIES u1 in its history — a tally that reads history instead of
+# the issuing SSE double-counts alpha here, which is the regression to catch.
 _write_skill_turn(1, "parent", True, 200, [])
-_write_skill_turn(2, "parent", True, 200, [("u1", "alpha-skill")])
+_write_skill_turn(2, "parent", True, 200, [("u1", "alpha-skill")],
+                  issued=["alpha-skill"])
 _write_skill_turn(3, "parent", True, 200,
-                  [("u1", "alpha-skill"), ("u2", "beta-skill")])   # u1 repeat
+                  [("u1", "alpha-skill"), ("u2", "beta-skill")],   # u1 re-ships
+                  issued=["beta-skill"])
 _write_skill_turn(4, "parent", False, 200, [])     # no skills loaded -> not evaluable
 _write_skill_turn(5, "parent", True, 500, [])      # errored -> not a use-chance
 # subagent instance a2sk invokes gamma once
 _write_skill_turn(6, "general-purpose", True, 200,
-                  [("u3", "gamma-skill")], agent_id="a2sk")
+                  [("u3", "gamma-skill")], agent_id="a2sk",
+                  issued=["gamma-skill"])
 
 lp._LAST_REQUEST["sess-skill-1"] = {"obj": _skill_obj, "ts": 4000.0,
                                     "headers": {}, "needs_auth": False}
@@ -2694,7 +2739,7 @@ lp._note_subagent("sess-skill-1", "general-purpose", "claude-haiku-4-5",
 
 _su = lp._context_snapshot("sess-skill-1", utilization=True)
 _sm = _su["agents"][0]
-check("/_context skills util: dedup by id (u1 repeat once), beta 1, gamma dead",
+check("/_context skills util: counted on the ISSUING turn (re-ship not recounted)",
       {p["name"]: p["used"] for p in _sm["skills"]["per_skill"]}
       == {"alpha-skill": 1, "beta-skill": 1, "gamma-skill": 0})
 check("/_context skills util: rollup (3 evaluable; no-skills + errored excluded)",
@@ -4545,6 +4590,292 @@ _ust, _uhash, _ud = lp._compact_history_warmth(comp_unstripped)   # no thinking-
 check("unstripped-body compact-check mismatches the stamp (the old bug)",
       _uhash != _stamp["hash"] and _ust == "absent")
 lp.transforms._strip_thinking_set_override(_SID, None)     # clear the override/latch
+
+# --- session-list filters + ordering (/_status + /_admin, 2026-09-18) ---------
+# The defect: a burst of one-shot seats (40 `brief-*` in one 24h window) pushed
+# every real session off page one AND out of the `limit` enrichment budget, and
+# the warm/cold split meant a session that turned seconds ago could render below
+# one idle an hour. The load-bearing property is WHERE the filter runs: before
+# the cut, not at render time. A filter applied downstream of the cut still
+# looks right on screen — the burst rows are gone — while freeing not one slot,
+# so assert the recovered sessions, never just the absence of the hidden ones.
+_t0 = time.time()
+# The real seats are OLDER than the burst — that is the whole shape of the bug:
+# recency alone hands every enriched slot to the one-shot seats, so the cut must
+# be made to see past them by family, not by time.
+for _i in range(3):
+    lp._upsert_session_meta(f"sess-real-{_i}", agent=f"clodex-work-{_i:08x}",
+                            model="claude-opus-5", now=_t0 - 600 + _i)
+for _i in range(6):
+    lp._upsert_session_meta(f"sess-flood-{_i}", agent=f"brief-x{_i}",
+                            model="claude-haiku-4-5", now=_t0 - 60 + _i)
+lp._upsert_session_meta("sess-done-1", agent="brief-done",
+                        model="claude-haiku-4-5", now=_t0 - 30)
+lp._end_session("sess-done-1", reason="other")
+
+check("family collapse folds a per-seat hex suffix, a ticket number and a tail",
+      lp.status._agent_family("brief-zbcn") == "brief-*"
+      and lp.status._agent_family("clodex-wirescope-46e6794f") == "clodex-wirescope-*"
+      and lp.status._agent_family("clodex-clodex.t978.hand-0862bcfa")
+          == "clodex-clodex.t*.hand-*"
+      and lp.status._agent_family(None) is None)
+
+_snap_all = lp._status_snapshot()
+_fams = {f["family"]: f["sessions"] for f in _snap_all["proxy"]["session_families"]}
+check("families roll up the window, biggest-first, unrouted excluded",
+      _fams.get("brief-*") == 7 and _fams.get("clodex-work-*") == 3
+      and _snap_all["proxy"]["session_families"][0]["sessions"] >= 7)
+
+# THE load-bearing check. Scope the universe to the two synthetic families so
+# the rest of the suite's sessions can't win the slots, then cut at 6: the six
+# newest are all `brief-*`, so the real (older) seats are outside the enriched
+# set. Hiding the family must pull them IN — a filter applied at render time
+# instead would produce the same-looking table while freeing nothing.
+_both = ["brief-*", "clodex-work-*"]
+_cut = lp._status_snapshot(limit=6, agent_globs=_both)
+_cut_ids = {s["session_id"] for s in _cut["sessions"]}
+_filt = lp._status_snapshot(limit=6, agent_globs=_both, hide_globs=["brief-*"])
+_filt_ids = {s["session_id"] for s in _filt["sessions"]}
+check("hide runs BEFORE the limit cut: filtering frees enrichment slots",
+      len(_filt_ids - _cut_ids) > 0
+      and any(i.startswith("sess-real-") for i in _filt_ids - _cut_ids))
+check("hide excludes the family and reports the reduced total",
+      not any((s.get("agent") or "").startswith("brief-")
+              for s in _filt["sessions"])
+      and _filt["proxy"]["sessions_total"] < _cut["proxy"]["sessions_total"])
+check("family counts are computed pre-filter, so chips don't move under a click",
+      {f["family"]: f["sessions"] for f in _filt["proxy"]["session_families"]}
+      .get("brief-*") == 7)
+check("agent= keeps only the named family; filters echo back",
+      all((s.get("agent") or "").startswith("brief-")
+          for s in lp._status_snapshot(agent_globs=["brief-*"])["sessions"])
+      and lp._status_snapshot(agent_globs=["brief-*"])["proxy"]["filters"]["agent"]
+          == ["brief-*"])
+check("ended=0 drops sessions that reported SessionEnd",
+      not any(s["session_id"] == "sess-done-1"
+              for s in lp._status_snapshot(hide_ended=True)["sessions"])
+      and any(s["session_id"] == "sess-done-1" for s in _snap_all["sessions"]))
+check("an empty or whitespace glob is discarded, never matched as a wildcard",
+      lp._status_snapshot(hide_globs=[])["proxy"]["sessions_total"]
+      == _snap_all["proxy"]["sessions_total"])
+
+# `by=recent` is the FINDING view: one table, strictly last_seen-desc. The
+# default `state` view sorts every warm row above every cold one, so recency
+# inverts across the split — that is intended there and must not leak here.
+_rec = lp._render_admin_html(_snap_all, host="t:7800", by="recent")
+_sta = lp._render_admin_html(_snap_all, host="t:7800", by="state")
+# assert on the SECTIONS, not on a <table> count: a warm section with no rows
+# renders as "none" rather than an empty table, so counting tables would pass
+# for the wrong reason on a store where nothing happens to be warm.
+check("by=recent renders one recency-ordered section, no warm/cold split",
+      "most recent first" in _rec and "warm cache" not in _rec)
+check("by=state keeps the warm/cold split",
+      "warm cache" in _sta and "cold / expired" in _sta
+      and "most recent first" not in _sta)
+check("admin renders family chips whose label doubles as the glob",
+      "brief-*" in _rec and "agent=brief-" in _rec and "hide=brief-" in _rec)
+check("a filtered view offers a way back (clear + restorable chip)",
+      "clear" in lp._render_admin_html(
+          lp._status_snapshot(hide_globs=["brief-*"]), host="t", by="state"))
+# titles/agent names are model- and caller-controlled: a glob reaches the page
+_xss = lp._render_admin_html(
+    lp._status_snapshot(hide_globs=['"><script>alert(1)</script>']),
+    host="t", by="state")
+check("a glob is escaped on its way into the chip markup",
+      "<script>" not in _xss)
+
+# --- /_context utilization: the scan must not read request BODIES (2026-09-19) ---
+# Reported defect: clodex's context popover timed out on its own long-lived
+# session. Cause was not the ordering of the work but its INPUT — _utilization and
+# _skill_utilization each json.loads'd every *.request.json in the capture dir,
+# and a request record holds that turn's whole `messages` array (measured 347 KB
+# ×8,546 turns = 2.9 GB, 22.97s, against a consumer timeout of 20s: the view could
+# not load at all on the sessions it most needed to describe).
+#
+# These checks pin the PROPERTY that makes it fast — never parsing a request body
+# — rather than a stopwatch, which would be a machine-speed assertion that fails
+# on a loaded CI box and passes on a fast one regardless of the algorithm. The
+# body is made SYNTACTICALLY INVALID while every cheap read stays well-formed: a
+# scan that parses bodies raises or silently drops the turn, so the equality
+# assertions below cannot pass. This is the same shape as test_bust_scan's rule.
+_cs_dir = os.path.join(os.environ["LOG_DIR"], "sess-capscan-1")
+os.makedirs(_cs_dir, exist_ok=True)
+for _i, (_role, _tools, _st) in enumerate(
+        [("parent", 3, 200), ("parent", 3, 200), ("parent", 0, 200),
+         ("parent", 3, 500), ("general-purpose", 2, 200)], start=1):
+    _b = os.path.join(_cs_dir, f"{_i:03d}-t")
+    # `summary` last (writer order) and reachable in a 4 KB tail; the body ahead
+    # of it is deliberate garbage that json.loads CANNOT parse.
+    with open(_b + ".request.json", "w") as _fh:
+        _fh.write('{"ts": "2026-09-19T10:00:0%d", "body": {"messages": [ THIS '
+                  'IS NOT JSON ,,, ]}, "summary": %s}'
+                  % (_i, json.dumps({"role": _role, "n_tools": _tools,
+                                     "agent_id": "acap" if _role != "parent" else None})))
+    with open(_b + ".response.json", "w") as _fh:
+        json.dump({"status_code": _st,
+                   "meta": {"tool_uses": ["Read", "Read", "Bash"]}}, _fh)
+    with open(_b + ".response.sse", "w") as _fh:
+        _fh.write("")
+_cs_tools, _cs_skills = lp._capture_scan("sess-capscan-1")
+# .get(), not [] — a body-parsing regression drops these lines entirely, and the
+# check must REPORT that as a failure rather than die on a KeyError mid-suite.
+_cs_main = _cs_tools.get("main") or {"evaluable_turns": None, "by_tool": {}}
+check("capture scan reads tool usage without parsing the request body",
+      _cs_main["evaluable_turns"] == 2                   # 3rd no tools, 4th errored
+      and dict(_cs_main["by_tool"]) == {"Read": 4, "Bash": 2})
+check("capture scan keys the subagent line off the tail summary's agent_id",
+      (_cs_tools.get("acap") or {}).get("evaluable_turns") == 1)
+# The skills roster needle is a BYTE search over the request file, so it must see
+# a roster that only exists inside the unparseable body — and must not claim one
+# that isn't there.
+_b = os.path.join(_cs_dir, "006-t")
+with open(_b + ".request.json", "w") as _fh:
+    _fh.write('{"ts": "2026-09-19T10:00:06", "body": {"messages": [ BROKEN '
+              '"The following skills are available for use with the Skill tool:" '
+              ',,, ]}, "summary": %s}'
+              % json.dumps({"role": "parent", "n_tools": 3}))
+with open(_b + ".response.json", "w") as _fh:
+    json.dump({"status_code": 200, "meta": {"tool_uses": []}}, _fh)
+with open(_b + ".response.sse", "w") as _fh:
+    _fh.write("")
+_cs2 = lp._capture_scan("sess-capscan-1")[1]
+check("skills roster detected by byte needle inside an unparseable body",
+      (_cs2.get("main") or {}).get("evaluable_turns") == 1)
+# A needle straddling the streaming chunk seam must still be found — the reason
+# _file_contains carries len(needle)-1 bytes across reads.
+_seam = os.path.join(_cs_dir, "seam.bin")
+with open(_seam, "wb") as _fh:
+    _fh.write(b"x" * 50 + lp.status._SKILLS_NEEDLE + b"y" * 50)
+check("a needle straddling the read seam is still found",
+      lp.status._file_contains(_seam, lp.status._SKILLS_NEEDLE, chunk=60) is True
+      and lp.status._file_contains(_seam, b"ABSENT-NEEDLE", chunk=60) is False)
+check("_file_contains fails closed on a missing file",
+      lp.status._file_contains(os.path.join(_cs_dir, "nope.bin"),
+                               lp.status._SKILLS_NEEDLE) is False)
+# A tail read that MISSES must degrade to a full parse, not drop the turn: the
+# optimisation is allowed to cost speed on a format change, never correctness.
+_b = os.path.join(_cs_dir, "007-t")
+with open(_b + ".request.json", "w") as _fh:          # valid JSON, summary FIRST
+    json.dump({"summary": {"role": "parent", "n_tools": 3},
+               "body": {"messages": []}, "pad": "P" * 9000}, _fh)
+with open(_b + ".response.json", "w") as _fh:
+    json.dump({"status_code": 200, "meta": {"tool_uses": ["Glob"]}}, _fh)
+with open(_b + ".response.sse", "w") as _fh:
+    _fh.write("")
+check("a summary out of tail reach falls back to a full parse, not a dropped turn",
+      lp.core._tail_summary(_b + ".request.json") is None          # cheap read misses
+      and dict((lp._capture_scan("sess-capscan-1")[0].get("main") or {})
+               .get("by_tool") or {}) == {"Read": 4, "Bash": 2, "Glob": 1})
+
+# The scan DECORATES a roster, so it must not run when there is no roster to
+# decorate. This is the difference between a cold long session answering in
+# microseconds and paying a full-dir scan to be told agents=[].
+_scanned = []
+_real_scan = lp.status._capture_scan
+try:
+    lp.status._capture_scan = (lambda s, since_ts=None:
+                               (_scanned.append(s), ({}, {}))[1])
+    _cold = lp._context_snapshot("sess-capscan-1", utilization=True)
+    check("cold/ended session: no in-memory roster -> capture scan never runs",
+          _cold["agents"] == [] and _cold["note"] and _scanned == []
+          and "scan" not in _cold)
+    lp._LAST_REQUEST["sess-capscan-1"] = {"obj": _skill_obj, "ts": 5000.0,
+                                          "headers": {}, "needs_auth": False}
+    lp._context_snapshot("sess-capscan-1", utilization=True)
+    check("live session: the scan does run once a roster exists",
+          _scanned == ["sess-capscan-1"])
+    _scanned.clear()
+    lp._context_snapshot("sess-capscan-1")
+    check("without utilization= the scan never runs at all", _scanned == [])
+finally:
+    lp.status._capture_scan = _real_scan
+    lp._LAST_REQUEST.pop("sess-capscan-1", None)
+
+# --- utilization is WINDOWED, with lifetime alongside (clodex, 2026-09-19) ----
+# The roster describes the CURRENT context window, so "never used" has to be
+# measured over turns the model can still see — a tool exercised only before the
+# last compact is deadweight NOW. Lifetime answers the other question (should
+# this tool stay loaded at all) and rides under `utilization.lifetime`.
+# Measured on clodex's own coordinator: lifetime says 7 of 9 tools earned their
+# place, the current window says 2. Those are different claims about the roster.
+_w_dir = os.path.join(os.environ["LOG_DIR"], "sess-window-1")
+os.makedirs(_w_dir, exist_ok=True)
+
+
+def _write_window_turn(stem, iso_ts, tools_used):
+    _b = os.path.join(_w_dir, stem)
+    with open(_b + ".request.json", "w") as _fh:
+        _fh.write('{"ts": "%s", "body": {"messages": [ NOT JSON ,,, ]}, '
+                  '"summary": %s}'
+                  % (iso_ts, json.dumps({"role": "parent", "n_tools": 4})))
+    with open(_b + ".response.json", "w") as _fh:
+        json.dump({"status_code": 200, "meta": {"tool_uses": tools_used}}, _fh)
+    with open(_b + ".response.sse", "w") as _fh:
+        _fh.write("")
+
+
+# Pre-compact: WebFetch paid off. Post-compact: only Read and Bash did.
+_write_window_turn("001-w", "2026-09-19T09:00:00", ["WebFetch", "WebFetch"])
+_write_window_turn("002-w", "2026-09-19T09:30:00", ["Read"])
+import datetime as _dt  # noqa: E402
+_BOUNDARY = _dt.datetime.fromisoformat("2026-09-19T10:00:00").timestamp()
+_write_window_turn("003-w", "2026-09-19T10:15:00", ["Read", "Bash"])
+_write_window_turn("004-w", "2026-09-19T10:45:00", ["Bash"])
+_wl, _ = lp._capture_scan("sess-window-1")
+_ww, _ = lp._capture_scan("sess-window-1", since_ts=_BOUNDARY)
+check("lifetime scan counts every turn in the dir",
+      _wl["main"]["evaluable_turns"] == 4
+      and dict(_wl["main"]["by_tool"]) == {"WebFetch": 2, "Read": 2, "Bash": 2})
+check("since_ts drops turns before the compact boundary",
+      _ww["main"]["evaluable_turns"] == 2
+      and dict(_ww["main"]["by_tool"]) == {"Read": 1, "Bash": 2})
+# An untimeable turn must be KEPT: silently dropping it shrinks the denominator
+# and inflates every used-rate, which reads as a cleaner roster than the wire supports.
+_b = os.path.join(_w_dir, "005-w")
+with open(_b + ".request.json", "w") as _fh:       # no `ts` key at all
+    _fh.write('{"body": {"messages": [ NOT JSON ,,, ]}, "summary": %s}'
+              % json.dumps({"role": "parent", "n_tools": 4}))
+with open(_b + ".response.json", "w") as _fh:
+    json.dump({"status_code": 200, "meta": {"tool_uses": ["Glob"]}}, _fh)
+with open(_b + ".response.sse", "w") as _fh:
+    _fh.write("")
+check("a turn with no readable ts is kept, never silently dropped from the window",
+      lp._capture_scan("sess-window-1", since_ts=_BOUNDARY)[0]["main"]
+        ["evaluable_turns"] == 3)
+
+_window_obj = {"model": "claude-opus-4-8",
+               "tools": [{"name": "Read", "description": "r" * 100},
+                         {"name": "Bash", "description": "b" * 80},
+                         {"name": "WebFetch", "description": "w" * 60},
+                         {"name": "Glob", "description": "g" * 40}],
+               "messages": [{"role": "user", "content": "go"}]}
+lp._LAST_REQUEST["sess-window-1"] = {"obj": _window_obj, "ts": 6000.0,
+                                     "headers": {}, "needs_auth": False}
+lp._SESSION_TOTALS["sess-window-1"]["_compact_base"] = {
+    "turns": 0, "requests": 0, "est_usd": 0.0,
+    "boundary_ts": _BOUNDARY, "compacted": True}
+_wsnap = lp._context_snapshot("sess-window-1", utilization=True)
+_wm = _wsnap["agents"][0]
+check("/_context utilization is windowed on the compact boundary",
+      _wm["utilization"]["evaluable_turns"] == 3
+      and {p["name"]: p["used"] for p in _wm["tools"]["per_tool"]}.get("WebFetch") == 0)
+check("lifetime rides alongside, distinct-count only (never a second per-tool used)",
+      _wm["utilization"]["lifetime"]["evaluable_turns"] == 5
+      and _wm["utilization"]["lifetime"]["used_distinct"] == 4      # +WebFetch, +Glob
+      and _wm["utilization"]["used_distinct"] == 3
+      and "used" not in _wm["utilization"]["lifetime"])
+check("the live-scan smear is a FIELD consumers can render, not prose",
+      _wsnap["scan"]["basis"] == "live-scan"
+      and _wsnap["scan"]["compact_boundary_ts"] == _BOUNDARY
+      and isinstance(_wsnap["scan"]["scan_s"], float))
+# A session that never compacted must not report an empty window: the window IS
+# the lifetime there, and both bases have to agree rather than one going blank.
+lp._SESSION_TOTALS["sess-window-1"].pop("_compact_base", None)
+_nc = lp._context_snapshot("sess-window-1", utilization=True)["agents"][0]
+check("no compact yet -> window == lifetime, neither basis goes empty",
+      _nc["utilization"]["evaluable_turns"]
+      == _nc["utilization"]["lifetime"]["evaluable_turns"] == 5)
+lp._LAST_REQUEST.pop("sess-window-1", None)
 
 print()
 if FAILS:
