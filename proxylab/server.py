@@ -28,6 +28,7 @@ from proxylab import prune as prune_mod
 from proxylab import receipts as receipts_mod
 from proxylab import report as report_mod
 from proxylab import restore as restore_mod
+from proxylab import spill as spill_mod
 from proxylab import status as status_mod
 from proxylab import subs as subs_mod
 from proxylab import transforms as transforms_mod
@@ -1938,16 +1939,41 @@ async def handler(request: Request) -> Response:
     sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}")
                if m is not None and is_messages else None)
 
+    # Intent-body spill (scratchpad/SPILL-WIRE-FORMAT.md): rewrite an oversized
+    # greedy intent body to a content-addressed pointer. ROUTED traffic only —
+    # unrouted requests carry the literal agent name "ext", which is not a seat
+    # and has no resolver, so they must never write a spill file. Unlike
+    # buffer_resp this holds only the current intent body, never the whole
+    # response, so ordinary prose still streams.
+    # `not buffer_resp`: RESP_*/relay rewrite the whole blob at the end, which
+    # would discard what we rewrote mid-stream. They are off for agent-routed
+    # traffic, so this is mutual exclusion made explicit rather than a live case.
+    spill_tee = (spill_mod.SpillTee(agent)
+                 if m is not None and is_messages and not buffer_resp
+                 and spill_mod.enabled() and spill_mod.valid_agent(agent) else None)
+
     async def body_iter():
         out_blob = None
         try:
             async for chunk in up.aiter_raw():
                 if capture:
-                    chunks.append(chunk)
+                    chunks.append(chunk)   # capture the UNMODIFIED upstream bytes
                 if not buffer_resp:     # stream verbatim; when buffering we hold
-                    yield chunk
+                    yield spill_tee.feed(chunk) if spill_tee is not None else chunk
                 if sub_tee is not None:  # after yield: client bytes come first
+                    # Deliberately the ORIGINAL chunk: a subscriber is told what
+                    # the model SAID, while the CLI transcript gets the pointer.
+                    # The two therefore differ on a spilled turn — intended, but
+                    # stated here because it is the kind of asymmetry a consumer
+                    # should read rather than discover.
                     sub_tee.feed(chunk)
+            if spill_tee is not None:
+                tail = spill_tee.close()   # unterminated body: never dropped
+                if tail:
+                    yield tail
+                if spill_tee.fired:
+                    print(f"[spill] #{n} {agent} {spill_tee.fired} "
+                          f"body(ies) -> pointer", flush=True)
             if buffer_resp and chunks:
                 full = b"".join(chunks)
                 # relay stashes prose + blanks it as a side effect; compute ONCE
