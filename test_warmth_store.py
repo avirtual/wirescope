@@ -4139,6 +4139,47 @@ check("prune scan: sizes split bodies vs receipts; old session is reclaimable",
       and _ps["reclaimable"]["bodies"]["bytes"] == 1500
       and _ps["reclaimable"]["no_session"]["files"] == 1)
 
+# ---- the readout MEMO ------------------------------------------------------
+# GET /_prune sizes every session dir, which is O(whole store) and measured
+# 91.9s on the live 82.8 GB corpus — past the 20s at which the consumer's own
+# control hides itself, i.e. invisible exactly where it is needed. The memo
+# keys on (dir mtime, inode) + file count, which is sound ONLY while captures
+# are write-once. These checks pin BOTH halves: that the cache is transparent,
+# and that the write-once premise it rests on still holds.
+check("prune memo: a memoized readout is byte-identical to a live walk",
+      {k: v for k, v in lp.prune.prune_scan().items()
+       if k not in ("basis", "dirs_memoized", "dirs_walked", "scan_s")}
+      == {k: v for k, v in lp.prune.prune_scan(memo=False).items()
+          if k not in ("basis", "dirs_memoized", "dirs_walked", "scan_s")})
+check("prune memo: basis says which path served it (never guess from latency)",
+      lp.prune.prune_scan()["basis"] == "memo"
+      and lp.prune.prune_scan(memo=False)["basis"] == "walk"
+      and lp.prune.prune_scan()["dirs_memoized"] > 0)
+
+# The load-bearing one: a dir that CHANGED must not be served from the memo.
+# Mutation-proven — reverting the mtime half of the key makes this fail.
+_pm_before = lp.prune.prune_scan()["total_bytes"]
+(_pr_new / "002-x-parent-m-000001.request.json").write_bytes(b"z" * 4321)
+check("prune memo: adding a file to a memoized dir moves the readout",
+      lp.prune.prune_scan()["total_bytes"] == _pm_before + 4321)
+(_pr_new / "002-x-parent-m-000001.request.json").unlink()
+check("prune memo: removing it again moves the readout back",
+      lp.prune.prune_scan()["total_bytes"] == _pm_before)
+
+# The premise the key RESTS on, pinned so a future in-place rewrite fails here
+# rather than silently serving stale sizes. A directory's mtime moves on
+# add/remove but NOT on an in-place modification, so if the writer ever starts
+# reopening a capture (a redaction pass, a re-encode), the memo goes stale and
+# nothing else would catch it. Verified empirically when this shipped: across
+# all 4,651 live session dirs, ZERO had a file newer than their own dir mtime.
+import inspect as _pm_inspect  # noqa: E402  (also imported later, for other blocks)
+_pm_src = _pm_inspect.getsource(lp.writer._writer_loop)
+check("prune memo premise: the writer never reopens a capture for writing",
+      _pm_src.count('.open("a")') == 1          # the _canary change-log alone
+      and "_canary" in _pm_inspect.getsource(lp.writer) + _pm_inspect.getsource(lp.canary)
+      and ".open('a')" not in _pm_src and '"r+"' not in _pm_src
+      and "'r+'" not in _pm_src)
+
 _pd = lp.prune.prune(30 * 86400, tier="receipts", scope="sessions", dry_run=True)
 check("prune dry-run: reports the reclaim, deletes nothing",
       _pd["dry_run"] and _pd["sessions_pruned"] == 1 and _pd["bytes_reclaimed"] == 1500

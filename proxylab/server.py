@@ -763,7 +763,14 @@ async def handler(request: Request) -> Response:
     # Action-endpoint convention: 400 only for malformed input; outcome in body.
     if request.url.path.rstrip("/") == "/_prune":
         if request.method == "GET":
-            return Response(json.dumps(prune_mod.prune_scan(), indent=2),
+            # Sizing every session dir is unbounded disk work, so it goes off
+            # the event loop for the same reason the /_context scan does: a
+            # synchronous walk here stalls every seat's live turn behind one
+            # readout. Memoized (prune.prune_scan), so the steady-state call is
+            # ~0.13s — but the first call after a restart is the full cold walk,
+            # which is exactly the case that must not block the loop.
+            res = await run_in_threadpool(prune_mod.prune_scan)
+            return Response(json.dumps(res, indent=2),
                             media_type="application/json")
         if request.method == "POST":
             q = request.query_params
@@ -781,7 +788,11 @@ async def handler(request: Request) -> Response:
                               "scope in {sessions,no-session,all}"}),
                     status_code=400, media_type="application/json")
             dry = q.get("dry_run") in ("1", "yes", "true")
-            res = prune_mod.prune(age, tier=tier, scope=scope, dry_run=dry)
+            # Off the loop for the same reason as the GET, and more so: this one
+            # walks every dir AND unlinks, so it is the longest-running handler
+            # in the proxy.
+            res = await run_in_threadpool(prune_mod.prune, age, tier=tier,
+                                          scope=scope, dry_run=dry)
             if not dry:
                 print(f"[prune] tier={tier} scope={scope} "
                       f"older_than={q.get('older_than')} -> "
