@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import re
+import threading
 import time
 
 from starlette.applications import Starlette
@@ -2000,6 +2001,15 @@ async def _lifespan(app):
     # silently dropped) on a freshly-resolved unpinned install. lifespan= has
     # been supported since 0.13, so this works on both old and new Starlette.
     await hold_mod._start_hold_loop()
+    # Warm the /_prune size memo off the request path. The memo persists, so
+    # this is a no-op cost on any store that has been scanned before (one stat
+    # per dir to re-validate, ~12ms on 4,654) — it exists for the store that has
+    # NEVER been scanned, where the first caller would otherwise pay the full
+    # cold walk (45.8s) against a 20s client timeout. Daemon thread, so it can
+    # never hold up a shutdown, and failures print rather than propagate: this
+    # is a cache warm, and the scan is correct without it either way.
+    threading.Thread(target=prune_mod.warm_stats_memo,
+                     name="prune-memo-warm", daemon=True).start()
     yield
 
 

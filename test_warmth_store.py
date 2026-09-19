@@ -13,6 +13,7 @@ Run: python3 test_warmth_store.py   (uses throwaway tmp dirs; no live ports)
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -4180,6 +4181,67 @@ check("prune memo premise: the writer never reopens a capture for writing",
       and ".open('a')" not in _pm_src and '"r+"' not in _pm_src
       and "'r+'" not in _pm_src)
 
+# ---- the memo PERSISTS across a restart ------------------------------------
+# The memo above fixed the steady state and left a hole: it was per-process, so
+# a restart threw it away and the first caller paid the full cold walk (45.8s
+# measured) against the consumer's 20s timeout — the control stayed broken
+# exactly at restart, which is when someone is most likely to be clearing logs.
+# Persisting it costs one stat per dir to re-validate (0.012s across 4,654),
+# versus 45.8s to re-walk.
+#
+# These run in a SUBPROCESS on purpose. The claim is specifically "a DIFFERENT
+# process serves this from the table", and nothing in-process can test that —
+# the in-memory dict would answer and the check would pass with the persistence
+# ripped out. (Mutation-proven: stubbing _load_persisted_stats to return
+# immediately leaves every in-process check green and fails these.)
+_pp_probe = (
+    "import logproxy as lp, json, sys\n"
+    "r = lp.prune.prune_scan()\n"
+    "sys.stdout.write('@@' + json.dumps("
+    "{'basis': r['basis'], 'walked': r['dirs_walked'],"
+    " 'memo': r['dirs_memoized'], 'bytes': r['total_bytes']}) + '@@')\n")
+
+
+def _pp_run():
+    """prune_scan() in a fresh interpreter sharing this test's LOG_DIR/DB."""
+    out = subprocess.run([sys.executable, "-c", _pp_probe],
+                         capture_output=True, text=True, env=os.environ.copy(),
+                         cwd=os.path.dirname(os.path.abspath(__file__)))
+    if "@@" not in out.stdout:
+        raise AssertionError(f"probe produced no result: {out.stderr[-500:]}")
+    return json.loads(out.stdout.split("@@")[1])
+
+
+lp.prune.prune_scan()                      # make sure the table is populated
+_pp1 = _pp_run()
+check("prune memo persists: a FRESH PROCESS serves the readout from the table",
+      _pp1["basis"] == "memo" and _pp1["walked"] == 0 and _pp1["memo"] > 0)
+check("prune memo persists: the restored readout equals this process's",
+      _pp1["bytes"] == lp.prune.prune_scan()["total_bytes"])
+
+# The load-bearing half, again across the process boundary: a persisted row is
+# a claim about a dir that must still be CHECKED, never trusted. A restored memo
+# that misses a change is far worse than no memo — it serves a confident wrong
+# number with no slow path to reveal it.
+(_pr_new / "003-x-parent-m-000002.request.json").write_bytes(b"q" * 777)
+_pp2 = _pp_run()
+check("prune memo persists: a dir changed while the process was down is re-walked",
+      _pp2["walked"] == 1 and _pp2["bytes"] == _pp1["bytes"] + 777)
+(_pr_new / "003-x-parent-m-000002.request.json").unlink()
+
+# Only the proxy's OWN LOG_DIR is persisted: the table is owner-scoped but the
+# memo keys on bare dir NAME, so a scan pointed elsewhere (a test fixture, an
+# archived corpus) must not durably claim rows the real store would read back.
+_pp_other = pathlib.Path(tempfile.mkdtemp(prefix="pruneother_"))
+(_pp_other / "sess-alien-1").mkdir()
+(_pp_other / "sess-alien-1" / "001-x-parent-m-000000.request.json").write_bytes(b"a" * 50)
+lp.prune.prune_scan(str(_pp_other))
+_pp_con = sqlite3.connect(os.environ["WARMTH_DB"])
+check("prune memo persists: a scan of another root writes no rows",
+      _pp_con.execute("SELECT COUNT(*) FROM prune_dir_stats "
+                      "WHERE name LIKE 'sess-alien%'").fetchone()[0] == 0)
+_pp_con.close()
+
 _pd = lp.prune.prune(30 * 86400, tier="receipts", scope="sessions", dry_run=True)
 check("prune dry-run: reports the reclaim, deletes nothing",
       _pd["dry_run"] and _pd["sessions_pruned"] == 1 and _pd["bytes_reclaimed"] == 1500
@@ -4200,12 +4262,25 @@ check("prune: receipts-only dir is a no-op on a second receipts pass",
       lp.prune.prune(30 * 86400, tier="receipts", scope="sessions",
                      dry_run=False)["sessions_pruned"] == 0)
 
+lp.prune.prune_scan()                      # ensure _pr_old has a persisted row
+_pf_row_before = sqlite3.connect(os.environ["WARMTH_DB"]).execute(
+    "SELECT COUNT(*) FROM prune_dir_stats WHERE name=?",
+    (_pr_old.name,)).fetchone()[0]
 _pf = lp.prune.prune(30 * 86400, tier="full", scope="all", dry_run=False,
                      protect=False)   # protect=False = the CLI path: held dir goes too
 check("prune tier=full + protect=False (CLI): old dirs + old no-session files go",
       not _pr_old.exists() and not _pr_held.exists() and _pr_new.exists()
       and not (_pr_ns / "old-probe.request.json").exists()
       and (_pr_ns / "new-probe.request.json").exists())
+# _pf_row_before pins this check against VACUITY: "no row now" is also true when
+# no row was ever written, so a broken flush would satisfy the delete assertion
+# for the wrong reason. Caught by mutation — disabling the flush left this green
+# until the before-count was added.
+check("prune tier=full: the deleted dir's persisted row goes with it",
+      _pf_row_before == 1
+      and sqlite3.connect(os.environ["WARMTH_DB"]).execute(
+          "SELECT COUNT(*) FROM prune_dir_stats WHERE name=?",
+          (_pr_old.name,)).fetchone()[0] == 0)
 with lp._HOLD_LOCK:
     lp._HOLD_STATE.pop("sess-prune-held", None)   # don't leak into later checks
 shutil_rm = __import__("shutil").rmtree
