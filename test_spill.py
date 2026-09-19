@@ -1,4 +1,4 @@
-"""Offline checks for intent-body spill (scratchpad/SPILL-WIRE-FORMAT.md, 2026-09-19).
+"""Offline checks for intent-body spill (SPILL.md, 2026-09-19).
 
 The wire format is a CONTRACT with clodex: it builds the `@spill:<id>` resolver
 against these exact bytes, so anything here that drifts silently breaks a

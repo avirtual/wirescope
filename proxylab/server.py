@@ -1939,7 +1939,7 @@ async def handler(request: Request) -> Response:
     sub_tee = (subs_mod._tee_for(agent, session_id, f"{n}-{ts}")
                if m is not None and is_messages else None)
 
-    # Intent-body spill (scratchpad/SPILL-WIRE-FORMAT.md): rewrite an oversized
+    # Intent-body spill (SPILL.md): rewrite an oversized
     # greedy intent body to a content-addressed pointer. ROUTED traffic only —
     # unrouted requests carry the literal agent name "ext", which is not a seat
     # and has no resolver, so they must never write a spill file. Unlike

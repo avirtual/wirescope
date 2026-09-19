@@ -1,9 +1,19 @@
 """Intent-body spill: replace a large greedy intent body on the wire with a
 content-addressed pointer, and write the body to a file the consumer resolves.
 
-Wire format contract: scratchpad/SPILL-WIRE-FORMAT.md (agreed with clodex
-2026-09-19). The consumer builds the `@spill:<id>` resolver; we build this,
-the response-side buffer.
+Wire format contract: SPILL.md (agreed with clodex 2026-09-19). The consumer
+builds the `@spill:<id>` resolver; we build this, the response-side buffer.
+
+STATUS: DARK EVERYWHERE WE DEPLOY, AND DELIBERATELY KEPT — read SPILL.md's header
+before proposing a deletion. clodex moved the rewrite into its own in-process wire
+tee, implementing SPILL.md verbatim, and Bogdan ruled on principle that no clodex
+intent grammar lives in this proxy (the same ruling that retired WB_INTENT_DISPATCH
+in 2026-06). So the four WIRESCOPE_SPILL_* knobs stay unset and nothing depends on
+this module. It is kept because test_spill.py is the CONFORMANCE SUITE for a format
+that now has two implementations, and because a box running wirescope WITHOUT that
+tee (headless nodes) has no other owner for the rewrite. `enabled()` requires all
+four knobs and `SpillTee.feed` returns its chunk before parsing when unarmed, so an
+unconfigured box pays one boolean per chunk.
 
 WHY THIS IS A RESPONSE TRANSFORM. A clodex intent body is emitted by the model
 into its ANSWER TEXT, and response text mutation is durable — it persists into
