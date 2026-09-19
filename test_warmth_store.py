@@ -289,6 +289,116 @@ check("a real (non-restart) content bust lifts actionable_excl_restart above 0",
       _dep2["by_class"]["system"] == 2 and _dep2["by_restart"]["system"] == 1
       and _dep2["actionable_excl_restart"] == 1)
 
+# ---- WHY a system bust fired ----------------------------------------------
+# The `system` hint used to assert "often a mid-session /model swap leaving a
+# stale prompt; pin the model/prompt" on EVERY system bust, while session_head
+# stored no model at all — so the classifier could not have checked, even in
+# principle. clodex hit two real events where the model was identical and went
+# hunting a swap that never happened. These checks pin that a reason is only ever
+# emitted from something OBSERVED to differ.
+_bh = "x-anthropic-billing-header: cc_version={v}; cc_entrypoint=cli;"
+
+
+def _rsn(prior_model, cur_model, prior_v, cur_v, sid):
+    """Two turns differing only as specified -> the last bust's reason dict."""
+    base = {"metadata": {"user_id": json.dumps({"session_id": sid})},
+            "messages": [msg("user", "reason probe " * 40),
+                         msg("assistant", "reason reply " * 40),
+                         msg("user", "reason probe two " * 40)]}
+    t1 = {**base, "model": prior_model,
+          "system": [{"type": "text", "text": _bh.format(v=prior_v)},
+                     {"type": "text", "text": "You are Claude Code. " * 30}],
+          "messages": base["messages"][:1]}
+    lp._record_warmth(t1, {"cache_creation_input_tokens": 30_000})
+    t2 = {**base, "model": cur_model,
+          "system": [{"type": "text", "text": _bh.format(v=cur_v)},
+                     # CHANGED prose -> the system hash moves -> a system bust
+                     {"type": "text", "text": "You are Claude Code, edited. " * 30}],
+          "messages": base["messages"][:2]}
+    lp._record_warmth(t2, {"cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 10})
+    # the snapshot only lists sessions it has identity for
+    lp._upsert_session_meta(sid, cwd="/tmp/reason", model=cur_model)
+    s = [x for x in lp._status_snapshot(session=sid)["sessions"]
+         if x["session_id"] == sid][0]
+    return s["busts"]["last_bust"]
+
+
+_r_swap = _rsn("claude-opus-5", "claude-sonnet-5", "2.1.269.c93", "2.1.269.c93",
+               "sess-reason-swap")
+check("system bust: a real model swap is named as one, with both values",
+      _r_swap["reason"] == "model_swap"
+      and _r_swap["reason_was"] == "claude-opus-5"
+      and _r_swap["reason_now"] == "claude-sonnet-5"
+      and "pin the model" in _r_swap["fix_hint"])
+
+_r_up = _rsn("claude-opus-5", "claude-opus-5", "2.1.269.c93", "2.1.270.a11",
+             "sess-reason-upgrade")
+check("system bust: same model, new CLI build -> cli_upgrade, not a model swap",
+      _r_up["reason"] == "cli_upgrade"
+      and _r_up["reason_was"] == "2.1.269" and _r_up["reason_now"] == "2.1.270"
+      and "/model" not in _r_up["fix_hint"])
+
+# THE REGRESSION clodex actually hit: same model, same build, the CLI edited its
+# own prompt. This is the case that used to say "/model swap".
+_r_pc = _rsn("claude-opus-5", "claude-opus-5", "2.1.269.c93", "2.1.269.c93",
+             "sess-reason-prompt")
+check("system bust: same model AND build -> client_prompt_change, never /model",
+      _r_pc["reason"] == "client_prompt_change"
+      and "/model" not in _r_pc["fix_hint"]
+      and "swap" not in _r_pc["fix_hint"])
+
+# The hex build tag is PER-PROCESS, not per-release: measured 300/300 live
+# sessions change the FULL string within one session while only 3/300 change the
+# x.y.z base. Comparing raw strings would report a CLI upgrade on essentially
+# every session, so _cc_version keeps three components. Without this, the check
+# above would report cli_upgrade instead of client_prompt_change.
+_r_hex = _rsn("claude-opus-5", "claude-opus-5", "2.1.269.c93", "2.1.269.e81",
+              "sess-reason-hexonly")
+check("system bust: a per-process build-tag change is NOT a CLI upgrade",
+      _r_hex["reason"] == "client_prompt_change")
+
+check("cc_version keeps the release, drops the per-process build tag",
+      lp.warmth._cc_version(
+          {"system": [{"type": "text",
+                       "text": _bh.format(v="2.1.269.c93")}]}) == "2.1.269"
+      # absent header (codex body, --system-prompt-file harness) = cannot say
+      and lp.warmth._cc_version({"system": None}) is None
+      and lp.warmth._cc_version(
+          {"system": [{"type": "text", "text": "You are Claude Code."}]}) is None)
+
+# Evidence missing must DECLINE, not fall through to a guess — the whole defect
+# being fixed was a cause asserted without evidence.
+check("system bust: unknown model/version declines to name a cause",
+      lp.warmth._system_bust_reason(None, "claude-opus-5", None, "2.1.269") is None
+      and lp.warmth._system_bust_reason("claude-opus-5", None, "2.1.269", None) is None)
+
+# PRECEDENCE, when a turn carries BOTH a model swap and a CLI upgrade (a seat
+# restarted onto a new build AND a different model — the realistic way this
+# happens). model_swap must win: it is the one an operator can act on in-session
+# by pinning the model, while a CLI upgrade self-heals. Mutation-proven — with
+# the two tests reordered, every OTHER check in this block still passes, so
+# without this one the precedence is unpinned and free to silently invert.
+check("system bust: a simultaneous model swap and CLI upgrade reports the swap",
+      lp.warmth._system_bust_reason(
+          "claude-opus-5", "claude-sonnet-5", "2.1.269", "2.1.270")
+      == ("model_swap", "claude-opus-5", "claude-sonnet-5"))
+
+# clodex's ask: name the block by ordinal + size delta, so an operator does not
+# have to open the request JSON to find what moved.
+check("system bust: the changed block is named by ordinal and char delta",
+      lp.warmth._sys_block_delta("[[0,5000],[2,900]]", "[[0,4093],[2,900]]")
+      == (0, -907)
+      # ambiguous (two blocks moved) -> no locator rather than a wrong one
+      and lp.warmth._sys_block_delta("[[0,5000],[2,900]]",
+                                     "[[0,4093],[2,800]]") is None
+      # reshaped array -> no locator (the ordinals no longer line up)
+      and lp.warmth._sys_block_delta("[[0,5000]]", "[[0,5000],[1,10]]") is None)
+check("block sizes exclude the billing header (it moves every turn)",
+      json.loads(lp.warmth._sys_block_sizes(
+          {"system": [{"type": "text", "text": _bh.format(v="2.1.269.c93")},
+                      {"type": "text", "text": "abc"}]})) == [[1, 3]])
+
 # /_end = a MARKER since 2026-06-11, not a delete: one-shot `claude -p` runs
 # fire SessionEnd the instant their answer lands; the debug state must survive.
 e = lp._end_session("sess-test-1", reason="clear")
