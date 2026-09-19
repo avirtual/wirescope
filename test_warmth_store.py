@@ -10,6 +10,7 @@ Covers exactly the cases the live A/B can't cheaply reach:
 
 Run: python3 test_warmth_store.py   (uses throwaway tmp dirs; no live ports)
 """
+import datetime
 import json
 import os
 import sqlite3
@@ -1760,9 +1761,15 @@ check("classifier side-call does NOT overwrite the seat's model (stays opus, not
       st_cls2["model"] == "claude-opus-5")
 check("report.is_classifier_pair reads the summary tag, falls back to the body shape",
       lp.report.is_classifier_pair({"summ": {"sidecall": "classifier"}}) is True
-      and lp.report.is_classifier_pair({"summ": {"sidecall": None}, "req": {"body": cls_req}}) is False
-      and lp.report.is_classifier_pair({"summ": {}, "req": {"body": cls_req}}) is True
-      and lp.report.is_classifier_pair({"summ": {}, "req": {"body": {"tools": [{"name": "Bash"}]}}}) is False)
+      and lp.report.is_classifier_pair({"summ": {"sidecall": None}, "body": cls_req}) is False
+      and lp.report.is_classifier_pair({"summ": {}, "body": cls_req}) is True
+      and lp.report.is_classifier_pair({"summ": {}, "body": {"tools": [{"name": "Bash"}]}}) is False)
+# A pair with NO body and NO path must not explode and must not read disk: these
+# two helpers are module surface and get called on hand-built dicts. (Regression:
+# the receipts-first pass moved the body behind _pair_body, which reads p["path"].)
+check("report pair helpers tolerate a pair with neither body nor path",
+      lp.report.is_classifier_pair({"summ": {}}) is False
+      and lp.report.is_keepwarm_pair({"summ": {}}) is False)
 
 # --- keep-warm ping detection + apart-pricing -----------------------------------
 # Both pingers replay the seat's full request (tools + system + history) at
@@ -3188,6 +3195,124 @@ _rcm = _rs["cost_decomposition"]["cache_misses"]
 check("/_report catches the overnight idle-gap miss across a restart (not hidden as eviction)",
       _rcm["count"] == 1 and _rcm["by_cause"].get("idle_gap_gt_ttl") == 1
       and _rcm["events"][0]["idle_gap_s"] == 6 * 3600 - 60)  # gap from last night turn
+
+# --- /_report receipts-first: the body is DEFERRED, and the tool tally comes
+# --- off each turn's own receipt/SSE rather than re-shipped history -----------
+# The tool tally: counted off meta.tool_uses (the ISSUING turn's receipt), NOT by
+# walking re-shipped history. This is the behaviour, so assert it on a session
+# whose history and receipts DISAGREE — a call whose tool_result never came back
+# (interrupted turn, or simply the last call of a session) exists on the receipt
+# and never enters any request body. The old history walk could not see it.
+_ta_dir = os.path.join(os.environ["LOG_DIR"], "sess-report-attr")
+os.makedirs(_ta_dir, exist_ok=True)
+
+
+def _ta_turn(seq, ts, tool_uses, messages, sse_cmds=()):
+    base = os.path.join(_ta_dir, f"{seq:03d}-a")
+    # `ts` as the ISO STRING the writer really emits: core._head_ts matches a
+    # quoted ts only, so a float-epoch fixture silently takes the full-parse
+    # fallback and cannot exercise the receipts-first path at all.
+    json.dump({"summary": {"role": "parent", "n_tools": 1, "agent_id": None,
+                           "model": "claude-opus-4-8"},
+               "ts": datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+               "body": {"tools": [{"name": "Bash"}], "messages": messages}},
+              open(base + ".request.json", "w"))
+    json.dump({"status_code": 200, "role": "parent", "model": "claude-opus-4-8",
+               "billing": {"billable": True, "model": "claude-opus-4-8",
+                           "tokens": {"input_tokens": 10, "output_tokens": 5},
+                           "est_usd": 0.001},
+               "meta": {"tool_uses": list(tool_uses), "text": "ok"}},
+              open(base + ".response.json", "w"))
+    # a minimal but REAL SSE: the tool input arrives as input_json_delta frames,
+    # which is the only place the command string exists on the issuing turn.
+    with open(base + ".response.sse", "w") as fh:
+        for i, cmd in enumerate(sse_cmds):
+            fh.write('data: ' + json.dumps({
+                "type": "content_block_start", "index": i,
+                "content_block": {"type": "tool_use", "id": f"t{seq}_{i}",
+                                  "name": "Bash", "input": {}}}) + "\n")
+            frag = json.dumps({"command": cmd})
+            fh.write('data: ' + json.dumps({
+                "type": "content_block_delta", "index": i,
+                "delta": {"type": "input_json_delta", "partial_json": frag}}) + "\n")
+            fh.write('data: ' + json.dumps({
+                "type": "content_block_stop", "index": i}) + "\n")
+
+
+_TA0 = 1_700_100_000.0
+# turn 1 issues a Bash; turn 2 carries its result in history and issues another;
+# turn 3 issues a FINAL Bash whose result never comes back (no turn 4).
+_ta_use1 = {"role": "assistant", "content": [
+    {"type": "tool_use", "id": "u1", "name": "Bash", "input": {"command": "grep x f"}}]}
+_ta_res1 = {"role": "user", "content": [
+    {"type": "tool_result", "tool_use_id": "u1", "content": "out"}]}
+_ta_turn(1, _TA0, ["Bash"], [{"role": "user", "content": "go"}],
+         sse_cmds=["grep x f"])
+_ta_turn(2, _TA0 + 30, ["Bash"], [{"role": "user", "content": "go"}, _ta_use1, _ta_res1],
+         sse_cmds=["grep y f"])
+# turn 3's command arrives `cd`-PREFIXED, the way the model emits it and the SSE
+# records it. It must still count as a grep: reading the raw first word files it
+# under `cd` and the hint silently loses it (1,628 such calls on one live
+# session). Mutation-proven — without a cd-prefixed fixture here, dropping the
+# unwrap entirely leaves every other check in this block green.
+_ta_turn(3, _TA0 + 60, ["Bash"],
+         [{"role": "user", "content": "go"}, _ta_use1, _ta_res1],
+         sse_cmds=["cd /tmp/proj && grep z f"])
+_ta_pairs = lp.report._iter_pairs("sess-report-attr")
+# A request record holds that turn's whole `messages` array (mean 347 KB on the
+# session that prompted this), so _iter_pairs must not parse one up front.
+check("/_report _iter_pairs leaves the request body unparsed (receipts-first)",
+      len(_ta_pairs) == 3
+      and all(p["body"] is None for p in _ta_pairs)
+      and all(p["path"] is not None for p in _ta_pairs))
+# ...and _pair_body materialises it on demand, memoising so a second ask is free.
+_pb = _ta_pairs[0]
+check("/_report _pair_body loads the body on demand and memoises it",
+      (lp.report._pair_body(_pb) or {}).get("messages") is not None
+      and _pb["body"] is not None and _pb["body"] is not False)
+# A record with NO body must memoise the MISS as False, not leave it None —
+# None is the "not looked yet" sentinel, so a bodiless record would otherwise be
+# re-read from disk on every ask. Correctness is identical either way, which is
+# exactly why this needs pinning: the regression is invisible except in wall time.
+_nb_dir = os.path.join(os.environ["LOG_DIR"], "sess-report-nobody")
+os.makedirs(_nb_dir, exist_ok=True)
+_nb_base = os.path.join(_nb_dir, "001-n")
+json.dump({"summary": {"role": "parent", "n_tools": 0, "agent_id": None},
+           "ts": "2026-01-01T00:00:00"},          # no "body" key at all
+          open(_nb_base + ".request.json", "w"))
+json.dump({"status_code": 200, "billing": {}}, open(_nb_base + ".response.json", "w"))
+_nb = lp.report._iter_pairs("sess-report-nobody")[0]
+check("/_report _pair_body memoises a MISS as False (never re-reads a bodiless record)",
+      lp.report._pair_body(_nb) is None and _nb["body"] is False
+      and lp.report._pair_body(_nb) is None)
+
+_ta_attr, _ta_hints = lp.report._tool_result_attribution(_ta_pairs)
+# 3 receipts, each with one Bash => 3. A history walk sees only u1 (the one whose
+# result was echoed back) => 1. Pinning 3 is what makes this receipts-first.
+check("/_report tool tally counts every ISSUED call, incl. one whose result never returned",
+      _ta_attr["main"]["Bash"]["calls"] == 3)
+check("/_report tool tally no longer carries the unread result_tokens field",
+      "result_tokens" not in _ta_attr["main"]["Bash"])
+# the cheaper-tool hint reads the command off the SSE (3 greps >= the 2 threshold)
+_ta_cheap = [h for h in _ta_hints if h[0] == "cheaper_tool"]
+check("/_report cheaper-tool hint reads the command off the response SSE",
+      _ta_cheap == [("cheaper_tool", "main", "grep", "Grep", 3)])
+
+# The SSE carries the command the MODEL emitted; the CLI strips a leading
+# `cd <root> &&` before writing history. Read raw, such a command's first word is
+# `cd` and the real verb is invisible — measured 1,628 grep/sed/ls/cat calls on
+# one live session. Unwrapping is what keeps the SSE reading comparable.
+check("/_report unwraps a leading `cd <dir> &&` so the real verb is the first word",
+      lp.report._unwrap_cd("cd /a/b && grep -rn x .") == "grep -rn x ."
+      and lp.report._unwrap_cd("cd /a && cd /b && sed -n 1,5p f") == "sed -n 1,5p f"
+      and lp.report._unwrap_cd("cd '/a b' && ls") == "ls"
+      and lp.report._unwrap_cd('cd "/a b" && ls') == "ls")
+# ...and does NOT eat a command that merely mentions cd, or a bare cd.
+check("/_report cd-unwrap leaves a non-prefix `cd` alone",
+      lp.report._unwrap_cd("grep -rn 'cd x' .") == "grep -rn 'cd x' ."
+      and lp.report._unwrap_cd("cd /a/b") == "cd /a/b"
+      and lp.report._unwrap_cd("cdto && ls") == "cdto && ls")
+
 check("/_identity exposes context_report capability + endpoint",
       lp._identity()["capabilities"].get("context_report") is True
       and lp._identity()["endpoints"].get("report") == "/_report")
