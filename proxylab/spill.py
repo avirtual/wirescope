@@ -131,6 +131,16 @@ class _SpillFilter:
     HOLD: a listed verb's head line was seen; the body accumulates until the
     `[agent:end]` line. On close we emit `<head>] @spill:<id>` — or, on any
     failure or overflow, the original bytes.
+
+    ⚠ THE EMITTED SHAPE IS STALE (2026-09-21). `<head> @spill:<id>` lands in the
+    model's OWN transcript, so every successful spill becomes a worked example, in
+    the model's own voice, of how to write a long intent body — and models copy it:
+    measured 19 fabricated pointers, 19/19 dangling, 18/19 reproducing this exact
+    shape, across two lead seats that were both holding a "never type it" rule.
+    clodex's tee (t1047) therefore emits a past-tense receipt carrying NO `[agent:`
+    head and NO pointer token; see SPILL.md §4b. This module is DARK everywhere, so
+    the stale shape harms nothing today — but ARMING it on a headless node without
+    switching to §4b would teach that defect to whatever seat it serves.
     """
 
     def __init__(self, agent):
