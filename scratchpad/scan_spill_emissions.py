@@ -69,6 +69,10 @@ SEAT_RE = re.compile(r"(\d+)-(.+?)-(parent|subagent|ext|unknown)-")
 #   t1052 strip+filler -> the editorial filler line, alone  (FILLER)
 #   t1055/t1056        -> back to `@spill:<id>` (POINTER), plus the Clodex-voiced
 #                         `[clodex] … filed at <path>` ack, now typeable (ACK)
+#   t1065              -> `@spill:` RETIRED from every agent-visible surface; the
+#                         stub becomes `<head> — 5.2 KB filed at <path>` (FILED).
+#                         The id survives only as the file basename, so the
+#                         dangling discriminator is a path stat, not a token.
 # Count all three under one class, and keep them separable so a MIGRATION is
 # visible as a shape rotation rather than hidden inside one total.
 RECEIPT = re.compile(r"\((?:I sent|Clodex: you sent)\b[^)]*?"
@@ -90,6 +94,29 @@ ACK = re.compile(r"\[clodex\][^\n]*?\bfiled at\b[^\n]*?/([0-9a-f]{16})\.md")
 # reply — is a stand-in whatever it resolves to.
 STANDIN_POS = re.compile(r"^\[agent:[^\]\n]*\][^\n]{0,160}?@spill:([0-9a-fA-F]{8,})\s*$",
                          re.M)
+
+# Fifth shape (t1065): same position rule, new vocabulary. With `@spill:` gone a
+# typed stand-in reads `[agent:dm x] … — 858 B filed at /…/<hex>.md`, which
+# STANDIN_POS cannot see. Anchor on the trailing `filed at <path>` instead, and
+# keep the size clause optional — the untitled and prose-tail variants word it
+# differently ("858 B filed at", "858 B of prose filed at") but all three end in
+# the path. Both id-bearing groups stay separable so a migration still shows up
+# as a shape rotation rather than a silent zero.
+FILED = re.compile(r"\bfiled at\b\s+(/[^\s)]+?/([0-9a-f]{16})\.md)")
+STANDIN_FILED = re.compile(
+    r"^\[agent:[^\]\n]*\][^\n]{0,160}?\bfiled at\b\s+/[^\s)]+?/([0-9a-f]{16})\.md\s*$",
+    re.M)
+
+
+def spill_id_resolves(h):
+    """True iff <h>.md exists under any seat's spill dir.
+
+    A path stat, per seat dir — never `ls dir/*/h.md &&`: an unmatched zsh glob
+    lists the cwd and exits 0, which reported RESOLVES for every hash once.
+    """
+    h = h.lower()
+    return any(os.path.isfile(os.path.join(d, h + ".md"))
+               for d in glob.glob(os.path.expanduser("~/.clodex/spill/*/")))
 
 # THE PER-SEAT TREATMENT GATE (added 2026-09-21).
 # A seat is only evidence about the fix if the fix was in the prompt it was served.
@@ -244,8 +271,20 @@ for p in files:
                 if m.group(2) not in real]
     acks = [m.group(1) for m in ACK.finditer(txt) if m.group(1) not in real]
     quoted += [m.group(1) for m in ACK.finditer(txt) if m.group(1) in real]
+    # t1065 shape. ACK already covers the Clodex-voiced `[clodex] … filed at`,
+    # so only count a FILED hit that ACK did not claim — else the rendering
+    # change would double every ack.
+    ack_ids = {m.group(1) for m in ACK.finditer(txt)}
+    positional_filed = set(STANDIN_FILED.findall(txt))
+    filed = [h for (_, h) in
+             ((m.group(1), m.group(2)) for m in FILED.finditer(txt))
+             if h not in ack_ids
+             and (not spill_id_resolves(h) or h in positional_filed)]
+    quoted += [m.group(2) for m in FILED.finditer(txt)
+               if m.group(2) not in ack_ids and spill_id_resolves(m.group(2))
+               and m.group(2) not in positional_filed]
     filler = txt.strip() == FILLER
-    if not (ptrs or receipts or acks or filler or quoted
+    if not (ptrs or receipts or acks or filed or filler or quoted
             or "@spill" in txt or FILLER in txt or "filed at" in txt):
         continue
     if mid in seen:
@@ -259,10 +298,11 @@ for p in files:
     rec = {"ts": dt.astimezone(), "agent": d.get("agent"), "model": d.get("model"),
            "session": d.get("session_id"), "mid": mid, "file": p,
            "served": served, "ptrs": ptrs, "quoted": quoted, "acks": acks,
-           "receipts": receipts, "filler": filler, "text": txt}
+           "receipts": receipts, "filler": filler, "filed": filed, "text": txt}
     rec["shapes"] = ([f"pointer:{h}" for h in ptrs]
                      + [f"receipt:{i}" for _, i in receipts]
                      + [f"ack:{i}" for i in acks]
+                     + [f"filed:{i}" for i in filed]
                      + (["filler"] if filler else []))
     (events if rec["shapes"] else mention_only).append(rec)
 
@@ -272,12 +312,14 @@ n_quoted = sum(len(e["quoted"]) for e in mention_only) + sum(len(e["quoted"]) fo
 n_recv = sum(len(e["receipts"]) for e in events)
 n_ack = sum(len(e["acks"]) for e in events)
 n_fill = sum(1 for e in events if e["filler"])
+n_filed = sum(len(e["filed"]) for e in events)
 
 arm = "  [--arm: TREATED seats only]" if ARM else ("  [--control: UNTREATED only]" if CTRL else "")
 print(f"WINDOW: last {WIN:g}h over {len(CAPTURE_ROOTS)} capture root(s){arm}")
 print(f"200-responses scanned: {n200} | responses mentioning a spill shape: {len(seen)}")
 print(f"STAND-IN EVENTS (a receipt-shape emitted in place of a body): {len(events)}")
 print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  ack:{n_ack}  filler:{n_fill}"
+      f"  filed:{n_filed}"
       f"   (id-carrying shapes: dangling, or standing where a body belongs)")
 print(f"RESOLVABLE ids quoted in prose: {n_quoted}  <- the seat discussing its own real receipt, NOT a fabrication")
 print(f"MENTION-ONLY responses (prose ABOUT a shape, no fabrication): {len(mention_only)}  <- NOT events")
