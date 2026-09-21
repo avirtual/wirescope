@@ -95,16 +95,21 @@ ACK = re.compile(r"\[clodex\][^\n]*?\bfiled at\b[^\n]*?/([0-9a-f]{16})\.md")
 STANDIN_POS = re.compile(r"^\[agent:[^\]\n]*\][^\n]{0,160}?@spill:([0-9a-fA-F]{8,})\s*$",
                          re.M)
 
-# Fifth shape (t1065): same position rule, new vocabulary. With `@spill:` gone a
-# typed stand-in reads `[agent:dm x] … — 858 B filed at /…/<hex>.md`, which
-# STANDIN_POS cannot see. Anchor on the trailing `filed at <path>` instead, and
-# keep the size clause optional — the untitled and prose-tail variants word it
-# differently ("858 B filed at", "858 B of prose filed at") but all three end in
-# the path. Both id-bearing groups stay separable so a migration still shows up
-# as a shape rotation rather than a silent zero.
-FILED = re.compile(r"\bfiled at\b\s+(/[^\s)]+?/([0-9a-f]{16})\.md)")
+# Fifth shape (t1065, merged 8c7e12db): same position rule, new vocabulary. With
+# `@spill:` gone a typed stand-in reads `[agent:dm x] … — 858 B filed at
+# /…/<hex>.md`, which STANDIN_POS cannot see. Anchor on `filed at <path>`.
+#
+# THE SIZE TOKEN IS PART OF THE GRAMMAR, NOT DECORATION. Merged shape is
+# `<head> [<title> — ]<size> filed at <abs path>`, and clodex is explicit that a
+# bare `filed at` is PROSE. My first cut made the size clause optional, which
+# would have scored every sentence like "the body was filed at /…/x.md" as an
+# emission — over-counting the arm with the fleet's own discussion, the same
+# trap #4 family that already fired twice today. Require the size token.
+SIZE = r"[\d.,]+ *(?:B|KB|MB)(?: +of +prose)?"
+FILED = re.compile(r"(" + SIZE + r") +filed at\s+(/[^\s)]+?/([0-9a-f]{16})\.md)")
 STANDIN_FILED = re.compile(
-    r"^\[agent:[^\]\n]*\][^\n]{0,160}?\bfiled at\b\s+/[^\s)]+?/([0-9a-f]{16})\.md\s*$",
+    r"^\[agent:[^\]\n]*\][^\n]{0,160}?" + SIZE +
+    r" +filed at\s+/[^\s)]+?/([0-9a-f]{16})\.md\s*$",
     re.M)
 
 
@@ -296,13 +301,24 @@ for p in files:
     # change would double every ack.
     ack_ids = {m.group(1) for m in ACK.finditer(txt)}
     positional_filed = set(STANDIN_FILED.findall(txt))
-    filed = [h for (_, h) in
-             ((m.group(1), m.group(2)) for m in FILED.finditer(txt))
+    # FILED groups: 1=size token, 2=path, 3=id. Same typography guard as the
+    # pointer: an id shown inside a code span, fence or indented block is being
+    # QUOTED (spec text, test pin), never emitted.
+    filed_hits = [(m.group(3), m) for m in FILED.finditer(txt)]
+    filed_quoted_span = set()
+    for h, m in filed_hits:
+        line = txt[txt.rfind("\n", 0, m.start()) + 1: m.start()]
+        before = txt[:m.start()]
+        if (before.count("`") % 2 == 1 or before.count("```") % 2 == 1
+                or line.startswith("    ") or line.startswith("\t")):
+            filed_quoted_span.add(h)
+    filed = [h for h, _ in filed_hits
              if h not in ack_ids
-             and (not spill_id_resolves(h) or h in positional_filed)]
-    quoted += [m.group(2) for m in FILED.finditer(txt)
-               if m.group(2) not in ack_ids and spill_id_resolves(m.group(2))
-               and m.group(2) not in positional_filed]
+             and (not spill_id_resolves(h) or h in positional_filed)
+             and not (h in filed_quoted_span and h not in positional_filed)]
+    quoted += [h for h, _ in filed_hits
+               if h not in ack_ids and h not in positional_filed
+               and (spill_id_resolves(h) or h in filed_quoted_span)]
     filler = txt.strip() == FILLER
     if not (ptrs or receipts or acks or filed or filler or quoted
             or "@spill" in txt or FILLER in txt or "filed at" in txt):
