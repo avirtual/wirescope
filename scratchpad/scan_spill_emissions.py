@@ -73,6 +73,11 @@ SEAT_RE = re.compile(r"(\d+)-(.+?)-(parent|subagent|ext|unknown)-")
 #                         stub becomes `<head> — 5.2 KB filed at <path>` (FILED).
 #                         The id survives only as the file basename, so the
 #                         dangling discriminator is a path stat, not a token.
+#   t1067              -> a stub-only assistant message BEHIND A SYSTEM ROW is no
+#                         longer dropped (`system -> user` is a 400) but kept as a
+#                         head-line PLACEHOLDER, `[agent:verb args] <title>` or a
+#                         bare `[agent]` (PLACEHOLDER). New rendering, reaches the
+#                         model, so it gets a row here BEFORE the arm is measured.
 # Count all three under one class, and keep them separable so a MIGRATION is
 # visible as a shape rotation rather than hidden inside one total.
 RECEIPT = re.compile(r"\((?:I sent|Clodex: you sent)\b[^)]*?"
@@ -111,6 +116,63 @@ STANDIN_FILED = re.compile(
     r"^\[agent:[^\]\n]*\][^\n]{0,160}?" + SIZE +
     r" +filed at\s+/[^\s)]+?/([0-9a-f]{16})\.md\s*$",
     re.M)
+
+# Sixth shape (t1067, merged f973c53a): the tee now arms on system-adjacent
+# requests too, and a stub-only assistant message sitting behind a `role:system`
+# row is kept as a HEAD-LINE PLACEHOLDER rather than dropped (dropping it would
+# leave `system -> user`, a 400). Shape, from wire/spill-cut.js:
+#   heads present -> the intent head lines, one per line, `[agent:verb args]`
+#                    optionally ` <title>` (placeholderOf/headOf)
+#   no head       -> the bare literal `[agent]` (PLACEHOLDER)
+# It reaches the model in history, so it is imitable, and imitation is exactly
+# the failure this scan counts.
+#
+# TWO DISCRIMINATORS, DIFFERENT STRENGTHS — keep them separate rather than
+# averaging them into one number:
+#   bare  : a line that is exactly `[agent]` is not a valid intent in any
+#           grammar, so nothing but the placeholder can legitimately produce it.
+#           Unfoolable.
+#   head  : a body-taking intent head line that is the LAST non-empty line of the
+#           response — i.e. a greedy body that was never written. Ambiguous by
+#           construction: it is indistinguishable from the model emitting a plain
+#           bodyless intent (which merely bounces). Counted, but tagged apart so
+#           a reader can drop it.
+#
+# THE VERB SET IS THE WHOLE PRECISION OF THE HEAD RULE — get it from the grammar,
+# not from "takes a body". First cut listed every body-taking verb and scored
+# 21 hits over 30h, 0 of them real: 20 were `[agent:remind …]`, whose body is
+# written INLINE on the head line by design (so a head line with no following
+# body is the normal, correct shape), and 1 was a kv-only `[agent:team role-set …]`,
+# which the grammar says takes no body at all. Both are legitimate traffic, and
+# the count would have opened the arm at 21 phantom emissions. Excluded here:
+#   remind              — body is inline on the head line
+#   team role-add/-set  — kv head line takes no body
+#   term, exec          — argument ends at its own line
+#   who/name/list/…     — no body in the grammar
+PLACEHOLDER_BARE = re.compile(r"^\[agent\]\s*$", re.M)
+BODY_VERBS = (r"dm|shout|memory remember|context (?:compact|clear|reload)|"
+              r"task (?:add|done|reject|respec|cancel|accept)|"
+              r"team (?:template-save|prompt-save)")
+PLACEHOLDER_HEAD = re.compile(
+    r"^\[agent:(?:" + BODY_VERBS + r")\b[^\]\n]*\][^\n]{0,200}\s*\Z", re.M)
+
+
+def placeholder_hits(txt):
+    """(bare, head) counts of t1067 placeholder renderings emitted by the model.
+
+    Typography guard, same as the pointer and filed shapes: a placeholder shown
+    inside a code span, a fence or an indented block is being QUOTED — and this
+    shape will be quoted a lot, since it is the thing the fleet is specifying.
+    """
+    def quoted(m):
+        before = txt[:m.start()]
+        line = txt[txt.rfind("\n", 0, m.start()) + 1: m.start()]
+        return (before.count("`") % 2 == 1 or before.count("```") % 2 == 1
+                or line.startswith("    ") or line.startswith("\t"))
+    bare = sum(1 for m in PLACEHOLDER_BARE.finditer(txt) if not quoted(m))
+    head = sum(1 for m in PLACEHOLDER_HEAD.finditer(txt.rstrip())
+               if not quoted(m))
+    return bare, head
 
 
 def spill_id_resolves(h):
@@ -320,7 +382,9 @@ for p in files:
                if h not in ack_ids and h not in positional_filed
                and (spill_id_resolves(h) or h in filed_quoted_span)]
     filler = txt.strip() == FILLER
+    ph_bare, ph_head = placeholder_hits(txt)
     if not (ptrs or receipts or acks or filed or filler or quoted
+            or ph_bare or ph_head
             or "@spill" in txt or FILLER in txt or "filed at" in txt):
         continue
     if mid in seen:
@@ -334,12 +398,15 @@ for p in files:
     rec = {"ts": dt.astimezone(), "agent": d.get("agent"), "model": d.get("model"),
            "session": d.get("session_id"), "mid": mid, "file": p,
            "served": served, "ptrs": ptrs, "quoted": quoted, "acks": acks,
-           "receipts": receipts, "filler": filler, "filed": filed, "text": txt}
+           "receipts": receipts, "filler": filler, "filed": filed,
+           "ph_bare": ph_bare, "ph_head": ph_head, "text": txt}
     rec["shapes"] = ([f"pointer:{h}" for h in ptrs]
                      + [f"receipt:{i}" for _, i in receipts]
                      + [f"ack:{i}" for i in acks]
                      + [f"filed:{i}" for i in filed]
-                     + (["filler"] if filler else []))
+                     + (["filler"] if filler else [])
+                     + ([f"placeholder-bare:{ph_bare}"] if ph_bare else [])
+                     + ([f"placeholder-head:{ph_head}"] if ph_head else []))
     (events if rec["shapes"] else mention_only).append(rec)
 
 events.sort(key=lambda r: r["ts"])
@@ -349,6 +416,8 @@ n_recv = sum(len(e["receipts"]) for e in events)
 n_ack = sum(len(e["acks"]) for e in events)
 n_fill = sum(1 for e in events if e["filler"])
 n_filed = sum(len(e["filed"]) for e in events)
+n_ph_bare = sum(e["ph_bare"] for e in events)
+n_ph_head = sum(e["ph_head"] for e in events)
 
 arm = "  [--arm: TREATED seats only]" if ARM else ("  [--control: UNTREATED only]" if CTRL else "")
 print(f"WINDOW: last {WIN:g}h over {len(CAPTURE_ROOTS)} capture root(s){arm}")
@@ -357,6 +426,9 @@ print(f"STAND-IN EVENTS (a receipt-shape emitted in place of a body): {len(event
 print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  ack:{n_ack}  filler:{n_fill}"
       f"  filed:{n_filed}"
       f"   (id-carrying shapes: dangling, or standing where a body belongs)")
+print(f"  t1067 placeholder — bare:{n_ph_bare} (a literal `[agent]`, unfoolable)"
+      f"  head-only:{n_ph_head} (a body-taking head line with no body; AMBIGUOUS"
+      f" — same class, but indistinguishable from a plain bodyless intent)")
 print(f"RESOLVABLE ids quoted in prose: {n_quoted}  <- the seat discussing its own real receipt, NOT a fabrication")
 print(f"MENTION-ONLY responses (prose ABOUT a shape, no fabrication): {len(mention_only)}  <- NOT events")
 print()
