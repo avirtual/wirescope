@@ -55,12 +55,29 @@ SEAT_RE = re.compile(r"(\d+)-(.+?)-(parent|subagent|ext|unknown)-")
 #   t1047 and earlier  -> `@spill:<hex>`                    (POINTER)
 #   t1047 receipt      -> `(I sent dm X — "…" in full, N B; …at <path>)`  (RECEIPT)
 #   t1052 strip+filler -> the editorial filler line, alone  (FILLER)
+#   t1055/t1056        -> back to `@spill:<id>` (POINTER), plus the Clodex-voiced
+#                         `[clodex] … filed at <path>` ack, now typeable (ACK)
 # Count all three under one class, and keep them separable so a MIGRATION is
 # visible as a shape rotation rather than hidden inside one total.
 RECEIPT = re.compile(r"\((?:I sent|Clodex: you sent)\b[^)]*?"
                      r"(?:in full, *[\d,]+ *B|delivered in full)[^)]*?"
                      r"(/[^\s)]+?/([0-9a-f]{16})\.md)", re.S)
 FILLER = "[Runtime note: action text omitted from retained history.]"
+# Fourth shape (t1055/t1056, 2026-09-21 15:17): the Clodex-voiced ACK, which rides
+# the next prompt in the USER role — so a seat typing it is claiming, in its own
+# voice, a filing only the harness can perform. Same dangling rule as the others.
+ACK = re.compile(r"\[clodex\][^\n]*?\bfiled at\b[^\n]*?/([0-9a-f]{16})\.md")
+
+# POSITION, for the one case the dangling rule cannot decide (t1055 onward).
+# On the RESPONSE side every pointer is model-typed by construction — the tee is
+# downstream — so dangling separates "invented an id" from "copied a real one",
+# NOT harness from model. That was harmless while the tee wrote no pointers; since
+# t1055 restored the pointer stand-in, a seat can copy a RESOLVABLE id out of its
+# own transcript and the dangling rule would file that as prose. So a pointer
+# standing where a body belongs — alone on an intent head line, or as the whole
+# reply — is a stand-in whatever it resolves to.
+STANDIN_POS = re.compile(r"^\[agent:[^\]\n]*\][^\n]{0,160}?@spill:([0-9a-fA-F]{8,})\s*$",
+                         re.M)
 
 # THE PER-SEAT TREATMENT GATE (added 2026-09-21).
 # A seat is only evidence about the fix if the fix was in the prompt it was served.
@@ -155,12 +172,20 @@ for p in files:
     # pointer: a model quoting its own real receipt id back in prose (both seats
     # did this while debugging the bug) names a file that EXISTS, and counting it
     # would have turned two explanations into two fabrications.
-    ptrs = [h for h in POINTER.findall(txt) if h.lower() not in real]
-    quoted = [h for h in POINTER.findall(txt) if h.lower() in real]
+    positional = set(STANDIN_POS.findall(txt))
+    if txt.strip().startswith("@spill:") and len(txt.strip().split()) == 1:
+        positional |= set(POINTER.findall(txt))
+    ptrs = [h for h in POINTER.findall(txt)
+            if h.lower() not in real or h in positional]
+    quoted = [h for h in POINTER.findall(txt)
+              if h.lower() in real and h not in positional]
     receipts = [(m.group(1), m.group(2)) for m in RECEIPT.finditer(txt)
                 if m.group(2) not in real]
+    acks = [m.group(1) for m in ACK.finditer(txt) if m.group(1) not in real]
+    quoted += [m.group(1) for m in ACK.finditer(txt) if m.group(1) in real]
     filler = txt.strip() == FILLER
-    if not (ptrs or receipts or filler or quoted or "@spill" in txt or FILLER in txt):
+    if not (ptrs or receipts or acks or filler or quoted
+            or "@spill" in txt or FILLER in txt or "filed at" in txt):
         continue
     if mid in seen:
         continue
@@ -172,10 +197,11 @@ for p in files:
     dt = email.utils.parsedate_to_datetime((d.get("response_headers") or {}).get("date"))
     rec = {"ts": dt.astimezone(), "agent": d.get("agent"), "model": d.get("model"),
            "session": d.get("session_id"), "mid": mid, "file": p,
-           "served": served, "ptrs": ptrs, "quoted": quoted,
+           "served": served, "ptrs": ptrs, "quoted": quoted, "acks": acks,
            "receipts": receipts, "filler": filler, "text": txt}
     rec["shapes"] = ([f"pointer:{h}" for h in ptrs]
                      + [f"receipt:{i}" for _, i in receipts]
+                     + [f"ack:{i}" for i in acks]
                      + (["filler"] if filler else []))
     (events if rec["shapes"] else mention_only).append(rec)
 
@@ -183,14 +209,15 @@ events.sort(key=lambda r: r["ts"])
 ptr_total = sum(len(e["ptrs"]) for e in events)
 n_quoted = sum(len(e["quoted"]) for e in mention_only) + sum(len(e["quoted"]) for e in events)
 n_recv = sum(len(e["receipts"]) for e in events)
+n_ack = sum(len(e["acks"]) for e in events)
 n_fill = sum(1 for e in events if e["filler"])
 
 arm = "  [--arm: TREATED seats only]" if ARM else ("  [--control: UNTREATED only]" if CTRL else "")
 print(f"WINDOW: last {WIN:g}h over {len(CAPTURE_ROOTS)} capture root(s){arm}")
 print(f"200-responses scanned: {n200} | responses mentioning a spill shape: {len(seen)}")
 print(f"STAND-IN EVENTS (a receipt-shape emitted in place of a body): {len(events)}")
-print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  filler:{n_fill}"
-      f"   (id-carrying shapes counted only when the id names NO file)")
+print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  ack:{n_ack}  filler:{n_fill}"
+      f"   (id-carrying shapes: dangling, or standing where a body belongs)")
 print(f"RESOLVABLE ids quoted in prose: {n_quoted}  <- the seat discussing its own real receipt, NOT a fabrication")
 print(f"MENTION-ONLY responses (prose ABOUT a shape, no fabrication): {len(mention_only)}  <- NOT events")
 print()
@@ -230,20 +257,23 @@ for a in sorted({e["agent"] for e in events},
     print(f"  {a:34s} model={sub[0]['model']:16s} events={len(sub):3d} "
           f"ptr={sum(len(e['ptrs']) for e in sub):3d} "
           f"receipt={sum(len(e['receipts']) for e in sub):3d} "
+          f"ack={sum(len(e['acks']) for e in sub):3d} "
           f"filler={sum(1 for e in sub if e['filler']):3d} "
           f"served={sv:10s} {sub[0]['ts']:%m-%d %H:%M} -> {sub[-1]['ts']:%m-%d %H:%M}")
 print()
 # Shape-by-hour, not events-by-hour: a fix that only removes ONE shape shows up
 # here as the count moving to the next column, which a single total would hide.
-print("BY HOUR (local; pointer / receipt / filler):")
-hr = collections.defaultdict(lambda: [0, 0, 0])
+print("BY HOUR (local; pointer / receipt / ack / filler):")
+hr = collections.defaultdict(lambda: [0, 0, 0, 0])
 for e in events:
     k = e["ts"].strftime("%m-%d %H")
     hr[k][0] += len(e["ptrs"])
     hr[k][1] += len(e["receipts"])
-    hr[k][2] += 1 if e["filler"] else 0
+    hr[k][2] += len(e["acks"])
+    hr[k][3] += 1 if e["filler"] else 0
 for k in sorted(hr):
-    print(f"  {k}:00   ptr={hr[k][0]:2d}  receipt={hr[k][1]:2d}  filler={hr[k][2]:2d}")
+    print(f"  {k}:00   ptr={hr[k][0]:2d}  receipt={hr[k][1]:2d}  "
+          f"ack={hr[k][2]:2d}  filler={hr[k][3]:2d}")
 print()
 print("ALL STAND-IN EVENTS:")
 for e in events:
