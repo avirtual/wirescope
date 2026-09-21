@@ -1,21 +1,31 @@
 #!/usr/bin/env python3
-"""Count MODEL-EMITTED intent-pointer tokens (`@spill:<hex>`) on the wire.
+"""Count MODEL-EMITTED receipt STAND-INS on the wire — a harness rendering typed
+by the model in place of the body it was supposed to write.
 
 WHY THIS WORKS (the whole method in one paragraph):
 the proxy captures the raw API response, which is UPSTREAM of clodex's spill tee.
-So a pointer token found in a `.response.json` `meta.text` was typed by the model,
+So a stand-in found in a `.response.json` `meta.text` was typed by the model,
 by construction — the tee's own rewrite can only ever appear later, in the
 `.request.json` history of a subsequent turn. No placement heuristic is needed.
 Measured 2026-09-21 over 12h: 20 distinct hashes in responses, 0 of them real files;
 78 in requests, 51 real. The two populations partition cleanly.
 
-Three traps this avoids (cf. CLAUDE.md, the 611-hits/0-firings lesson):
+COUNT THE CLASS, NOT THE SHAPE. This started as a pointer counter and was wrong
+for it: clodex shipped two rewrites in one morning, and the fabrication followed
+each into its new shape (pointer -> receipt sentence -> bare filler line). A scan
+pinned to yesterday's shape scores a MIGRATION as a cure — the 11:09 build read
+as 0/13 on pointers while two seats were fabricating fillers. See the shape table
+at RECEIPT/FILLER below; every new rendering the harness ships needs a row there
+BEFORE its arm is measured.
+
+Four traps this avoids (cf. CLAUDE.md, the 611-hits/0-firings lesson):
   1. apparatus matching itself  -> scan ONLY meta.text, never request bodies.
   2. re-shipped history inflating -> dedupe by meta.message_id, count per response.
-  3. harness vs model pointers  -> the response/request split above, plus a
+  3. harness vs model stand-ins -> the response/request split above, plus a
      resolvability cross-check against the spill dirs on disk.
-A bare `@spill` mention with NO hex is prose ABOUT the token (prompt drafts,
-retractions, "never type it" memories) and is reported separately, never counted.
+  4. the fleet DISCUSSING the bug -> an id that names a real file is the seat
+     quoting its own receipt, and the bare filler inside prose is a quote; only a
+     dangling id, or the filler as the WHOLE reply, is a fabrication.
 
 PER-SEAT TREATMENT GATE. After a prompt fix ships, the old and new wordings coexist
 on the wire until every pre-reload process exits — a running seat keeps its booted
@@ -37,6 +47,20 @@ SPILL_GLOB = os.path.expanduser("~/.clodex/spill/*/*.md")
 
 POINTER = re.compile(r"@spill:([0-9a-fA-F]{8,})")  # a concrete pointer
 SEAT_RE = re.compile(r"(\d+)-(.+?)-(parent|subagent|ext|unknown)-")
+
+# THE COUNTED THING IS "A STAND-IN INSTEAD OF A BODY", NOT ONE SHAPE OF IT.
+# (2026-09-21, after clodex pointed out the pointer count missed the filler.)
+# Each time the harness changed the rewrite, the fabrication followed it into the
+# new shape, so a scan pinned to the old shape reads the migration as a cure:
+#   t1047 and earlier  -> `@spill:<hex>`                    (POINTER)
+#   t1047 receipt      -> `(I sent dm X — "…" in full, N B; …at <path>)`  (RECEIPT)
+#   t1052 strip+filler -> the editorial filler line, alone  (FILLER)
+# Count all three under one class, and keep them separable so a MIGRATION is
+# visible as a shape rotation rather than hidden inside one total.
+RECEIPT = re.compile(r"\((?:I sent|Clodex: you sent)\b[^)]*?"
+                     r"(?:in full, *[\d,]+ *B|delivered in full)[^)]*?"
+                     r"(/[^\s)]+?/([0-9a-f]{16})\.md)", re.S)
+FILLER = "[Runtime note: action text omitted from retained history.]"
 
 # THE PER-SEAT TREATMENT GATE (added 2026-09-21).
 # A seat is only evidence about the fix if the fix was in the prompt it was served.
@@ -122,7 +146,21 @@ for p in files:
     if served:
         exposure[d.get("agent")][served] += 1
 
-    if "@spill" not in txt:
+    # Each shape needs its OWN discriminator against the fleet discussing it —
+    # the mention-only trap applies to all three, not just the pointer.
+    #   pointer : the 8+ hex group (a bare `@spill` is prose about the token)
+    #   receipt : the id in its path resolves to NO file (a real receipt's does)
+    #   filler  : it is the WHOLE reply (quoting it inside prose is discussion)
+    # Dangling is the discriminator for BOTH id-carrying shapes, not just the
+    # pointer: a model quoting its own real receipt id back in prose (both seats
+    # did this while debugging the bug) names a file that EXISTS, and counting it
+    # would have turned two explanations into two fabrications.
+    ptrs = [h for h in POINTER.findall(txt) if h.lower() not in real]
+    quoted = [h for h in POINTER.findall(txt) if h.lower() in real]
+    receipts = [(m.group(1), m.group(2)) for m in RECEIPT.finditer(txt)
+                if m.group(2) not in real]
+    filler = txt.strip() == FILLER
+    if not (ptrs or receipts or filler or quoted or "@spill" in txt or FILLER in txt):
         continue
     if mid in seen:
         continue
@@ -134,20 +172,27 @@ for p in files:
     dt = email.utils.parsedate_to_datetime((d.get("response_headers") or {}).get("date"))
     rec = {"ts": dt.astimezone(), "agent": d.get("agent"), "model": d.get("model"),
            "session": d.get("session_id"), "mid": mid, "file": p,
-           "served": served, "ptrs": POINTER.findall(txt), "text": txt}
-    (events if rec["ptrs"] else mention_only).append(rec)
+           "served": served, "ptrs": ptrs, "quoted": quoted,
+           "receipts": receipts, "filler": filler, "text": txt}
+    rec["shapes"] = ([f"pointer:{h}" for h in ptrs]
+                     + [f"receipt:{i}" for _, i in receipts]
+                     + (["filler"] if filler else []))
+    (events if rec["shapes"] else mention_only).append(rec)
 
 events.sort(key=lambda r: r["ts"])
 ptr_total = sum(len(e["ptrs"]) for e in events)
-dang = sum(1 for e in events for h in e["ptrs"] if h not in real)
-res = ptr_total - dang
+n_quoted = sum(len(e["quoted"]) for e in mention_only) + sum(len(e["quoted"]) for e in events)
+n_recv = sum(len(e["receipts"]) for e in events)
+n_fill = sum(1 for e in events if e["filler"])
 
 arm = "  [--arm: TREATED seats only]" if ARM else ("  [--control: UNTREATED only]" if CTRL else "")
 print(f"WINDOW: last {WIN:g}h over {len(CAPTURE_ROOTS)} capture root(s){arm}")
-print(f"200-responses scanned: {n200} | distinct responses containing '@spill': {len(seen)}")
-print(f"EMISSION EVENTS (response emitted >=1 concrete @spill:<hex>): {len(events)}")
-print(f"  pointer tokens in those: {ptr_total}   DANGLING: {dang}   RESOLVABLE: {res}")
-print(f"MENTION-ONLY responses (prose about the token, no hex): {len(mention_only)}  <- NOT emissions")
+print(f"200-responses scanned: {n200} | responses mentioning a spill shape: {len(seen)}")
+print(f"STAND-IN EVENTS (a receipt-shape emitted in place of a body): {len(events)}")
+print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  filler:{n_fill}"
+      f"   (id-carrying shapes counted only when the id names NO file)")
+print(f"RESOLVABLE ids quoted in prose: {n_quoted}  <- the seat discussing its own real receipt, NOT a fabrication")
+print(f"MENTION-ONLY responses (prose ABOUT a shape, no fabrication): {len(mention_only)}  <- NOT events")
 print()
 print("TREATMENT EXPOSURE (which grammar line each seat was SERVED, per request):")
 print("  a seat is evidence about the fix only for its NEW-line turns; the two")
@@ -176,32 +221,34 @@ if spills:
 else:
     print("  none — ANY emission count over this window is unnormalised, report it as such")
 print()
-print("BY AGENT (events / pointers / dangling):")
-by = collections.defaultdict(lambda: [0, 0, 0])
-for e in events:
-    a = e["agent"]
-    by[a][0] += 1
-    by[a][1] += len(e["ptrs"])
-    by[a][2] += sum(1 for h in e["ptrs"] if h not in real)
-for a, (ev, pt, dg) in sorted(by.items(), key=lambda kv: -kv[1][0]):
+print("BY AGENT (events, then the shape split):")
+for a in sorted({e["agent"] for e in events},
+                key=lambda a: -sum(1 for e in events if e["agent"] == a)):
     sub = [e for e in events if e["agent"] == a]
-    served = collections.Counter(e["served"] for e in sub)
-    sv = "/".join(f"{k or '?'}:{v}" for k, v in served.items())
-    print(f"  {a:34s} model={sub[0]['model']:16s} events={ev:3d} ptrs={pt:3d} "
-          f"dangling={dg:3d} served={sv:10s} {sub[0]['ts']:%m-%d %H:%M} -> {sub[-1]['ts']:%m-%d %H:%M}")
+    sv = "/".join(f"{k or '?'}:{v}" for k, v in
+                  collections.Counter(e["served"] for e in sub).items())
+    print(f"  {a:34s} model={sub[0]['model']:16s} events={len(sub):3d} "
+          f"ptr={sum(len(e['ptrs']) for e in sub):3d} "
+          f"receipt={sum(len(e['receipts']) for e in sub):3d} "
+          f"filler={sum(1 for e in sub if e['filler']):3d} "
+          f"served={sv:10s} {sub[0]['ts']:%m-%d %H:%M} -> {sub[-1]['ts']:%m-%d %H:%M}")
 print()
-print("BY HOUR (local, events / pointers):")
-hr = collections.defaultdict(lambda: [0, 0])
+# Shape-by-hour, not events-by-hour: a fix that only removes ONE shape shows up
+# here as the count moving to the next column, which a single total would hide.
+print("BY HOUR (local; pointer / receipt / filler):")
+hr = collections.defaultdict(lambda: [0, 0, 0])
 for e in events:
     k = e["ts"].strftime("%m-%d %H")
-    hr[k][0] += 1
-    hr[k][1] += len(e["ptrs"])
+    hr[k][0] += len(e["ptrs"])
+    hr[k][1] += len(e["receipts"])
+    hr[k][2] += 1 if e["filler"] else 0
 for k in sorted(hr):
-    print(f"  {k}:00   events={hr[k][0]:2d}  ptrs={hr[k][1]:2d}")
+    print(f"  {k}:00   ptr={hr[k][0]:2d}  receipt={hr[k][1]:2d}  filler={hr[k][2]:2d}")
 print()
-print("ALL EMISSION EVENTS:")
+print("ALL STAND-IN EVENTS:")
 for e in events:
-    print(f"  {e['ts']:%m-%d %H:%M:%S}  [{e['served'] or '?'}]  {e['agent']:34s} {','.join(e['ptrs'])}")
+    print(f"  {e['ts']:%m-%d %H:%M:%S}  [{e['served'] or '?'}]  {e['agent']:34s} "
+          f"{','.join(e['shapes'])}")
 
 if OUT:
     json.dump([{**e, "ts": e["ts"].isoformat()} for e in events],
