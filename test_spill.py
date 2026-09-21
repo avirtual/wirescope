@@ -31,7 +31,11 @@ os.environ["LOG_DIR"] = tempfile.mkdtemp(prefix="spilltest_logs_")
 os.environ["WARMTH_DB"] = os.path.join(
     tempfile.mkdtemp(prefix="spilltest_db_"), "warmth.sqlite")
 os.environ["WIRESCOPE_SPILL_DIR"] = tempfile.mkdtemp(prefix="spilltest_spill_")
-os.environ["WIRESCOPE_SPILL_VERBS"] = "task.add,task.respec,context.compact"
+# A FIXTURE vocabulary, deliberately not clodex's live list (which since t1061 is
+# task.add,task.respec,task.reject,task.done,shout,dm — SPILL.md §1). The module has
+# no default verb set by design, so the suite states its own and `dm` below is the
+# unlisted-verb case for THIS list, not a claim about any consumer's.
+os.environ["WIRESCOPE_SPILL_VERBS"] = "task.add,task.respec,task.done"
 # The grammar tokens are CONFIG, not code (CLAUDE.md: no app-specific protocol
 # parsing in the proxy). There is no default, so a consumer must state them.
 os.environ["WIRESCOPE_SPILL_OPEN"] = "[agent:"

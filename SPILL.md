@@ -82,12 +82,27 @@ passing two more env vars at launch, and the feature stays inert for anyone who
 does not.
 
 **Verb keys are DOTTED, never spaced** — `task.add`, not `task add`. A comma list
-containing spaces invites trim bugs on both sides. Initial scope ruling:
+containing spaces invites trim bugs on both sides. Current scope, matching clodex's
+tee as of t1061 (2026-09-21):
 
-    WIRESCOPE_SPILL_VERBS=task.add,task.respec,task.reject,context.compact,context.clear,context.reload
+    WIRESCOPE_SPILL_VERBS=task.add,task.respec,task.reject,task.done,shout,dm
 
 `memory.remember` needs no special case: it is excluded by not being in the list.
 An unlisted or unknown verb is never touched.
+
+**`context.compact` / `context.clear` / `context.reload` were in the initial scope
+ruling and were dropped in t1061** (Bogdan's ruling): the body of a compact or clear
+is discarded by the operation itself, so filing + stubbing + cutting it buys nothing
+on any later request. It is a pure-cost case, not a correctness one — the mechanism
+handles those verbs fine. Note the consequence for anyone MEASURING this: a long
+`[agent:context compact]` body now appears in full in assistant history exactly once,
+on the request that carries the compact call, and vanishes with the summary. That is
+correct behaviour, not an unspilled body.
+
+This list is the one place a verb set is written down for us: `SPILL_VERBS` in
+`spill.py` is read from the env and holds no default, deliberately (see the tokens
+ruling above) — so tracking a consumer's vocabulary change is a docs edit here, never
+a code edit there.
 
 ## 2. What counts as a body
 

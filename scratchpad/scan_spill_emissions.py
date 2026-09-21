@@ -233,6 +233,14 @@ print()
 # evidence of a fix, it is an empty denominator — the 2026-09-21 arm nearly got
 # read that way. A spill FILE is one long body that actually went out, so count
 # files by mtime in the same window and report the rate, never the bare count.
+#
+# The denominator therefore tracks the consumer's SPILL VERB SET, and it should:
+# a verb the tee stopped spilling produces no stand-in to fabricate, so it belongs
+# out of both sides of the rate. t1061 dropped context.compact/clear/reload — so
+# from 2026-09-21 a long `[agent:context compact]` body rides the wire in FULL,
+# once, on the request that carries the compact call, and is gone with the summary.
+# That is the tee working as specced; do NOT read it as an unspilled body, and do
+# not hand-add it to the denominator to "correct" for it.
 print("LONG BODIES ACTUALLY EMITTED in the window (spill files by mtime) — the DENOMINATOR:")
 spills = collections.Counter()
 for f in glob.glob(SPILL_GLOB):

@@ -132,15 +132,20 @@ class _SpillFilter:
     `[agent:end]` line. On close we emit `<head>] @spill:<id>` — or, on any
     failure or overflow, the original bytes.
 
-    ⚠ THE EMITTED SHAPE IS STALE (2026-09-21). `<head> @spill:<id>` lands in the
-    model's OWN transcript, so every successful spill becomes a worked example, in
-    the model's own voice, of how to write a long intent body — and models copy it:
-    measured 19 fabricated pointers, 19/19 dangling, 18/19 reproducing this exact
-    shape, across two lead seats that were both holding a "never type it" rule.
-    clodex's tee (t1047) therefore emits a past-tense receipt carrying NO `[agent:`
-    head and NO pointer token; see SPILL.md §4b. This module is DARK everywhere, so
-    the stale shape harms nothing today — but ARMING it on a headless node without
-    switching to §4b would teach that defect to whatever seat it serves.
+    ⚠ THE EMITTED SHAPE IS THE LIVE ONE AND IS ONLY HALF THE OBLIGATION (2026-09-21).
+    `<head> @spill:<id>` lands in the model's OWN transcript, so every successful
+    spill becomes a worked example, in the model's own voice, of how to write a long
+    intent body — and models copy it: measured 19 fabricated pointers, 19/19
+    dangling, 18/19 reproducing this exact shape, across two lead seats that were
+    both holding a "never type it" rule. clodex tried two harder-to-forge renderings
+    (t1047 receipt, t1052 filler) and seats forged both; the all-shapes recount is
+    41.9% / 12.5% / 40.0%, pooled Fisher p=0.31 — the behaviour MIGRATED, so do not
+    treat a rendering change as the cure. What fixed it was removing the line from
+    the REQUEST (clodex `wire/spill-cut.js`), not making it harder to copy.
+    This module is DARK everywhere, so nothing here harms anything today — but
+    ARMING it on a headless node, where there is no clodex tee, reproduces the 41.9%
+    configuration exactly unless the same node also cuts the stand-in line out of
+    every forwarded request. See SPILL.md's header for the pair and its wire cost.
     """
 
     def __init__(self, agent):
