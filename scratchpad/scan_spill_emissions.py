@@ -18,6 +18,16 @@ as 0/13 on pointers while two seats were fabricating fillers. See the shape tabl
 at RECEIPT/FILLER below; every new rendering the harness ships needs a row there
 BEFORE its arm is measured.
 
+ENUMERATE THE SINKS, NOT JUST THE CHANNEL. The wire is where a stand-in is CHEAP
+(clodex's `Not executed` bounces it, the turn is retried). The expensive sink is a
+DURABLE one, and this scan was blind to it until 2026-09-21 18:40: two of this
+seat's memory units have an ellipsis-plus-pointer as their whole body, saved
+22:21 the night before, both dangling and provably never filed (retention covers
+the window; neighbours survive either side). There the fabrication destroys the
+fact AT SAVE TIME and ships a half-sentence to every later session, framed with
+the confidence a memory unit carries. `--sinks` scans that store; add a sink here
+whenever the harness grows a new durable one.
+
 Four traps this avoids (cf. CLAUDE.md, the 611-hits/0-firings lesson):
   1. apparatus matching itself  -> scan ONLY meta.text, never request bodies.
   2. re-shipped history inflating -> dedupe by meta.message_id, count per response.
@@ -38,6 +48,8 @@ Usage:  scan_spill_emissions.py [window_hours] [--json OUT] [--arm | --control]
         --arm      count only TREATED turns (new receipt wording in the prompt)
         --control  count only UNTREATED turns (pre-fix wording)
         neither    count both; the per-event tag says which
+        --sinks    audit the DURABLE sinks instead of the wire (memory store);
+                   no window — a unit saved once is delivered forever
 """
 import json, os, re, glob, sys, time, collections, email.utils
 
@@ -101,6 +113,51 @@ CTRL = "--control" in sys.argv     # count only OLD-line (untreated) seats
 cutoff = time.time() - WIN * 3600
 real = set(os.path.basename(f)[:-3] for f in glob.glob(SPILL_GLOB))
 
+# --- the DURABLE sink -------------------------------------------------------
+MEMORY_ROOT = os.path.expanduser("~/.clodex/library/memory")
+# NOTE both globs: the per-seat dirs under library/memory are SYMLINKS into
+# ~/.clodex/sessions/<seat>/memory, so `glob` on `*/*.md` traverses them but
+# `grep -r` does NOT (it needs -R). A recursive search that silently returns
+# nothing looks exactly like a clean audit — this cost a wrong "no hits" once.
+MEMORY_GLOB = os.path.join(MEMORY_ROOT, "*", "*.md")
+
+
+def audit_sinks():
+    """A stand-in in a memory unit is strictly worse than one on the wire: the
+    wire bounces and retries, a unit is saved DESTROYED and then delivered to
+    every later session. A unit whose body ends in a pointer is a fabrication
+    whether or not the id resolves — the tee never spills a memory.remember, so
+    a real pointer cannot legitimately appear in one."""
+    bad = []
+    for f in sorted(glob.glob(MEMORY_GLOB)):
+        try:
+            txt = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        body = txt.split("\n---\n", 1)[-1].strip()
+        for m in POINTER.finditer(body):
+            h = m.group(1).lower()
+            # `[ -f ]` per candidate dir, never `ls dir/*/h.md &&`: an unmatched
+            # zsh glob lists the cwd and exits 0, which reported RESOLVES for
+            # every hash the first time this was checked by hand.
+            resolves = any(os.path.isfile(os.path.join(d, h + ".md"))
+                           for d in glob.glob(os.path.expanduser(
+                               "~/.clodex/spill/*/")))
+            bad.append((f, h, resolves, len(body.encode()), body[:90]))
+    print(f"DURABLE SINK: memory store ({MEMORY_ROOT})")
+    print(f"  units scanned: {len(glob.glob(MEMORY_GLOB))}")
+    if not bad:
+        print("  no pointer-bodied units — clean")
+        return
+    print(f"  {len(bad)} FABRICATED unit(s) — the fact was destroyed at save time:")
+    for f, h, res, n, head in bad:
+        seat = os.path.basename(os.path.dirname(f))
+        print(f"    {seat}/{os.path.basename(f)[:-3]}  {n:4d} B  "
+              f"@spill:{h} {'resolves(!)' if res else 'dangling'}")
+        print(f"      {head}…")
+    print("  ACTION: recover the fact from the handoff/changelog, re-save in full,"
+          " and forget the stub — its content is already gone.")
+
 
 def grammar_served(req_path):
     """Which spill grammar line was in the SYSTEM prompt of this request.
@@ -122,6 +179,10 @@ def grammar_served(req_path):
         return "OLD"
     return None
 
+
+if "--sinks" in sys.argv:
+    audit_sinks()
+    sys.exit(0)
 
 files = []
 for root in CAPTURE_ROOTS:
