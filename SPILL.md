@@ -4,30 +4,44 @@ Status: **built and shipped in v0.6.69 (`proxylab/spill.py`); DARK on every box 
 
 Read this before touching `spill.py` or before implementing a spill rewrite anywhere else — the format is the contract, and the second consumer of it already exists.
 
-> **⚠ THE TWO IMPLEMENTATIONS DIVERGED ON §4, 2026-09-21 — and the divergence is CORRECT.**
-> clodex's tee (their `wire/spill.js`, ticket t1047) no longer writes `<head> @spill:<id>` into
-> the transcript. It writes a past-tense receipt with **no pointer token and no `[agent:` head**:
-> `(Clodex: you sent dm clodex "title" — delivered in full, 1234 B; your text is kept at <path>)`.
+> **⚠ §4 IS SOUND AS A RENDERING AND INSUFFICIENT AS A DEFENCE — read this before "fixing" it.**
+> The stand-in rendering rotated three times on 2026-09-21 (t1047 receipt → t1052 strip+filler →
+> t1055/t1056) and landed **back on the §4 pointer shape**, so §4 again describes what clodex's tee
+> writes into a transcript. What changed is not the shape but where the defence lives: since
+> `635aee45` clodex runs a **request-side editor** (`wire/spill-cut.js`) that removes every stand-in
+> line — pointer, receipt, filler alike — from assistant messages in each OUTGOING request. The model
+> never sees the rendering at all, so the rendering no longer has to be hard to copy.
 >
-> **Why, measured on the wire (this repo, 12h window, 2026-09-21): the old §4 shape TAUGHT the
-> failure it was reporting.** The placeholder lands in the model's OWN transcript record, so every
-> successful spill became a worked example — in the model's own voice — of "this is how I write a
-> long body". Result: 17 emission events / 19 fabricated pointers, **19/19 dangling**, 18 of 19
-> reproducing the §4 shape ellipsis and all. Two lead seats, both holding a "never type it"
-> instruction, one of them this seat. A prohibition in prose cannot beat few-shot evidence in the
-> model's own voice; removing the reproducible token from BOTH the placeholder and the grammar line
-> is the fix. Baseline instrument + numbers: `scratchpad/scan_spill_emissions.py`, HANDOFF entry
-> 2026-09-21.
+> **The problem §4 was accused of is real; the rendering rewrite was NOT the cure, and the cure claim
+> is retracted.** The stand-in lands in the model's own transcript record, so every successful spill
+> becomes a worked example, in the model's own voice, of "this is how I write a long body" —
+> measured here over 12h: 17 emission events / 19 fabricated pointers, 19/19 dangling, 18 of 19
+> reproducing the §4 ellipsis and all, on two lead seats that both held a "never type it"
+> instruction. But an all-shapes recount across the three renderings says the behaviour **migrated
+> rather than stopped**: control 13 stand-ins / 31 long bodies (41.9%), t1047 arm 1/8 (12.5%), t1052
+> arm 2/5 (40.0%), one-sided Fisher pooled p = 0.31. Each shape was harder to forge than the last
+> and each was forged. **Do not record "removing the reproducible token is the fix" as a finding —
+> it is an untested hypothesis with a null measurement behind it** (numbers + method:
+> `scratchpad/scan_spill_emissions.py`, HANDOFF 2026-09-21 12:30). The durable half is the
+> measurement lesson: *count the class ("a harness rendering typed in place of a body"), never the
+> shape*, and give every new rendering a matcher BEFORE reading its arm, or a migration scores as a
+> cure.
 >
-> **Consequence for THIS file.** §4 below specifies a wire shape no live implementation now emits,
-> and `test_spill.py` asserts it. That is fine *as long as it is not mistaken for conformance*: our
-> module is dark, so nothing observes it, and the id/path/threshold/failure-policy halves (§2, §3,
-> §5) are unchanged and still shared. **If our module is ever ARMED on a headless node — the one
-> case reason #2 below exists for — it must emit the receipt shape, not §4**, or it will teach the
-> same defect to whatever seat it serves. Do not "re-align" clodex to §4; §4 is the stale half.
-> Generalizes the CLAUDE.md lesson one turn further: a vendored consumer can be current on the CODE
-> and stale on a TABLE it re-declared — and a SPEC can be the stale copy while both implementations
-> have moved on.
+> **Consequence for THIS file.** §4 below stands as both the spec and what `test_spill.py` asserts;
+> §4b records the t1047 receipt shape as history, not as the shape to implement. **But if our module
+> is ever ARMED on a headless node — the one case reason #2 below exists for — emitting §4 alone
+> reproduces exactly the configuration measured at 41.9%,** because there is no clodex tee out there
+> to cut the stand-in back out of the request. An armed headless node therefore owes the *pair*: the
+> §4 rendering for the operator and the transcript, plus removal of that line from every forwarded
+> request. One without the other is the defect.
+>
+> **Pricing that cut, if we ever build it** (measured off clodex's, 2026-09-21): removing lines from
+> assistant messages edits a CACHED PREFIX, so it costs one full cold write per seat on its first
+> post-deploy turn — **$4.07 across 3 live seats**, scaling with window size — then rides byte-stable
+> (15 consecutive requests, `changed_prefix_idx=[]`). The `[user, user]` adjacency it creates is
+> accepted; `[user, system, user]` 400s, so an assistant message preceded by a `role:"system"` one
+> must be left uncut. And per CLAUDE.md's rider-latch lesson, the cut must be UNCONDITIONAL: once it
+> is live, a window where it does not run is what originates the bust — two cold writes per flap.
 
 **Why it is dark, which is not the same as why it would be deleted.** clodex signed this format off, then moved the rewrite into its own in-process wire tee (`wire/proxy.js`), which sits between each seat and our `/agent/<name>` route and implements this document verbatim. Bogdan's ruling (2026-09-19) settled the ownership question on principle rather than on which implementation worked: *no clodex intent grammar is to live in wirescope*, which is the same ruling CLAUDE.md already recorded when `WB_INTENT_DISPATCH` was retired in 2026-06 — "No app-specific protocol parsing remains in the proxy." Our four `WIRESCOPE_SPILL_*` knobs therefore stay unset in every deployment, and clodex explicitly does not depend on this code.
 
@@ -126,29 +140,35 @@ point in the build:
 
 ## 4. What goes on the wire
 
-**STALE as of 2026-09-21 — see the warning at the top of this file. This section records
-what v0.6.69 emits and what `test_spill.py` asserts; it is NOT the shape to implement.**
+This is what v0.6.69 emits, what `test_spill.py` asserts, and — since `635aee45` (2026-09-21) —
+what clodex's tee writes again. **It is the whole of the rendering contract and only half of the
+obligation: see the warning at the top for the request-side cut that must accompany it.**
 
     [agent:task add t42 start] @spill:1f4e9c07a2b35d68
     [agent:end]
 
 The head line is preserved **byte-for-byte** including all modifiers; only the body
 is replaced, by the bare pointer after a single space. `[agent:end]` is re-emitted
-as-is.
+as-is. Tail prose past the threshold spills to a bare `@spill:<id>` on its own line.
 
-### 4b. The shape to implement (current)
+The id, the path and the write rules (§3) are unchanged by any rendering decision — the file is
+content-addressed and written before anything is emitted. The intent scanner must read the
+**unspilled** stream (clodex does this in `wire/proxy.js`), so the rendering is never load-bearing
+for dispatch: it is prose for the model and the operator, and nothing parses it back.
 
-Emit a past-tense receipt that contains **no `[agent:` opener and no `@spill:` token** — nothing
-a model can copy as a template for its own next intent. The head line is consumed, not preserved,
-and the terminator is swallowed with it:
+### 4b. The t1047 receipt shape — history, not the shape to implement
+
+For one day (t1047 → t1052) clodex's tee emitted a past-tense receipt instead, with no `[agent:`
+opener and no `@spill:` token — nothing a model could copy as a template:
 
     (Clodex: you sent task add "T-B scratch-rewind: session-manager begin/cancel/end" — delivered in full, 4859 B; your text is kept at /Users/bogdan/.clodex/spill/clodex/1f4e9c07a2b35d68.md)
 
-The id, the path and the write rules (§3) are unchanged — the file is still content-addressed and
-still written before anything is emitted. What changes is only the *transcript-visible* rendering,
-because that rendering is training data for the next turn. The intent scanner must therefore read
-the **unspilled** stream (clodex does this in `wire/proxy.js`), so the receipt is never
-load-bearing for dispatch: it is prose for the model and the operator, nothing parses it back.
+It was reverted in t1055/t1056 once the request-side cut made the rendering invisible to the model.
+Recorded here because **it did not work**: seats fabricated the receipt sentence — quoted prefix,
+byte count, absolute path, dangling id — as readily as they had fabricated the pointer, and the
+`[Runtime note: action text omitted from retained history.]` filler that followed it was typed as a
+whole reply twice within an hour. Reach for a harder-to-forge rendering only with that on the
+record.
 
 ## 5. Failure policy — never lose a spec
 
