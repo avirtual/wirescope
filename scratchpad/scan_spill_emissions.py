@@ -42,8 +42,12 @@ SEAT_RE = re.compile(r"(\d+)-(.+?)-(parent|subagent|ext|unknown)-")
 # A seat is only evidence about the fix if the fix was in the prompt it was served.
 # Read that off the wire per request, never from the host's git state: the old and
 # new prompts coexist for as long as any pre-reload process is still running.
+# The NEW wording has already been revised once in place (t1047's "a receipt is
+# something Clodex writes after delivery" -> t1053's "the confirmation is …"), so
+# match the shortest substring COMMON to every post-fix revision. Pinning the full
+# t1047 sentence would have silently re-labelled 119 treated requests as untreated.
 OLD_LINE = "Never type `@spill:` yourself"
-NEW_LINE = "a receipt is something Clodex writes after delivery"
+NEW_LINE = "is something Clodex writes after delivery"
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 WIN = float(args[0]) if args else 12.0
@@ -152,6 +156,25 @@ for a in sorted(exposure, key=lambda a: -sum(exposure[a].values())):
     c = exposure[a]
     tag = "TREATED" if c["NEW"] and not c["OLD"] else ("untreated" if c["OLD"] and not c["NEW"] else "MIXED")
     print(f"  {a:40s} NEW={c['NEW']:4d} OLD={c['OLD']:4d}  {tag}")
+print()
+# THE DENOMINATOR. Zero emissions from a seat that emitted no long bodies is not
+# evidence of a fix, it is an empty denominator — the 2026-09-21 arm nearly got
+# read that way. A spill FILE is one long body that actually went out, so count
+# files by mtime in the same window and report the rate, never the bare count.
+print("LONG BODIES ACTUALLY EMITTED in the window (spill files by mtime) — the DENOMINATOR:")
+spills = collections.Counter()
+for f in glob.glob(SPILL_GLOB):
+    try:
+        if os.path.getmtime(f) >= cutoff:
+            spills[os.path.basename(os.path.dirname(f))] += 1
+    except OSError:
+        pass
+if spills:
+    for s, n in spills.most_common():
+        print(f"  {s:40s} {n:4d}")
+    print(f"  {'TOTAL':40s} {sum(spills.values()):4d}")
+else:
+    print("  none — ANY emission count over this window is unnormalised, report it as such")
 print()
 print("BY AGENT (events / pointers / dangling):")
 by = collections.defaultdict(lambda: [0, 0, 0])
