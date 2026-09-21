@@ -263,10 +263,30 @@ for p in files:
     positional = set(STANDIN_POS.findall(txt))
     if txt.strip().startswith("@spill:") and len(txt.strip().split()) == 1:
         positional |= set(POINTER.findall(txt))
+    # Trap #4, second-order (2026-09-21 19:1x). The dangling rule assumed a
+    # dangling id could only have been invented. Once the fleet started FIXING
+    # this bug, the fabricated ids themselves became quotable: they now appear
+    # verbatim in tickets, test pins and postmortems, where they are dangling BY
+    # CONSTRUCTION (that is what makes them the example). All 3 "events" in the
+    # first 6h run were this — two seats writing t1065's spec, quoting the two
+    # memory-unit stubs and a literal `0123456789abcdef` test fixture.
+    # Discriminator is TYPOGRAPHY, not resolvability: an id inside a code span,
+    # a fence or an indented block is being SHOWN, never emitted. Cheap to check
+    # and it cannot be fooled by the id resolving or not.
+    quoted_span = set()
+    for m in POINTER.finditer(txt):
+        line = txt[txt.rfind("\n", 0, m.start()) + 1: m.start()]
+        before, after = txt[:m.start()], txt[m.end():]
+        in_span = before.count("`") % 2 == 1           # open backtick span
+        in_fence = before.count("```") % 2 == 1        # inside a fence
+        indented = line.startswith("    ") or line.startswith("\t")
+        if in_span or in_fence or indented:
+            quoted_span.add(m.group(1))
     ptrs = [h for h in POINTER.findall(txt)
-            if h.lower() not in real or h in positional]
+            if (h.lower() not in real or h in positional)
+            and not (h in quoted_span and h not in positional)]
     quoted = [h for h in POINTER.findall(txt)
-              if h.lower() in real and h not in positional]
+              if (h.lower() in real or h in quoted_span) and h not in positional]
     receipts = [(m.group(1), m.group(2)) for m in RECEIPT.finditer(txt)
                 if m.group(2) not in real]
     acks = [m.group(1) for m in ACK.finditer(txt) if m.group(1) not in real]
