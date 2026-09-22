@@ -5,6 +5,15 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.71 — 2026-09-22 — Opus 5.5 priced (`claude-opus-5-5`: $4/$20, cache read 0.05x)
+
+A price-table release. Rows read off platform.claude.com (pricing table + models overview) on 2026-09-22, not inferred.
+
+- **`claude-opus-5-5` in `PRICES`:** $4 in / $20 out per MTok, 5m write $5, 1h write $8, **cache read $0.20 = 0.05x base** — the second model after fable/mythos-5.1 (0.025x) to leave the universal 0.1x read multiplier. `claude-opus-5` IS a prefix of `claude-opus-5-5` (the fable-5 / 5.1 trap again), so without its own row 5.5 traffic priced at opus-5's $5/$25/$0.50 — 1.25x over on in/out, 2.5x over on reads — and, being a present-but-wrong rate, never warned.
+- **`claude-opus-5-5` in `PRICES_SPEED_FAST`:** fast mode is $8/$40 published; the cache columns ($10/$16 writes, $0.40 read) are derived from the documented "caching multipliers stack on fast pricing" rule with 5.5's own read multiplier, and the row comment says so — verify against a fast-mode receipt when one lands.
+- Tests assert every column of both rows and that opus-5's rows are untouched (asserting the row's presence would pass on a copy of opus-5's). The billing header no longer claims reads are 0.10x of input; the read rate is a per-row fact.
+- **Consumers that re-declare the table** (clodex `wire/billing.js`) need the same two rows; the proxy still exposes no `/_prices` to assert against (open item, CLAUDE.md fifth failure mode).
+
 ## v0.6.70 — 2026-09-22 — Muse Code (Meta) provider: the codex wire with a provider switch, live-verified on a subscription account
 
 A provider release. Meta's `muse` CLI (1.3.0) speaks the OpenAI Responses API, so the model call rides `_handle_openai` with `provider="meta"` (upstream, price table, session header, capture tag) — one handler generalized, not a third copy. Route: `--base-url http://127.0.0.1:<port>/agent/<seat>/meta`. Capture + pricing + subscriber feed only; no warmth/pinger/hold/transforms on this wire (server-side cache, no TTL, `cached_tokens` is the only warmth signal; `/_ping` declines with `skipped:"openai_wire"`). Everything below was read off the wire, first with a local stub fronting the real binary, then against Meta's endpoint on 2026-09-22.
