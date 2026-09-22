@@ -161,6 +161,16 @@ STANDIN_FILED = re.compile(
 #                         mechanisms, one hit; both closed here (verb dropped,
 #                         head rule reads the SSE when the receipt is at cap).
 PLACEHOLDER_BARE = re.compile(r"^\[agent\]\s*$", re.M)
+# t1087 (5c2b80c6, 2026-09-22 ~19:06): the no-head placeholder is no longer the
+# bare `[agent]` but ONE prose line. Keyed on the EXACT bytes clodex dm'd (sha256
+# d7d077a9…f963), never a paraphrase: a paraphrase would match the fleet
+# discussing the rendering, the exact line only matches an imitation of it. BARE
+# stays for histories cut before the swap; the swap time is a placeholder-CLASS
+# boundary only (receipt-shape arm unaffected).
+PLACEHOLDER_PROSE_BYTES = ("(This turn's text was delivered in full; "
+                           "Clodex keeps it out of the request.)")
+PLACEHOLDER_PROSE = re.compile(
+    r"^" + re.escape(PLACEHOLDER_PROSE_BYTES) + r"\s*$", re.M)
 BODY_VERBS = (r"dm|shout|memory remember|"
               r"task (?:add|done|reject|respec|cancel|accept)|"
               r"team (?:template-save|prompt-save)")
@@ -169,7 +179,10 @@ PLACEHOLDER_HEAD = re.compile(
 
 
 def placeholder_hits(txt):
-    """(bare, head) counts of t1067 placeholder renderings emitted by the model.
+    """(bare, prose, head) counts of placeholder renderings emitted by the model.
+
+    bare  = the t1067 literal `[agent]`; prose = the t1087 one-liner. Both are
+    the no-head class, split so a reader can see which rendering was imitated.
 
     Typography guard, same as the pointer and filed shapes: a placeholder shown
     inside a code span, a fence or an indented block is being QUOTED — and this
@@ -181,9 +194,18 @@ def placeholder_hits(txt):
         return (before.count("`") % 2 == 1 or before.count("```") % 2 == 1
                 or line.startswith("    ") or line.startswith("\t"))
     bare = sum(1 for m in PLACEHOLDER_BARE.finditer(txt) if not quoted(m))
+    # The prose line is what the fleet SPECIFIES, so it gets pasted bare inside
+    # dm bodies (first hit, 19:06:22, was t1087's own hand dm'ing me the bytes —
+    # trap #4). An imitation is an EMPTY reply: the line as the whole response,
+    # or on top of it with nothing but intents after. A response that also
+    # talks about the rendering is discussion.
+    discussing = re.search(r"placeholder|spill-cut", txt, re.I) is not None
+    prose = sum(1 for m in PLACEHOLDER_PROSE.finditer(txt)
+                if not quoted(m) and (txt.strip() == PLACEHOLDER_PROSE_BYTES
+                                      or not discussing))
     head = sum(1 for m in PLACEHOLDER_HEAD.finditer(txt.rstrip())
                if not quoted(m))
-    return bare, head
+    return bare, prose, head
 
 
 def sse_text(path):
@@ -412,7 +434,7 @@ for p in files:
                if h not in ack_ids and h not in positional_filed
                and (spill_id_resolves(h) or h in filed_quoted_span)]
     filler = txt.strip() == FILLER
-    ph_bare, ph_head = placeholder_hits(txt)
+    ph_bare, ph_prose, ph_head = placeholder_hits(txt)
     if ph_head and len(txt) >= 3900:
         # The head rule keys on the LAST line; a receipt text truncated at its
         # cap has an artificial last line. Re-read the full text off the SSE.
@@ -420,9 +442,9 @@ for p in files:
         if os.path.exists(sse):
             full = sse_text(sse)
             if full:
-                ph_head = placeholder_hits(full)[1]
+                ph_head = placeholder_hits(full)[2]
     if not (ptrs or receipts or acks or filed or filler or quoted
-            or ph_bare or ph_head
+            or ph_bare or ph_prose or ph_head
             or "@spill" in txt or FILLER in txt or "filed at" in txt):
         continue
     if mid in seen:
@@ -437,13 +459,15 @@ for p in files:
            "session": d.get("session_id"), "mid": mid, "file": p,
            "served": served, "ptrs": ptrs, "quoted": quoted, "acks": acks,
            "receipts": receipts, "filler": filler, "filed": filed,
-           "ph_bare": ph_bare, "ph_head": ph_head, "text": txt}
+           "ph_bare": ph_bare, "ph_prose": ph_prose, "ph_head": ph_head,
+           "text": txt}
     rec["shapes"] = ([f"pointer:{h}" for h in ptrs]
                      + [f"receipt:{i}" for _, i in receipts]
                      + [f"ack:{i}" for i in acks]
                      + [f"filed:{i}" for i in filed]
                      + (["filler"] if filler else [])
                      + ([f"placeholder-bare:{ph_bare}"] if ph_bare else [])
+                     + ([f"placeholder-prose:{ph_prose}"] if ph_prose else [])
                      + ([f"placeholder-head:{ph_head}"] if ph_head else []))
     (events if rec["shapes"] else mention_only).append(rec)
 
@@ -455,6 +479,7 @@ n_ack = sum(len(e["acks"]) for e in events)
 n_fill = sum(1 for e in events if e["filler"])
 n_filed = sum(len(e["filed"]) for e in events)
 n_ph_bare = sum(e["ph_bare"] for e in events)
+n_ph_prose = sum(e["ph_prose"] for e in events)
 n_ph_head = sum(e["ph_head"] for e in events)
 
 arm = "  [--arm: TREATED seats only]" if ARM else ("  [--control: UNTREATED only]" if CTRL else "")
@@ -464,7 +489,8 @@ print(f"STAND-IN EVENTS (a receipt-shape emitted in place of a body): {len(event
 print(f"  by shape — pointer:{ptr_total}  receipt:{n_recv}  ack:{n_ack}  filler:{n_fill}"
       f"  filed:{n_filed}"
       f"   (id-carrying shapes: dangling, or standing where a body belongs)")
-print(f"  t1067 placeholder — bare:{n_ph_bare} (a literal `[agent]`, unfoolable)"
+print(f"  placeholder — bare:{n_ph_bare} (t1067 literal `[agent]`, unfoolable)"
+      f"  prose:{n_ph_prose} (t1087 one-liner, exact bytes)"
       f"  head-only:{n_ph_head} (a body-taking head line with no body; AMBIGUOUS"
       f" — same class, but indistinguishable from a plain bodyless intent)")
 print(f"RESOLVABLE ids quoted in prose: {n_quoted}  <- the seat discussing its own real receipt, NOT a fabrication")
