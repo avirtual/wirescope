@@ -499,6 +499,30 @@ for e in events:
     print(f"  {e['ts']:%m-%d %H:%M:%S}  [{e['served'] or '?'}]  {e['agent']:34s} "
           f"{','.join(e['shapes'])}")
 
+# The near-misses are the part of this scan that CANNOT be automated: every
+# reading so far has been 0 events and N mention-only, and the only way that
+# zero stays honest is hand-reading what the discriminators threw out. `--near`
+# dumps each one with the matching line in context so a reading takes a minute
+# instead of a grep session over the capture dirs.
+if "--near" in sys.argv:
+    print()
+    print(f"MENTION-ONLY RESPONSES ({len(mention_only)}) — hand-read these; a "
+          f"mislabelled one is a missed event:")
+    for e in sorted(mention_only, key=lambda r: r["ts"]):
+        t = e["text"]
+        hits = []
+        for pat in ("@spill", "filed at", FILLER[:24]):
+            i = t.find(pat)
+            while i != -1 and len(hits) < 3:
+                line = t[t.rfind("\n", 0, i) + 1:
+                         (t.find("\n", i) if t.find("\n", i) != -1 else len(t))]
+                hits.append(line.strip()[:160])
+                i = t.find(pat, i + 1)
+        print(f"\n  {e['ts']:%m-%d %H:%M:%S}  [{e['served'] or '?'}]  "
+              f"{e['agent']}  {len(t)} ch  {os.path.basename(e['file'])}")
+        for h in dict.fromkeys(hits):
+            print(f"      | {h}")
+
 if OUT:
     json.dump([{**e, "ts": e["ts"].isoformat()} for e in events],
               open(OUT, "w"), indent=1)
