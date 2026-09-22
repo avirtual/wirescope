@@ -149,6 +149,14 @@ Installing the rest is `client/install.sh` + `client/settings.example.json`; not
 depends on it (everything fails soft — proxy down ⇒ statusline renders `cache ∅`,
 hooks exit 0).
 
+### Muse (Meta) seats
+
+No client files ship for muse; the whole integration is the route (`INTEGRATION.md` Step 2).
+Per-seat settings live under `$XDG_CONFIG_HOME/muse/settings.json`, so a fleet gives each seat its own config dir the way it gives claude seats a `CLAUDE_CONFIG_DIR`.
+Launch env: `UPSTREAM_META` (default `https://api.meta.ai/v1`; the `/muse-code/*` product passthrough goes to its scheme+host, override with `UPSTREAM_META_ORIGIN`).
+Learned prices persist in `LOG_DIR/_meta_catalog.json` and reload at boot.
+A stub-driven end-to-end run of the real binary is in `test_muse.py`'s docstring lineage (the capture fixtures under `fixtures/muse/` came from `muse exec --provider meta --base-url http://127.0.0.1:<port>/agent/probe` against a local stub); the live A/B against Meta's real endpoint is still pending a subscription — see HANDOFF.
+
 ## Test suites (gate every release)
 
 `release.sh` runs **every `test_*.py` in the repo root** (glob, since 2026-07-19 — a new suite is gated the day it lands; before that an explicit six-suite list had silently omitted test_bake/test_pot).

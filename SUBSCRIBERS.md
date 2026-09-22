@@ -66,6 +66,7 @@ each session with:
 
     ANTHROPIC_BASE_URL=http://127.0.0.1:7800/agent/<name>/anthropic   # claude
     # codex: model provider base_url http://127.0.0.1:7800/agent/<name>/openai
+    # muse:  --base-url http://127.0.0.1:7800/agent/<name>/meta (INTEGRATION.md Step 2)
 
 Plain traffic (no `/agent/` prefix) is never pushed to anyone, regardless of
 subscription patterns. The agent name is your addressing scheme — pick a
@@ -148,7 +149,7 @@ shape for anthropic and openai sessions. Deltas are coalesced (~300ms
 flushes), not per-token.
 
     "data": {
-      "provider": "anthropic",        // or "openai"
+      "provider": "anthropic",        // or "openai" (codex) / "meta" (muse)
       "text": "…chunk of assistant text…",
       "offset": 1234                  // char offset of this chunk in the turn's text
     }
@@ -242,11 +243,15 @@ same tokens at OpenAI API list rates so codex and anthropic carriage are
 comparable in one ledger):
 
     "data": {
-      "provider": "openai",
+      "provider": "openai",                 // "meta" for a muse session: same shape,
+                                            // priced off the catalog-learned table
       "model": "gpt-5.1-codex",
       "status_code": 200,
       "response_id": "resp_…",
       "status": "completed",                // openai response status; their stop signal
+      "sidecall": null,                     // muse only: "goal-reminder" / "skill-reminder" /
+                                            // "verify-reminder" = a CLI observer call filed
+                                            // under the parent session — drop from transcripts
       "text": "…full assistant text…",
       "usage": {                            // openai axes (input INCLUDES cached)
         "input_tokens": 9000, "cached_tokens": 8700,
