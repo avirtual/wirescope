@@ -519,6 +519,10 @@ check("session row present", row is not None)
 if row:
     check("muse session never pingable / never awaiting auth",
           not row.get("pingable") and not row.get("awaiting_auth"))
+    check("/_status row says which wire the session speaks (wire=meta)",
+          row.get("wire") == "meta", row.get("wire"))
+    check("warmth block structurally absent on this wire (server-side cache, no TTL)",
+          (row.get("warmth") or {}).get("state") == "absent", row.get("warmth"))
     check("cwd learned from the developer message (Workspace root)",
           (row.get("cwd") or "").endswith("/echo-ws"), row.get("cwd"))
     # the row title is the wirescope agent label when one is routed (here
@@ -526,6 +530,26 @@ if row:
     check("title = agent label or first user prompt",
           row.get("title") in ("[probe]",) or (row.get("title") or "").endswith("say hi"),
           row.get("title"))
+# /_admin files a server-side-cached session by RECENCY, not by the (absent)
+# warmth row: a muse seat that turned seconds ago sat under "cold / expired"
+# (Bogdan, 2026-09-22). Active in the last hour -> the warm table.
+from proxylab import views as views_mod  # noqa: E402
+snap = status_mod._status_snapshot()
+page = views_mod._render_admin_html(snap)
+warm_part = page.split("cold / expired")[0]
+check("/_admin: the recently-active muse session renders in the WARM table",
+      f"session={SID}" in warm_part and "server · active" in warm_part)
+aged = json.loads(json.dumps(snap))
+for s_ in aged["sessions"]:
+    if s_["session_id"] == SID:
+        s_["last_seen"] = time.time() - 2 * 3600
+page = views_mod._render_admin_html(aged)
+check("/_admin: the same session idle 2h renders in the COLD table as server · idle",
+      f"session={SID}" not in page.split("cold / expired")[0]
+      and "server · idle" in page.split("cold / expired")[1])
+check("anthropic rows keep the warmth-state split (wire=anthropic default)",
+      not views_mod._server_cached({"warmth": {"state": "cold"}})
+      and views_mod._server_cached({"wire": "openai"}))
 ctx = c.get(f"/_context?session={SID}").json()
 main = next((a for a in ctx.get("agents") or [] if a.get("line") == "main"), None)
 check("/_context main line present", main is not None, ctx.get("note"))

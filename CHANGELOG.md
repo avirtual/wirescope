@@ -14,6 +14,12 @@ Three display/classification defects found on the first live muse seat inside cl
 - **`/_context` `composition` for the Responses-API wire** (`status._composition_openai`; was `null` for codex and muse). Same output shape and char→tok divisors, that wire's vocabulary: `system` (= `instructions`), `developer` (codex's permissions block / muse's workspace framing), `user`, `assistant`, `reasoning` (the encrypted items re-shipped every turn, counted at shipped length), `tool_calls`, `tool_results`, `tools`. Receipt-scaled on the main line as before. INTEGRATION.md's `/_context` row no longer promises `composition:null` there.
 - `test_muse.py` 106 → 137 checks across the three (assertions on the captured bodies' BEHAVIOUR: the idle call leaves `_LAST_REQUEST` and the 29-function roster intact, is not a turn, lands in its own bucket; the string dialect renders both roles and two turn headers; the composition categories and receipt scaling). SUBSCRIBERS.md / INTEGRATION.md / CLAUDE.md name the new `sidecall` values.
 
+## v0.6.73 — 2026-09-22 — /_admin: codex and muse sessions are placed by recency, not by a warmth row they can never have
+
+- **Server-side-cached wires file under "warm cache" while active in the last hour.** The Responses-API wires (codex, muse) cache upstream with no TTL, so no warmth row ever exists for them and the state-split admin page put every such session under "cold / expired" seconds after a turn (Bogdan, on the first live muse seat). `/_admin` now treats recency as the state for those rows: `last_seen` within `_SERVER_CACHE_ACTIVE_S` (3600 s, an operator horizon, not a cache claim) → the warm table, with the time-left cell reading `☁️ server · active` / `server · idle` and a tooltip saying why; anthropic rows are untouched. `?by=recent` was already recency-ordered and is unchanged.
+- **`/_status` session rows gain `wire`** (`anthropic` | `openai` | `meta`, off the last request's provider) so a consumer can key liveness on `last_seen` for the two wires whose `warmth.state` is structurally `absent`. INTEGRATION.md documents both.
+- `test_muse.py` +6 (row `wire`, absent warmth, warm placement while active, cold placement at 2h idle, anthropic split untouched).
+
 ## v0.6.71 — 2026-09-22 — Opus 5.5 priced (`claude-opus-5-5`: $4/$20, cache read 0.05x)
 
 A price-table release. Rows read off platform.claude.com (pricing table + models overview) on 2026-09-22, not inferred.
