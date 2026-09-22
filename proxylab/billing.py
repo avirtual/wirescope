@@ -427,9 +427,9 @@ def _billing_openai(model_resolved, usage, provider="openai"):
     if provider == "meta":
         from proxylab import muse as muse_mod     # lazy: muse imports core only
         table, table_name = muse_mod.PRICES_META, "PRICES_META"
-        basis = ("USD/1M off the /muse-code/models catalog (published list "
-                 "price until the first catalog capture); a Meta plan seat is "
-                 "API-equivalent, never dollar-billed")
+        basis = ("published Muse Spark list price USD/1M (the live catalog "
+                 "carries no cost rows); a Meta plan seat is API-equivalent, "
+                 "never dollar-billed; edit muse.PRICES_META")
     else:
         table, table_name = PRICES_OPENAI, "PRICES_OPENAI"
         basis = ("API-equivalent USD/1M (chatgpt-plan traffic is never "

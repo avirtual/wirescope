@@ -447,7 +447,7 @@ def emit_turn_completed_anthropic(agent, session_id, request_id, *, meta, bill,
 def emit_turn_completed_openai(agent, session_id, request_id, *, meta,
                                status_code, text, bill=None,
                                session_totals=None, provider="openai",
-                               sidecall=None):
+                               sidecall=None, subscription=None):
     subs = _match(agent, "turn.completed")
     if not subs:
         return 0
@@ -480,7 +480,12 @@ def emit_turn_completed_openai(agent, session_id, request_id, *, meta,
                       "unpriced": bool(bill.get("unpriced"))}
                      if bill else None),
             "session_totals": totals, "context": None,
-            "warmth": None}
+            "warmth": None,
+            # muse only: the plan quota the stream itself reported
+            # ({tier, weekly:{resets_at,used_percent}, window:{resets_at,
+            # used_percent,window_duration_mins}, at}); account-scoped like
+            # the anthropic `quota`, null on codex
+            "subscription": subscription}
     return dispatch("turn.completed", agent, session_id, request_id, data,
                     subs=subs)
 

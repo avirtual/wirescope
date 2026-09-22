@@ -123,9 +123,10 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts,
         pass
     model = (obj or {}).get("model")
     # codex carries session identity in HEADERS (plus prompt_cache_key in-body)
-    sidecall = None
+    sidecall = parent_prefix = None
     if meta_wire:
-        session_id, sidecall = muse_mod._session_identity(request.headers, obj)
+        session_id, sidecall, parent_prefix = muse_mod._session_identity(
+            request.headers, obj)
         if sidecall:
             stats["sidecalls"] += 1
     else:
@@ -170,7 +171,11 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts,
                                    model=model, provider=provider)
     elif raw:
         record["body_raw"] = body_bytes.decode("utf-8", "replace")[:4000]
-    writer_mod._enqueue_json(out_dir / f"{stem}.request.json", record)
+    # an orphan side-call (parent main call not seen YET — it fires before
+    # the main call of the same prompt) files its request capture at receipt
+    # time, once the parent has had the stream's duration to show up
+    if parent_prefix is None:
+        writer_mod._enqueue_json(out_dir / f"{stem}.request.json", record)
 
     # ---- /v1/models stub (chatgpt backend has no platform model list) ----
     if chatgpt_mode and base_path.rstrip("/").endswith("/models"):
@@ -221,15 +226,24 @@ async def _handle_openai(request: Request, n, raw, agent, upstream_path, ts,
             if sub_tee is not None:
                 sub_tee.close()
             await up.aclose()
+            sid, skey, odir = session_id, session_key, out_dir
+            if parent_prefix is not None:
+                parent = muse_mod._resolve_parent(parent_prefix)
+                if parent:
+                    sid, skey, odir = parent, parent, core_mod._session_dir(parent)
+                    record["summary"]["session_id"] = parent
+                    record["summary"]["deferred_parent"] = True
+                    stats["sidecalls_deferred"] += 1
+                writer_mod._enqueue_json(odir / f"{stem}.request.json", record)
             if is_model_call and chunks:
                 blob = b"".join(chunks)
-                writer_mod._enqueue_bytes(out_dir / f"{stem}.response.sse", blob)
+                writer_mod._enqueue_bytes(odir / f"{stem}.response.sse", blob)
                 # everything derived from the finished response — billing,
                 # view state, capture, subscriber receipt — lives in receipts
                 receipts_mod.openai(
                     blob, n=n, ts=ts, agent=agent, model=model,
-                    session_id=session_id, session_key=session_key,
-                    out_dir=out_dir, stem=stem, status_code=up.status_code,
+                    session_id=sid, session_key=skey,
+                    out_dir=odir, stem=stem, status_code=up.status_code,
                     resp_headers=dict(up.headers),
                     tee_text=(sub_tee.text if sub_tee is not None else None),
                     provider=provider, sidecall=sidecall)
@@ -271,10 +285,10 @@ async def _handle_meta_product(request: Request, n, raw, ts):
         except Exception:
             rec["body_raw"] = body.decode("utf-8", "replace")[:4000]
         if up.status_code < 400:
-            rec["prices_learned"] = muse_mod.learn_catalog(rec.get("body"))
+            rec["catalog_learned"] = muse_mod.learn_catalog(rec.get("body"))
         writer_mod._enqueue_json(out_dir / f"{n:03d}-ext-muse-catalog-{ts}.response.json", rec)
         print(f"[muse] #{n} catalog -> {up.status_code} "
-              f"prices_learned={rec.get('prices_learned', 0)}", flush=True)
+              f"learned={rec.get('catalog_learned')}", flush=True)
     resp_headers = {k: v for k, v in up.headers.items()
                     if k.lower() not in {"connection", "transfer-encoding",
                                          "content-length", "keep-alive",

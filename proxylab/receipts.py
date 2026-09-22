@@ -231,6 +231,8 @@ def openai(blob, *, n, ts, agent, model, session_id, session_key,
         stats["errors"] += 1
     bill = billing_mod._billing_openai(meta.get("resolved_model") or model, u,
                                        provider=provider)
+    subscription = (muse_mod._subscription_usage(blob) if provider == "meta"
+                    else None)
     if session_id and not sidecall:
         _stash_view_state(
             session_id, text=meta.get("text"),
@@ -250,6 +252,7 @@ def openai(blob, *, n, ts, agent, model, session_id, session_key,
          "model": model, "session_id": session_id,
          "endpoint": "responses", "status_code": status_code,
          **({"sidecall": sidecall} if sidecall else {}),
+         **({"subscription": subscription} if subscription else {}),
          "response_headers": core_mod._safe_headers(resp_headers),
          "billing": bill, "cumulative": cum,
          "usage": u, "meta": meta})
@@ -259,7 +262,7 @@ def openai(blob, *, n, ts, agent, model, session_id, session_key,
         text=(tee_text if tee_text is not None else meta.get("text")),
         bill=bill,
         session_totals=billing_mod._SESSION_TOTALS.get(session_key),
-        provider=provider, sidecall=sidecall)
+        provider=provider, sidecall=sidecall, subscription=subscription)
     print(f"[{'muse' if provider == 'meta' else 'codex'}] #{n} {agent} "
           f"{meta.get('resolved_model') or model} "
           f"{'sidecall=' + sidecall + ' ' if sidecall else ''}"
