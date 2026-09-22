@@ -496,6 +496,11 @@ check("/_session renders turn headers for the string dialect", 'id="turn-1"' in 
 html = views_mod._render_session_openai_body({"obj": BODY, "ts": time.time()})
 check("/_session renders the conversation fixture's developer + user strings",
       "Workspace root" in html and "say hi" in html)
+# the namespace wrapper is ONE tools[] entry holding 29 functions: the page
+# counts and lists the functions (what the model can call), notes the wrapper
+check("/_session counts the UNWRAPPED functions, not the one namespace wrapper",
+      "tools <b>29</b>" in html and "tools · 29 · in 1 namespace wrapper" in html
+      and "<b>edit_file</b>" in html and "<b>muse</b>" not in html)
 comp = status_mod._composition(TIP)
 cc = {x["category"]: x["tokens"] for x in (comp or {}).get("by_category") or []}
 check("_composition_openai on the tip-picker body: user/assistant/reasoning/tool_calls/tool_results, no tools/system",

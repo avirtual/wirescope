@@ -5,6 +5,11 @@ Convention: add the new version's entry at the top of the release-history sectio
 One entry per tag; a line per meaningful change; measurements inline where they justify the change.
 Deep rationale lives in the module docstrings and INTEGRATION.md / SUBSCRIBERS.md / WIRESCOPE.md — this file is the "what changed when" index.
 
+## v0.6.74 — 2026-09-23 — /_session: a muse session lists its 29 functions, not one `muse` tool
+
+- **The namespace wrapper was counted as the roster.** Muse ships its tools as ONE `type:"namespace"` entry named `muse` holding the callable functions, so the Responses-API `/_session` page read `tools · 1 · ≈13.2k tok` with a single `muse` row, while `/_context` (which already unwraps via `muse._flatten_namespace_tools`) listed 33 — Bogdan's report on session 01a0cb11. The page now counts and lists the unwrapped functions (what the model can call, biggest-first, per-function schema size), notes `in 1 namespace wrapper`, and still sizes the token figure on the wrapper as shipped. Codex's flat list passes through the same helper untouched. The capture summary already carried both numbers (`n_tools:1`, `n_functions:29`) and is unchanged.
+- `test_muse.py` +1 (fixture body renders 29 functions, the wrapper note, `edit_file` as a row, no `muse` row).
+
 ## v0.6.72 — 2026-09-22 — Muse: the TUI's idle side-calls leave the main line, string content renders, and /_context gets a Responses-API composition
 
 Three display/classification defects found on the first live muse seat inside clodex (session 01a0ca63, 133 captures, 2026-09-22), each fixed against the captured bytes.
