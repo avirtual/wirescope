@@ -538,6 +538,29 @@ check("sonnet-5 stays $2/$10 after the withdrawn 2026-09-01 repricing",
                     now=time.mktime(time.strptime("2027-01-01", "%Y-%m-%d")))["in"] == 2.0)
 check("legacy opus-4-1 keeps $15 rates",
       lp._price_for("claude-opus-4-1-20250805")["in"] == 15.0)
+# opus-5.5 (2026-09-22): $4/$20 with a 0.05x read ($0.20). "claude-opus-5" is a
+# prefix of "claude-opus-5-5" — the fable-5/5.1 trap again — so a missing row
+# prices 5.5 at opus-5's rates (1.25x in/out, 2.5x on reads) with no unpriced
+# warning. Assert every column, not the row's presence.
+check("opus-5.5 priced $4/$20, writes 5/8, read 0.05x ($0.20) — not opus-5's row",
+      lp._price_for("claude-opus-5-5") == {"in": 4.0, "out": 20.0,
+                                           "cache_write_5m": 5.0,
+                                           "cache_write_1h": 8.0,
+                                           "cache_read": 0.20})
+check("opus-5.5 dated id does not fall back to opus-5",
+      lp._price_for("claude-opus-5-5-20260922")["cache_read"] == 0.20)
+check("opus-5 itself is untouched by the 5.5 row",
+      lp._price_for("claude-opus-5")["in"] == 5.0
+      and lp._price_for("claude-opus-5")["cache_read"] == 0.50)
+# fast mode: opus-5.5 fast is $8/$40 with its own 0.05x read stacked on the fast
+# base; opus-5 fast stays $10/$50/$1.00. The response's usage.speed drives it.
+check("opus-5.5 fast row: $8/$40, read $0.40, writes 10/16",
+      lp._price_for("claude-opus-5-5", speed="fast") == {
+          "in": 8.0, "out": 40.0, "cache_write_5m": 10.0,
+          "cache_write_1h": 16.0, "cache_read": 0.40})
+check("opus-5 fast row unchanged ($10/$50) and standard speed ignores the fast table",
+      lp._price_for("claude-opus-5", speed="fast")["in"] == 10.0
+      and lp._price_for("claude-opus-5-5", speed="standard")["in"] == 4.0)
 check("unknown model -> None (not a silent default)",
       lp._price_for("claude-zonnet-9") is None)
 
