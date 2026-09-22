@@ -149,8 +149,19 @@ STANDIN_FILED = re.compile(
 #   team role-add/-set  — kv head line takes no body
 #   term, exec          — argument ends at its own line
 #   who/name/list/…     — no body in the grammar
+#   context compact/clear/reload — the handoff text is OPTIONAL and may be
+#                         written on the head line itself ("on the same or
+#                         following lines"), so a bare or inline head is the
+#                         normal shape. Included at first; the one head-only
+#                         hit of the +18.7h reading (2026-09-22 15:15) was a
+#                         `[agent:context compact] <inline handoff>` line —
+#                         and it only became the LAST line because the
+#                         receipt's `meta.text` is capped (~4,000 ch) and the
+#                         cut fell inside that line. Two false-positive
+#                         mechanisms, one hit; both closed here (verb dropped,
+#                         head rule reads the SSE when the receipt is at cap).
 PLACEHOLDER_BARE = re.compile(r"^\[agent\]\s*$", re.M)
-BODY_VERBS = (r"dm|shout|memory remember|context (?:compact|clear|reload)|"
+BODY_VERBS = (r"dm|shout|memory remember|"
               r"task (?:add|done|reject|respec|cancel|accept)|"
               r"team (?:template-save|prompt-save)")
 PLACEHOLDER_HEAD = re.compile(
@@ -173,6 +184,25 @@ def placeholder_hits(txt):
     head = sum(1 for m in PLACEHOLDER_HEAD.finditer(txt.rstrip())
                if not quoted(m))
     return bare, head
+
+
+def sse_text(path):
+    """The response text reassembled from a captured .response.sse (uncapped)."""
+    out = []
+    try:
+        raw = open(path, "rb").read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in raw.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            d = json.loads(line[5:].strip())
+        except Exception:
+            continue
+        if d.get("type") == "content_block_delta" and (d.get("delta") or {}).get("type") == "text_delta":
+            out.append(d["delta"]["text"])
+    return "".join(out)
 
 
 def spill_id_resolves(h):
@@ -383,6 +413,14 @@ for p in files:
                and (spill_id_resolves(h) or h in filed_quoted_span)]
     filler = txt.strip() == FILLER
     ph_bare, ph_head = placeholder_hits(txt)
+    if ph_head and len(txt) >= 3900:
+        # The head rule keys on the LAST line; a receipt text truncated at its
+        # cap has an artificial last line. Re-read the full text off the SSE.
+        sse = p[:-len(".response.json")] + ".response.sse"
+        if os.path.exists(sse):
+            full = sse_text(sse)
+            if full:
+                ph_head = placeholder_hits(full)[1]
     if not (ptrs or receipts or acks or filed or filler or quoted
             or ph_bare or ph_head
             or "@spill" in txt or FILLER in txt or "filed at" in txt):
