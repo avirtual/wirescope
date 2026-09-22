@@ -251,7 +251,9 @@ comparable in one ledger):
       "status": "completed",                // openai response status; their stop signal
       "sidecall": null,                     // muse only: "goal-reminder" / "skill-reminder" /
                                             // "verify-reminder" = a CLI observer call filed
-                                            // under the parent session — drop from transcripts
+                                            // under the parent session; "tip-picker" /
+                                            // "away-recap" / "idle" = the TUI's idle calls on
+                                            // the session's own key — drop all from transcripts
       "text": "…full assistant text…",
       "usage": {                            // openai axes (input INCLUDES cached)
         "input_tokens": 9000, "cached_tokens": 8700,

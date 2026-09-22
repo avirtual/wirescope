@@ -392,6 +392,116 @@ check("orphan side-call still priced apart",
 check("orphan's request capture still written (under its own id)",
       len(list((Path(LOG_DIR) / "caf21793-87b4-417c-998f-9415f56d612c").glob("*.request.json"))) == 1)
 
+# ---- 4b. the TUI's IDLE side-calls ride the MAIN key ---------------------------
+# Live 2026-09-22 (session 01a0ca63, 133 captures): after every turn the TUI
+# sends a "tip-picker" call and, when the user returns, an "away-recap" call —
+# both under `tbh:main:<session>` + the session's own x-tbh-session-id, so the
+# key vocabulary cannot separate them. They were the main line: the idle body
+# became the session's last request (/_context tools:null whenever idle),
+# counted as a turn, and priced under main_est_usd. Fixtures are those
+# captures (seq 084 / 113) byte-for-byte, re-keyed to this test's session.
+print("[idle side-calls]")
+from proxylab import pinger as pinger_mod  # noqa: E402
+
+
+def _idle_fixture(name):
+    fx = json.loads((FIX / f"{name}.request.json").read_text())
+    body = fx["body"]
+    body["prompt_cache_key"] = f"tbh:main:{SID}"
+    hdrs = dict(HDRS)
+    hdrs["x-tbh-session-id"] = SID
+    hdrs["x-meta-ai-gateway-session-id"] = SID
+    return body, hdrs
+
+
+TIP, tip_hdrs = _idle_fixture("tip-picker")
+AWAY, _ = _idle_fixture("away-recap")
+check("fixture shape: main key, no tools, no instructions, last item a user message",
+      "tools" not in TIP and "instructions" not in TIP
+      and TIP["input"][-1].get("role") == "user")
+check("_idle_sidecall_kind: tip-picker off the captured opener",
+      muse_mod._idle_sidecall_kind(TIP) == "tip-picker")
+check("_idle_sidecall_kind: away-recap off the captured opener",
+      muse_mod._idle_sidecall_kind(AWAY) == "away-recap")
+check("_idle_sidecall_kind: the conversation body (tools + instructions) is NOT idle",
+      muse_mod._idle_sidecall_kind(BODY) is None)
+check("_idle_sidecall_kind: an unlisted prompt of the idle SHAPE files as `idle`",
+      muse_mod._idle_sidecall_kind({"input": [{"type": "message", "role": "user",
+                                              "content": "Summarize this session."}]}) == "idle")
+check("_idle_sidecall_kind: a tool-less body whose last item is a tool output is NOT idle",
+      muse_mod._idle_sidecall_kind({"input": [{"type": "function_call_output", "output": "x"}]}) is None)
+check("_session_identity: tip-picker = side-call on the session ITSELF (no prefix hop)",
+      muse_mod._session_identity(tip_hdrs, TIP) == (SID, "tip-picker", None))
+check("_session_identity: conversation body still main", muse_mod._session_identity(HDRS, BODY) == (SID, None, None))
+before = dict(billing_mod._SESSION_TOTALS.get(SID) or {})
+last_before = (pinger_mod._LAST_REQUEST.get(SID) or {}).get("obj")
+ENVELOPES.clear()
+r = c.post("/agent/probe/meta/responses", content=json.dumps(TIP).encode(), headers=tip_hdrs)
+check("tip-picker forwarded (200)", r.status_code == 200, r.status_code)
+r = c.post("/agent/probe/meta/responses", content=json.dumps(AWAY).encode(), headers=tip_hdrs)
+check("away-recap forwarded (200)", r.status_code == 200, r.status_code)
+flush()
+tot = billing_mod._SESSION_TOTALS.get(SID) or {}
+check("both filed under the session (requests +2)", tot.get("requests") == before.get("requests", 0) + 2,
+      (before.get("requests"), tot.get("requests")))
+check("neither is a turn", tot.get("turns") == before.get("turns"), (before.get("turns"), tot.get("turns")))
+check("priced apart under sidecalls.tip-picker / sidecalls.away-recap",
+      ((tot.get("sidecalls") or {}).get("tip-picker") or {}).get("requests") == 1
+      and ((tot.get("sidecalls") or {}).get("away-recap") or {}).get("requests") == 1,
+      sorted((tot.get("sidecalls") or {}).keys()))
+check("main line's own share unchanged (main_est_usd / by_line.main)",
+      (tot.get("by_line") or {}).get("main", {}).get("requests")
+      == (before.get("by_line") or {}).get("main", {}).get("requests"),
+      ((before.get("by_line") or {}).get("main"), (tot.get("by_line") or {}).get("main")))
+last_after = (pinger_mod._LAST_REQUEST.get(SID) or {}).get("obj")
+check("the idle body did NOT become the session's last request (tools still on it)",
+      last_after is last_before and bool((last_after or {}).get("tools")),
+      ("tools" in (last_after or {}), (last_after or {}).get("prompt_cache_key")))
+ctx = c.get(f"/_context?session={SID}").json()
+m = next((a for a in ctx.get("agents") or [] if a.get("line") == "main"), None)
+check("/_context after an idle call still shows the conversation's 29-function roster",
+      m is not None and (m.get("tools") or {}).get("count") == 29, (m or {}).get("tools"))
+turns = [e for e in ENVELOPES if e["event"] == "turn.completed"]
+check("turn.completed carries sidecall=tip-picker / away-recap",
+      sorted(e["data"].get("sidecall") for e in turns) == ["away-recap", "tip-picker"],
+      [e["data"].get("sidecall") for e in turns])
+idle_reqs = [json.loads(p.read_text()) for p in sess_dir.glob("*-probe-muse-*.request.json")]
+check("request captures tagged sidecall=tip-picker / away-recap",
+      {q["summary"].get("sidecall") for q in idle_reqs} >= {"tip-picker", "away-recap"})
+idle_resps = [json.loads(p.read_text()) for p in sess_dir.glob("*-probe-muse-*.response.json")]
+check("receipts tagged", {q.get("sidecall") for q in idle_resps} >= {"tip-picker", "away-recap"})
+
+# ---- 4c. bare-string content renders + counts as turns (views, codex predicate) ---
+# muse ships `content` as a bare string on every user/assistant item; codex as
+# [{type,text}] blocks. The /_session view and the turn predicate iterated the
+# list form only, so a muse session rendered no user/assistant text and 0 turns.
+print("[string content]")
+from proxylab import codex as codex_mod  # noqa: E402
+from proxylab import views as views_mod  # noqa: E402
+check("_is_prompt_item_openai counts a bare-string user item as a turn",
+      codex_mod._is_prompt_item_openai({"type": "message", "role": "user", "content": "hi"}))
+check("… and still the codex block dialect", codex_mod._is_prompt_item_openai(
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}))
+check("… machine context (<…>) is not a turn in either dialect",
+      not codex_mod._is_prompt_item_openai({"type": "message", "role": "user", "content": "<environment_context>x"})
+      and not codex_mod._is_prompt_item_openai({"type": "message", "role": "user",
+                                                "content": [{"type": "input_text", "text": " <permissions>"}]}))
+check("tip-picker capture: 2 prompt turns counted (the real prompt + the idle prompt)",
+      sum(1 for it in TIP["input"] if codex_mod._is_prompt_item_openai(it)) == 2)
+html = views_mod._render_session_openai_body({"obj": TIP, "ts": time.time()})
+check("/_session renders the bare-string USER text",
+      "does that file allow disabling some of the internal tools?" in html)
+check("/_session renders the bare-string ASSISTANT text", "Checked active settings" in html)
+check("/_session renders turn headers for the string dialect", 'id="turn-1"' in html and 'id="turn-2"' in html)
+html = views_mod._render_session_openai_body({"obj": BODY, "ts": time.time()})
+check("/_session renders the conversation fixture's developer + user strings",
+      "Workspace root" in html and "say hi" in html)
+comp = status_mod._composition(TIP)
+cc = {x["category"]: x["tokens"] for x in (comp or {}).get("by_category") or []}
+check("_composition_openai on the tip-picker body: user/assistant/reasoning/tool_calls/tool_results, no tools/system",
+      set(cc) == {"user", "assistant", "reasoning", "tool_calls", "tool_results"}, sorted(cc))
+check("_composition_openai basis estimate without a receipt", (comp or {}).get("basis") == "estimate")
+
 # ---- 5. /_identity, /_status, /_context ---------------------------------------
 print("[endpoints]")
 ident = c.get("/_identity").json()
@@ -399,7 +509,7 @@ check("capabilities.muse advertised", ident["capabilities"].get("muse") is True)
 check("capabilities.codex still advertised", ident["capabilities"].get("codex") is True)
 st = c.get("/_status").json()
 check("/_status proxy.upstream_meta", st["proxy"].get("upstream_meta") == os.environ["UPSTREAM_META"])
-check("/_status proxy.muse stats", (st["proxy"].get("muse") or {}).get("responses") == 5,
+check("/_status proxy.muse stats", (st["proxy"].get("muse") or {}).get("responses") == 7,
       (st["proxy"].get("muse") or {}).get("responses"))
 check("/_status proxy.muse.subscription = newest plan reading",
       ((st["proxy"].get("muse") or {}).get("subscription") or {}).get("tier") == "27681527378179523")
@@ -427,8 +537,15 @@ if main:
     check("roster names are the nested functions",
           "bash" in (tools.get("names") or []) or "read_file" in (tools.get("names") or []),
           (tools.get("names") or [])[:5])
-    check("/_context composition null on this wire (no anthropic sizing)",
-          main.get("composition") is None)
+    comp = main.get("composition") or {}
+    cats = {c["category"]: c for c in comp.get("by_category") or []}
+    check("/_context composition present on this wire (Responses-API vocabulary)",
+          set(cats) >= {"tools", "system", "developer", "user"}, sorted(cats))
+    check("composition scaled to the receipt's window (basis receipt, sums to 100)",
+          comp.get("basis") == "receipt" and comp.get("total_tokens") == 100
+          and sum(c["tokens"] for c in cats.values()) == 100, comp)
+    check("composition: the namespace tool schema is the biggest category",
+          (comp.get("by_category") or [{}])[0].get("category") == "tools")
     check("/_context model", main.get("model") == "muse-spark-1.3")
 check("_wire_of vocabulary", status_mod._wire_of(BODY) == "meta"
       and status_mod._wire_of({"input": [], "instructions": "x"}) == "openai"
@@ -458,7 +575,7 @@ check("codex priced off PRICES_OPENAI (gpt-5.4: 50*2.5 + 50*0.25 + 5*15 per M)",
 check("codex stem tag unchanged",
       len(list((Path(LOG_DIR) / "codex-sess-1").glob("*-cx-codex-*.request.json"))) == 1)
 check("codex stats bumped, muse stats not",
-      lp.codex._CODEX_STATS["requests"] == 1 and muse_mod._MUSE_STATS["requests"] == 5)
+      lp.codex._CODEX_STATS["requests"] == 1 and muse_mod._MUSE_STATS["requests"] == 7)
 check("codex body is NOT a muse body", not muse_mod._is_muse_body(codex_body))
 check("codex tools roster stays null", status_mod._tool_roster(codex_body) is None)
 cx_turn = [e for e in ENVELOPES if e["event"] == "turn.completed" and e["agent"] == "cx"]
