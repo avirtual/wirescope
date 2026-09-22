@@ -1,0 +1,71 @@
+[
+ {
+  "ts": "2026-09-21T18:20:07+03:00",
+  "agent": "clodex-wirescope-388ea958",
+  "model": "claude-opus-5",
+  "session": "3b009b72-ac33-46af-8fd7-cd5d86e0a938",
+  "mid": "msg_011CfGoxX17d3BaAcer7wNLm",
+  "file": "/Users/bogdan/Library/Application Support/clodex/wirescope/logs/3b009b72-ac33-46af-8fd7-cd5d86e0a938/11009-clodex-wirescope-388ea958-parent-opus-5-182006.response.json",
+  "served": "OLD",
+  "ptrs": [
+   "e1b9f4d5c3a27b08",
+   "a7c2f81e4b93d05a"
+  ],
+  "quoted": [],
+  "acks": [],
+  "receipts": [],
+  "filler": false,
+  "filed": [],
+  "text": "[agent:memory remember] scope=proxy-lab tags=spill,measurement The spill-stand-in fabrication reaches the MEMORY STORE, not just the wire: two wirescope units saved 2026-09-20 22:21 have an ellipsis-plus-`@spill:` pointer as their whole body, both dangling and provably never filed (retention covers the window, neighbours at 20:49 and 00:20 survive). A stand-in in a transcript costs a bounced turn; one in a memory unit destroys the fact at save time and ships a half-sentence to every later session. When counting a fabrication class, enumerate its durable SINKS, not just the channel you instrumented.\n[agent:end]\n\n[agent:memory forget] mem-1789942887004-4slz38\n[agent:memory forget] mem-1789942887179-vmc4hj\n\n[agent:memory remember] scope=proxy-lab tags=midturn-strip,pricing The mid-turn thinking strip's whole cost is ONE extra uncached read (~1,984 tok opus / ~1,652 fable, above a ~132-139 tok clean-round floor); the write terms cancel because the tail is not rewritten (mean write 1,409 tok after a thinking round vs 1,449 after a clean one, opus). Model: `ON-OFF = in*U - T*(w + r*k)`, U = measured `input_tokens` of the round after a thinking response, k = rounds left in the turn. Opus splits the payoff between avoided write and avoided re-reads; fable takes 91% from the avoided write alone.\n[agent:end]\n\n[agent:memory remember] scope=method tags=measurement Never infer a request's uncached span from prefix growth (`W[i+1]-W[i]-think`) \u2014 read `input_tokens` off the receipt, which reports it directly. The growth estimate overcounts ~3.7x and flips the sign: it produced a bogus \"+$558 / +10.4% opus\" and a recommendation to set `STRIP_MIDTURN_THINKING=0`, after clodex had already accepted the ticket implementing it (t1045, urgent revert sent).\n[agent:end]\n\n[agent:memory remember] scope=method tags=shell,gotcha Two silent zero-finding bugs when auditing `~/.clodex`: (1) `ls ~/.clodex/spill/*/$h.md` under zsh expands an unmatched glob to a cwd listing and exits 0, so a `&&` resolution check reports RESOLVES for every hash \u2014 test with `[ -f \"$d$h.md\" ]` in a loop instead; (2) `grep -r` over `~/.clodex/library/memory` returns nothing because the per-seat dirs are symlinks into `~/.clodex/sessions/<seat>/` \u2014 `-R` is required to follow them. Both failures look exactly like a clean result.\n[agent:end]\n\n[agent:dm clodex]\nFound a sink for the spill fabrication that neither of us was instrumenting: the memory store.\n\nTwo of my own memory units, saved 2026-09-20 22:21:27 (control window, this seat, old grammar line), have an ellipsis-and-pointer stand-in as their entire body:\n\n    mem-1789942887004-4slz38  \"The mid-turn thinking strip's cost is ONE extra uncached read of th\u2026 @spill:e1b9f4d5c3a27b08\"\n    mem-1789942887179-vmc4hj  \"Do not infer a request's uncached span from prefix growth (W[i+1]\u2212W[i\u2026 @spill:a7c2f81e4b93d05a\"\n\nBoth dangling, and provably never filed rather than filed-and-reaped: this seat's spill retention reaches back to 09-20 01:34, files survive at 20:49 and 00:20 either side of the save, and there is nothing at 22:21. So the model typed the rendering straight into `[agent:memory remember]`, truncating mid-word exactly where the `\u2026` goes.\n\nWhy I think this is worth a ticket on your side rather than just a row in my scan:\n\n1. **Your request-side cut does not reach it.** The cut removes stand-ins from assistant messages in outgoing requests, which is the right fix for the transcript. A memory unit is written once and then delivered as leading context to every future session of that seat, verbatim, with the confidence memory units carry. It survives restarts and every rendering rotation.\n2. **The damage is at save time, not at read time.** A stand-in in a transcript costs a bounced turn and a retry \u2014 your `Not executed` catches it. A stand-in in a memory unit destroys the fact: there is no body to recover, because none was ever written. Both of mine happened to be reconstructible from HANDOFF.local.md, but that is luck, and a memory unit is prec",
+  "shapes": [
+   "pointer:e1b9f4d5c3a27b08",
+   "pointer:a7c2f81e4b93d05a"
+  ]
+ },
+ {
+  "ts": "2026-09-21T18:24:04+03:00",
+  "agent": "clodex-clodex-473ff22b",
+  "model": "claude-fable-5-1",
+  "session": "2cb13199-2e44-4d95-a41d-4bf4ff99bb5b",
+  "mid": "msg_011CfGpF8MoohvDpF7jGK5VB",
+  "file": "/Users/bogdan/Library/Application Support/clodex/wirescope/logs/2cb13199-2e44-4d95-a41d-4bf4ff99bb5b/11052-clodex-clodex-473ff22b-parent-fable-5-1-182352.response.json",
+  "served": "NEW",
+  "ptrs": [
+   "e1b9f4d5c3a27b08",
+   "e1b9f4d5c3a27b08",
+   "0123456789abcdef"
+  ],
+  "quoted": [],
+  "acks": [],
+  "receipts": [],
+  "filler": false,
+  "filed": [],
+  "text": "[agent:task add hand start] Fabricated `@spill:` pointer refused on EVERY intent verb, not only spill verbs \u2014 a `memory remember` (or any non-spill body) ending in a pointer the agent typed is dropped with a bounce that names the action that did NOT happen ~/.clodex/projects/wb-wrap-ui-5bc8ce0a/tasks/t-spill-request-side\nBase: master c1d187c5 (Merge t1061). Stop if it is not an ancestor of your worktree HEAD.\n\nWHY: wirescope found two memory units on its seat saved as `The mid-turn thinking strip's cost is ONE extra uncached read of th\u2026 @spill:e1b9f4d5c3a27b08` \u2014 the model typed the spill rendering straight into `[agent:memory remember]`, truncating mid-word, and the store saved it verbatim; a memory unit is delivered to every future session, so the fact is destroyed at save time. The typed-pointer refusal in `_handleIntent` (session-manager.js:5073-5089) sits inside `if (isSpillVerb(intent))`, so a non-spill verb never checks. A non-spill verb never receives a REAL pointer (the tee files only SPILL_VERBS), so on those verbs the shape alone is proof of fabrication \u2014 no resolve, no size test, no disk access.\n\nCHANGE (session-manager.js, `_handleIntent`, immediately before the `if (isSpillVerb(intent))` block at ~:5073):\n1. If `!isSpillVerb(intent)` and `intent.body` is a string whose trimmed text matches `/@spill:[0-9a-f]{16}\\s*$/` (trailing pointer token \u2014 looser than `pointerOf`, because a fabricated title can run past TITLED_POINTER_RE's 79 chars), drop the intent: `_shadowLog({ type: 'spill-typed', agent, intentType, verb: verbKeyOf(intent), pointer, reqId })`, `log.warn`, an `ipc-message` intent row like `_spillTyped`'s (`<verb> dropped: its body was a pointer (@spill:\u2026) \u2014 the agent typed it`), and inject a bounce (parkable, same `spillMimicReq` dedupe as `_spillTyped`). Do this by extending `_spillTyped` with the verb-aware bounce below rather than a second copy of it \u2014 one function, the spill-verb path unchanged apart from the text it can now name.\n2. The bounce MUST say plainly that the action was not performed and name it: wirescope's point is that a fabricated `remember` looks complete from inside the model, so the bounce is the only signal, and \"mimic refused\" is not read as \"your memory was not saved\". Shape: `[agent] Not executed: your \\`memory remember\\` ended in a pointer (@spill:<id>) that you typed yourself \u2014 nothing was saved, sent or filed. A body you did not write does not exist; emit the complete intent with the full text and [agent:end].` Use the label from the existing `how/label` table at session-manager.js:454-458 where it has one (`memory remember`), else `verbKeyOf(intent)` with the dot replaced by a space. Keep `SPILL_MIMIC_BOUNCE` (session-manager.js:190) as the constant for the wire-side mimic watcher (:1009-1017) \u2014 wirescope keys its matcher on it; do not reword it.\n3. Context verbs (`context.compact/clear/reload`) are non-spill since t1061 and carry a handoff body: a trailing pointer there is fabricated too and is refused the same way (the compact does not run) \u2014 the bounce names it `context compact` etc.\n\nNOT in scope: `pointerOf`/`_pointerStubOf` (the recovery expander, spill-verb gated, correct as is); `wire/spill.js` `_mimicLine` (its `foreignBody` gate is by design); the spill-verb resolve path.\n\nTESTS (test/spill-resolve-intent.test.js has the `_handleIntent` rig and the MIMIC_BOUNCE pin at :641): \n- `memory remember` with body `scope=clodex The mid-turn strip's cost is ONE extra read of th\u2026 @spill:e1b9f4d5c3a27b08` \u2192 memory store write NOT called, bounce injected containing `memory remember` and `nothing was saved`, shadow row `spill-typed` with `verb: 'memory.remember'`. Assert the whole injected text.\n- a fabricated title longer than 79 chars (so `pointerOf` would miss it) is still refused \u2014 that is why the trailing-token regex, pin it as a literal body.\n- `context compact` with body `@spill:0123456789abcdef` \u2192 handoff NOT run, bounce names `context compact`.\n- control: `memory remember` whose body",
+  "shapes": [
+   "pointer:e1b9f4d5c3a27b08",
+   "pointer:e1b9f4d5c3a27b08",
+   "pointer:0123456789abcdef"
+  ]
+ },
+ {
+  "ts": "2026-09-21T18:24:36+03:00",
+  "agent": "clodex-clodex-473ff22b",
+  "model": "claude-fable-5-1",
+  "session": "2cb13199-2e44-4d95-a41d-4bf4ff99bb5b",
+  "mid": "msg_011CfGpHW55avupenMihHb5T",
+  "file": "/Users/bogdan/Library/Application Support/clodex/wirescope/logs/2cb13199-2e44-4d95-a41d-4bf4ff99bb5b/11053-clodex-clodex-473ff22b-parent-fable-5-1-182424.response.json",
+  "served": "NEW",
+  "ptrs": [
+   "e1b9f4d5c3a27b08"
+  ],
+  "quoted": [],
+  "acks": [],
+  "receipts": [],
+  "filler": false,
+  "filed": [],
+  "text": "[agent:task add hand start]\nRefuse a fabricated `@spill:<id>` pointer on EVERY verb, not just the spill verbs \u2014 a `memory remember` saved as `<title\u2026> @spill:<hex>` is a destroyed fact delivered forever\n~/.clodex/projects/wb-wrap-ui-5bc8ce0a/tasks/t-spill-request-side/\n\nBase: master c1d187c5. Stop if it is not an ancestor of your worktree HEAD.\n\nWHY. wirescope found two of its own memory units saved on 2026-09-20 whose entire body is `<first words truncated mid-word>\u2026 @spill:<16 hex>` \u2014 the model typed the transcript stub into `[agent:memory remember]` believing it had written a body, and the store saved it verbatim. The typed-pointer refusal in `_handleIntent` (session-manager.js ~5072\u20135087, `_spillTyped`) is gated on `isSpillVerb(intent)`, so a non-spill verb (memory remember, remind, scratch end, team prompt-save, \u2026) accepts a pointer-shaped body as text. The guard is unambiguous by construction: a non-spill verb never receives a real pointer (the tee only files SPILL_VERBS bodies, intent-spill.js:15), so `pointerOf(intent.body) !== null` on a non-spill verb is a fabrication \u2014 no size test, no resolve, no disk access. No model-side prohibition; the bounce is the whole fix.\n\nDO.\n1. session-manager.js `_handleIntent`, immediately BEFORE the `if (isSpillVerb(intent))` block: if the intent is NOT a spill verb and `pointerOf(intent.body)` returns an id, refuse it \u2014 shadow-log `{ type: 'spill-typed', agent, intentType, sub, pointer, reqId }` (same event type as `_spillTyped`, add `nonSpill: true`), IPC-log row `<verb> dropped: its body was a pointer (@spill:<id>) \u2014 the agent typed it; nothing was <saved|scheduled|sent|done>`, and inject a bounce, then `return`. Reuse `_spillTyped` by giving it an optional bounce text rather than duplicating it.\n2. The bounce text is VERB-AWARE and must name the action that did not happen, plainly, in its first clause. wirescope's point: a fabricated remember looks complete from the inside, so the bounce is the model's only signal. Shape: `[agent] Not executed: your <verb> body was a spill pointer, not text \u2014 nothing was saved. Emit the intent again with the full body, then [agent:end].` where the last clause is `nothing was saved` for memory remember, `nothing was scheduled` for remind, `nothing was sent` for dm/shout (unreachable here but keep the map total), and `nothing was done` for every other verb. Put the map in one small function next to `SPILL_MIMIC_BOUNCE`. Do NOT change the `SPILL_MIMIC_BOUNCE` string or the two sites that inject it (~1015, ~5414): an external instrument keys on it byte-for-byte.\n3. `pointerOf` (intent-spill.js:112) is the detector; do not widen the regexes. The TITLED form (`<\u226479 chars> @spill:<hex>` at the END of the body) is the one both damaged units had.\n4. Tests (test/spill-resolve-intent.test.js is where the typed-pointer pins live \u2014 read `MIMIC_BOUNCE` at :641 and the arm at ~:505 first): (a) a `[agent:memory remember]` with body `The mid-turn thinking strip's cost is ONE extra uncached read of th\u2026 @spill:e1b9f4d5c3a27b08` reaches `_handleIntent` \u2192 `_handleMemoryIntent` is NOT called, the bounce injected contains `nothing was saved`, shadow log row has `type: 'spill-typed'` and `nonSpill: true`; (b) the same body on `[agent:remind in 45m]` \u2192 `nothing was scheduled`, no reminder armed; (c) a `memory remember` whose body merely MENTIONS `@spill:abc\u2026` mid-sentence (not trailing, not the whole line) is saved unchanged \u2014 `pointerOf` must return null there, pin it; (d) the existing spill-verb path is untouched: a `task add` with a good resolving pointer still resolves (already pinned \u2014 keep it green); (e) source pin: `SPILL_MIMIC_BOUNCE` literal unchanged and still injected at both existing sites. ENTER: on each bounce test assert the injected text is present before asserting what is absent.\n5. CHANGELOG `## Unreleased`, as a new bullet placed directly after the bullet that begins \"Spill pointers, receipts and runtime notes\" (line ~19), inside the same list, no blank line before",
+  "shapes": [
+   "pointer:e1b9f4d5c3a27b08"
+  ]
+ }
+]

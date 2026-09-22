@@ -43,10 +43,18 @@ replayed at `max_tokens: 1` (both pingers build that shape); it is billed like
 a request and it is not a turn, so until v0.6.65 it hid inside the turn totals.
 The ping section prices them per seat (cached read vs uncached tail vs any
 write), flags DIRTY pings (a write, or an uncached span larger than the tail —
-a ping is supposed to be a pure cache read), and names LOOPS: runs of pings
-spaced at the hold tick (<= 2 min) with no organic turn between, which is what a
-5m-TTL stash under a perpetual hold looks like (152 pings / $7.53 in one night
-on one seat, 2026-09-09, keeping a pre-compact history warm).
+a ping is supposed to be a pure cache read), and names LOOPS: runs of BILLED
+pings spaced at the hold tick (<= 2 min) with no organic turn between, which is
+what a 5m-TTL stash under a perpetual hold looks like (152 pings / $7.53 in one
+night on one seat, 2026-09-09, keeping a pre-compact history warm).
+
+BURSTS are the free twin, reported separately: runs of consecutive FAILED pings
+at the same spacing. Same shape on the clock, opposite meaning — a loop is spend
+to be stopped, a burst is the decline path working against an upstream outage,
+and the number to read is how many attempts remained when the TTL ran out
+(2026-09-22: three seats, five 529s each over a 240s window, all inside a 300s
+margin; two prefixes expired mid-outage, one at $2.93). Keeping them in one
+table made a keeper that retries FASTER near expiry look like a new loop.
 
 Usage:
   python3 analyze_busts.py [--logs DIR] [--since DAYS] [--session ID] [--top N]
@@ -59,7 +67,7 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 DEFAULT_LOGS = os.path.expanduser(
@@ -264,6 +272,13 @@ def _group(rows, keyf):
 _MAX_TOKENS_RE = re.compile(rb'"max_tokens":\s*(\d+)')
 PING_LOOP_GAP_S = 120        # two hold ticks: pings this close with no turn between = a loop
 PING_LOOP_MIN = 5
+# A run of FAILED pings is the opposite of a loop: it bills nothing and it is
+# the keeper's decline path doing its job against an upstream outage. It has to
+# be named separately, because a keeper that retries FASTER near expiry (clodex
+# t1073, 15s inside the margin after any decline) produces runs that are dense
+# in exactly the way the loop rule keys on — 20 pings in one 300s window — while
+# costing $0. Counting those as a loop would report the hardening as the defect.
+PING_BURST_MIN = 3
 
 
 def _is_ping_capture(path, report):
@@ -373,9 +388,15 @@ def _usd_of(tokens, rate):
 def ping_loops(rows):
     """Runs of >= PING_LOOP_MIN pings on one seat, each within PING_LOOP_GAP_S
     of the previous PING (no organic turn between). Returns [(agent, session,
-    [rows])], costliest first."""
+    [rows])], costliest first.
+
+    BILLED pings only. A loop is a COST finding — a hold paying for a prefix
+    whose TTL is inside the ping margin — and a non-200 ping is billed nothing,
+    so a run of them is a different event (see ping_bursts)."""
     by_seat = defaultdict(list)
     for r in rows:
+        if r["status"] != 200:
+            continue
         by_seat[(r["agent"], r["session"])].append(r)
     loops = []
     for (agent, sess), L in by_seat.items():
@@ -392,6 +413,41 @@ def ping_loops(rows):
             loops.append((agent, sess, run))
     loops.sort(key=lambda x: -sum(r["est_usd"] or 0 for r in x[2]))
     return loops
+
+
+def ping_bursts(rows):
+    """Runs of >= PING_BURST_MIN CONSECUTIVE non-200 pings on one seat, each
+    within PING_LOOP_GAP_S of the previous ping. Returns [(agent, session,
+    [rows])], longest first.
+
+    This is the decline path under an upstream outage, and it is free — so read
+    it as EXPOSURE, never as spend: the question a burst answers is whether the
+    keeper had attempts left when the TTL ran out. 2026-09-22 on the clodex lead
+    seat: five 529s at ~60s inside a 300s margin, the last at T-15s, then the
+    prefix expired and the next organic turn re-wrote 147k tok ($2.93 at fable
+    1h). `status` is the whole signal — a 529 is retryable weather, a 401-class
+    run is credentials and counts toward the two-strike disarm instead."""
+    by_seat = defaultdict(list)
+    for r in rows:
+        by_seat[(r["agent"], r["session"])].append(r)
+    bursts = []
+    for (agent, sess), L in by_seat.items():
+        L.sort(key=lambda r: r["mtime"])
+        run = []
+        for r in L:
+            failed = r["status"] != 200
+            contiguous = (run and r["gap_s"] is not None
+                          and r["gap_s"] <= PING_LOOP_GAP_S)
+            if failed and contiguous:
+                run.append(r)
+            else:
+                if len(run) >= PING_BURST_MIN:
+                    bursts.append((agent, sess, run))
+                run = [r] if failed else []
+        if len(run) >= PING_BURST_MIN:
+            bursts.append((agent, sess, run))
+    bursts.sort(key=lambda x: -len(x[2]))
+    return bursts
 
 
 def render_pings(rows, top, since_days):
@@ -438,6 +494,24 @@ def render_pings(rows, top, since_days):
             rd = run[0]["read_tokens"]
             print(f"  {agent[:28]:28} {sess[:8]} {t0}→{t1} {len(run):4} pings {hrs:4.1f}h"
                   f" {_usd(cost):>8}  ttl={ttl}  read/ping={rd:,} tok")
+    bursts = ping_bursts(rows)
+    if bursts:
+        print(f"\n== Ping bursts (>= {PING_BURST_MIN} consecutive FAILED pings <="
+              f" {PING_LOOP_GAP_S}s apart): the decline path under an outage — free,"
+              " and NOT a loop")
+        print("   read these as exposure: did the keeper still have attempts when the"
+              " TTL ran out?")
+        for agent, sess, run in bursts[:top]:
+            t0 = time.strftime("%m-%d %H:%M:%S", time.localtime(run[0]["mtime"]))
+            t1 = time.strftime("%H:%M:%S", time.localtime(run[-1]["mtime"]))
+            span = run[-1]["mtime"] - run[0]["mtime"]
+            gaps = [r["gap_s"] for r in run[1:] if r["gap_s"] is not None]
+            cadence = f"{min(gaps)}-{max(gaps)}s" if gaps else "-"
+            codes = "/".join(f"{c}x{n}" for c, n in sorted(
+                Counter(r["status"] for r in run).items(),
+                key=lambda kv: -kv[1]))
+            print(f"  {agent[:28]:28} {sess[:8]} {t0}→{t1} {len(run):3} fails"
+                  f" over {span:4.0f}s  gap {cadence:>9}  {codes}")
     if dirty:
         print("\n== Dirty pings (a ping should be a pure cache read)")
         for r in sorted(dirty, key=lambda r: -(r["write_tokens"] + r["uncached_input"]))[:top]:

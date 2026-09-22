@@ -107,6 +107,36 @@ def test_ping_loops_need_tick_spacing_and_no_turn_between():
     ck("an organic turn between pings breaks the run", ab.ping_loops(split), [])
 
 
+def test_failed_pings_are_bursts_not_loops():
+    """A loop is spend; a burst is free. They look identical on the clock, so the
+    split has to be the status code — otherwise a keeper that retries faster near
+    expiry (clodex t1073: 15s inside the margin after a decline) files as a new
+    loop, i.e. the hardening reads as the defect it fixed."""
+    t0 = 1_000_000.0
+    # the 2026-09-22 outage: five 529s at the 60s tick, all inside one margin
+    outage = [_ping_row("a", t0, "turn", 3000)] + [
+        _ping_row("a", t0 + 60 * i, "ping", 60, usd=0.0, status=529) for i in range(1, 6)]
+    ck("a run of failed pings is not a loop", ab.ping_loops(outage), [])
+    bursts = ab.ping_bursts(outage)
+    ck("it is one burst", len(bursts), 1)
+    ck("the burst holds all five fails", len(bursts[0][2]), 5)
+    # t1073's post-fix cadence: 20 declines in one 300s window, still $0
+    fast = [_ping_row("b", t0, "turn", 3000)] + [
+        _ping_row("b", t0 + 15 * i, "ping", 15, usd=0.0, status=529) for i in range(1, 21)]
+    ck("a 15s decline cadence is still not a loop", ab.ping_loops(fast), [])
+    ck("and it is one burst of twenty", len(ab.ping_bursts(fast)[0][2]), 20)
+    # a ping that SUCCEEDS ends the burst: the prefix is warm again
+    mixed = [_ping_row("c", t0, "turn", 3000)] + [
+        _ping_row("c", t0 + 60 * i, "ping", 60, usd=0.0,
+                  status=(200 if i == 3 else 529)) for i in range(1, 6)]
+    ck("a successful ping splits the run below the minimum", ab.ping_bursts(mixed), [])
+    # and a healthy billed loop is still a loop, with no burst filed
+    rows = [_ping_row("d", t0, "turn", 3000)] + [
+        _ping_row("d", t0 + 60 * i, "ping", 60) for i in range(1, 6)]
+    ck("billed pings still file as a loop", len(ab.ping_loops(rows)), 1)
+    ck("and never as a burst", ab.ping_bursts(rows), [])
+
+
 def test_ping_capture_detection_reads_flag_then_shape():
     d = Path(tempfile.mkdtemp())
     try:
@@ -140,6 +170,7 @@ if __name__ == "__main__":
               test_proxy_state_names_the_unanchored_shape,
               test_agent_of_keeps_the_dashed_route_name,
               test_ping_loops_need_tick_spacing_and_no_turn_between,
+              test_failed_pings_are_bursts_not_loops,
               test_ping_capture_detection_reads_flag_then_shape):
         print(f"=== {t.__name__} ===")
         t()

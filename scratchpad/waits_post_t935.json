@@ -1,0 +1,74 @@
+{
+ "hand": {
+  "sessions_scanned": 106,
+  "seats_scanned": 235,
+  "sessions_with_run": 0,
+  "prevalence": 0.0,
+  "runs": 0,
+  "retry_runs_excluded": 0,
+  "run_length_dist": {},
+  "run_length_max": 0,
+  "top_shapes": [],
+  "top_norms": [],
+  "usd_total": 0,
+  "tokens_reread_total": 0,
+  "median_gap_s_dist": {},
+  "usd_median_per_run": 0,
+  "usd_mean_per_run": 0,
+  "price_methods": {},
+  "end_reasons": {},
+  "launched_by": {},
+  "alternative_usage_totals": {
+   "run_in_background": 2,
+   "monitor_intent": 12,
+   "remind_intent": 18,
+   "exec_intent": 505,
+   "inshell_wait_calls": 0
+  },
+  "alternative_usage_seats": {
+   "exec_intent": 106,
+   "monitor_intent": 9,
+   "remind_intent": 12,
+   "run_in_background": 2
+  },
+  "top10": [],
+  "per_session": []
+ },
+ "nonhand": {
+  "sessions_scanned": 186,
+  "seats_scanned": 248,
+  "sessions_with_run": 0,
+  "prevalence": 0.0,
+  "runs": 0,
+  "retry_runs_excluded": 0,
+  "run_length_dist": {},
+  "run_length_max": 0,
+  "top_shapes": [],
+  "top_norms": [],
+  "usd_total": 0,
+  "tokens_reread_total": 0,
+  "median_gap_s_dist": {},
+  "usd_median_per_run": 0,
+  "usd_mean_per_run": 0,
+  "price_methods": {},
+  "end_reasons": {},
+  "launched_by": {},
+  "alternative_usage_totals": {
+   "run_in_background": 2,
+   "monitor_intent": 2,
+   "remind_intent": 11,
+   "exec_intent": 5,
+   "inshell_wait_calls": 1
+  },
+  "alternative_usage_seats": {
+   "run_in_background": 1,
+   "remind_intent": 4,
+   "exec_intent": 3,
+   "inshell_wait_calls": 1,
+   "monitor_intent": 1
+  },
+  "top10": [],
+  "per_session": []
+ },
+ "runs": []
+}

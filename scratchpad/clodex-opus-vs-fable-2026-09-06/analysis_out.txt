@@ -1,0 +1,96 @@
+loaded 16401 priced 200s: main-line 15611, sub/side-calls 790; sessions 13
+models on main line: [('claude-opus-5', 13532), ('claude-fable-5-1', 2034), ('claude-opus-4-8', 33), ('claude-haiku-4-5-20251001', 12)]
+sessions:
+  37464a95  2026-08-30T01:23 .. 2026-09-06T23:31  n=4513  [('claude-opus-5', 4513)]  $480.26
+  d48e988f  2026-08-20T00:34 .. 2026-08-23T11:45  n=3961  [('claude-opus-5', 3961)]  $398.78
+  4d74dc16  2026-08-27T01:54 .. 2026-09-03T11:23  n=2862  [('claude-opus-5', 2862)]  $319.85
+  5383fbbc  2026-09-04T08:13 .. 2026-09-06T23:50  n=2772  [('claude-fable-5-1', 2034), ('claude-opus-5', 705), ('claude-opus-4-8', 33)]  $299.05
+  0731c55e  2026-08-23T16:33 .. 2026-08-27T01:53  n=1361  [('claude-opus-5', 1361)]  $147.69
+  7a549dc5  2026-08-30T00:23 .. 2026-09-02T02:59  n=126  [('claude-opus-5', 126)]  $3.02
+  35ec3085  2026-08-27T01:54 .. 2026-08-27T01:54  n=4  [('claude-opus-5', 4)]  $0.45
+  ebaeb02e  2026-09-03T22:46 .. 2026-09-03T22:46  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.06
+  1d21dd12  2026-09-03T22:46 .. 2026-09-03T22:46  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.01
+  d4831a4a  2026-09-03T22:48 .. 2026-09-03T22:48  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.01
+  513e438d  2026-09-04T09:49 .. 2026-09-04T09:49  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.06
+  31fce304  2026-09-04T09:49 .. 2026-09-04T09:49  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.01
+  7d5f2456  2026-09-04T09:50 .. 2026-09-04T09:50  n=2  [('claude-haiku-4-5-20251001', 2)]  $0.01
+
+== claude-opus-5 (main line)  n=13532 requests, 3456 turns, 2026-08-20T00:34 .. 2026-09-06T23:31 (span 431h, active 286.5h) ==
+  total $1,417.47  = read $828.56 (58%)  write $221.55 (16%)  uncached-in $107.38 (8%)  output $259.98 (18%)
+  $/request  mean 0.1047  p50 0.0933  p90 0.1364   |  $/active-hour 4.95  req/active-hour 47
+  $/turn     mean 0.410  p50 0.236  p90 1.009   |  req/turn mean 3.92 p50 2 p90 9
+  window/req mean 125,690  p50 126,346  p90 186,507   |  per req: read 122,460  write 1,643  uncached 1,587  out 768  think 195
+  tool calls/req 0.78  text-only responses 26%  top tools: Bash 10373, Edit 59, Write 21, Agent 15, Read 8, ListAgents 5, WebFetch 4, SendMessage 3
+  warm-on-arrival false: 21 (0.2%)   bust_class set: 146   ttl: [(3600, 13143), (None, 237)]
+  cross-priced at claude-fable-5-1 rates: $1,592.09 (1.12x)
+
+-- compactions in claude-opus-5: 107
+  $/compact mean 0.861 p50 1.035 max 1.455  total $92.16  = 6.5% of phase spend
+  context in: p50 196,226  max 255,166   summary out: p50 10,394  p90 12,316  ratio p50 0.053
+  cold (uncached input > 50% of window): 69/107   output share of compact $: 30%
+  full epochs between compacts: 106
+    requests   per epoch: mean   126.08  p50   125.00  p90   170.00
+    turns      per epoch: mean    31.06  p50    26.00  p90    55.00
+    $          per epoch: mean    12.45  p50    12.32  p90    16.88
+    wall hours per epoch: mean     3.16  p50     1.79  p90     5.95
+    window after compact: p50 52,791   window at next compact: p50 194,389
+    compact $ / (epoch $ + compact $): mean 6.9%  p50 7.2%
+
+== claude-fable-5-1 (main line)  n=2034 requests, 719 turns, 2026-09-04T23:29 .. 2026-09-06T23:50 (span 48h, active 43.5h) ==
+  total $226.26  = read $61.06 (27%)  write $73.16 (32%)  uncached-in $15.21 (7%)  output $76.82 (34%)
+  $/request  mean 0.1112  p50 0.0808  p90 0.1815   |  $/active-hour 5.20  req/active-hour 47
+  $/turn     mean 0.315  p50 0.165  p90 0.651   |  req/turn mean 2.83 p50 2 p90 5
+  window/req mean 122,630  p50 122,498  p90 171,932   |  per req: read 120,080  write 1,803  uncached 748  out 755  think 175
+  tool calls/req 0.65  text-only responses 35%  top tools: Bash 1284, Write 18, Agent 9, Edit 2, Read 2, SendMessage 1
+  warm-on-arrival false: 0 (0.0%)   bust_class set: 24   ttl: [(3600, 2014), (300, 20)]
+  cross-priced at claude-opus-5 rates: $204.72 (0.90x)
+
+-- compactions in claude-fable-5-1: 19
+  $/compact mean 0.544 p50 0.531 max 0.679  total $10.34  = 4.6% of phase spend
+  context in: p50 183,476  max 196,939   summary out: p50 9,044  p90 10,810  ratio p50 0.050
+  cold (uncached input > 50% of window): 0/19   output share of compact $: 85%
+  full epochs between compacts: 18
+    requests   per epoch: mean   103.11  p50   109.00  p90   127.00
+    turns      per epoch: mean    36.67  p50    36.00  p90    46.00
+    $          per epoch: mean    10.79  p50    10.55  p90    12.55
+    wall hours per epoch: mean     2.41  p50     1.87  p90     4.02
+    window after compact: p50 55,786   window at next compact: p50 180,894
+    compact $ / (epoch $ + compact $): mean 4.9%  p50 4.7%
+
+(other main-line models: [('claude-opus-4-8', 33), ('claude-haiku-4-5-20251001', 12)]  $5.55)
+
+== subagent + side-call line (spawned by the seat, shares session_id) ==
+  claude-opus-5                subagent         n=  202  $   12.48  $/req 0.0618
+  claude-sonnet-5              subagent         n=  442  $   11.97  $/req 0.0271
+  claude-sonnet-5              general-purpose  n=  121  $    3.60  $/req 0.0297
+  claude-haiku-4-5-20251001    general-purpose  n=   19  $    0.11  $/req 0.0055
+  claude-haiku-4-5-20251001    unknown          n=    6  $    0.01  $/req 0.0010
+  attributed to claude-opus-5 phase: 622 sub-requests, $18.62 (= 1.3% on top of the main line $1417.47)
+  attributed to claude-fable-5-1 phase: 162 sub-requests, $9.54 (= 4.2% on top of the main line $226.26)
+
+== per day (main line) ==
+day        model              req turns        $   $/req  $/turn  win p50 comp  comp$ active h
+2026-08-20 opus-5             627   127    61.35  0.0979   0.483  116,775    5   5.32     17.5
+2026-08-21 opus-5            2391   302   243.88  0.1020   0.808  126,852   17  14.21     22.7
+2026-08-22 opus-5             930   207    93.55  0.1006   0.452  111,036   10   8.84     18.2
+2026-08-23 opus-5             112    39    10.31  0.0921   0.264   91,229    1   0.90      8.4
+2026-08-24 opus-5             165    23    16.08  0.0975   0.699  116,879    1   0.32      1.5
+2026-08-25 opus-5             234    69    21.35  0.0913   0.309   99,659    2   1.78      4.8
+2026-08-26 opus-5             642   158    73.75  0.1149   0.467  138,220    4   4.25     14.9
+2026-08-27 opus-5            1561   416   181.03  0.1160   0.435  132,452   12  12.99     18.7
+2026-08-28 opus-5            1063   251   125.16  0.1177   0.499  121,061   13  11.46     14.7
+2026-08-29 opus-5             346   108    36.56  0.1057   0.338  128,925    2   2.46      9.7
+2026-08-30 opus-5             594   259    47.55  0.0800   0.184  108,923    2   2.33     20.8
+2026-08-31 opus-5            1111   427   122.91  0.1106   0.288  142,786    8   8.66     23.9
+2026-09-01 opus-5            1087   325   111.36  0.1024   0.343  127,975    8   8.63     22.5
+2026-09-02 opus-5            1151   311   119.37  0.1037   0.384  135,984    9   5.17     21.0
+2026-09-03 haiku-4-5-20251001     6     3     0.09  0.0148   0.030   29,722    0   0.00      0.0
+2026-09-03 opus-5             572   152    59.16  0.1034   0.389  124,272    6   2.10     16.3
+2026-09-04 fable-5-1           13     5     2.34  0.1797   0.467   75,977    0   0.00      0.5
+2026-09-04 haiku-4-5-20251001     6     3     0.09  0.0153   0.031   29,726    0   0.00      0.0
+2026-09-04 opus-5             894   235    88.81  0.0993   0.378  125,071    7   2.73     20.6
+2026-09-05 fable-5-1         1078   375   110.11  0.1021   0.294  122,298    9   5.20     20.8
+2026-09-05 opus-4-8            33     8     5.37  0.1627   0.671   69,893    1   0.34      0.6
+2026-09-05 opus-5              26    26     2.63  0.1013   0.101  178,843    0   0.00     12.5
+2026-09-06 fable-5-1          943   339   113.82  0.1207   0.336  123,846   10   5.14     22.0
+2026-09-06 opus-5              26    26     2.63  0.1013   0.101  178,843    0   0.00     12.5

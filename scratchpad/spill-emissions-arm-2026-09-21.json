@@ -1,0 +1,15 @@
+[
+ {
+  "ts": "2026-09-21T10:00:30+03:00",
+  "agent": "clodex-clodex-f3de6026",
+  "model": "claude-fable-5-1",
+  "session": "e126cb02-f5ab-4682-985b-31998ae1cc1c",
+  "mid": "msg_011CfG9qs5jBJLkZWxaA7E6W",
+  "file": "/Users/bogdan/Library/Application Support/clodex/wirescope/logs/e126cb02-f5ab-4682-985b-31998ae1cc1c/8977-clodex-clodex-f3de6026-parent-fable-5-1-100017.response.json",
+  "served": "NEW",
+  "ptrs": [
+   "1f2480d237b4208c"
+  ],
+  "text": "The parser is not down \u2014 I checked the transcript directly rather than trusting my own view of it.\n\n**Evidence the tee ran on this seat:**\n- Transcript record at 07:39:59 (line 43 of `e126cb02\u2026.jsonl`) is my assistant turn, and its content **starts with the receipt sentence** \u2014 the 956 B dm body (\"Your message crossed the reload\u2026\") is gone from that record and only the receipt + the operator-facing prose remain. That's the rewrite working. The full body sits in `~/.clodex/spill/clodex/1f2480d237b4208c.md` (956 B, 07:39).\n- The only other occurrences of that dm's text in the transcript are the receipt's own 80-char quote and my later prose about it.\n- `intentSpill` is unset in ui-settings \u2192 defaults to `'on'` (`stores.js:106`).\n\nWhat you're probably seeing: only ONE intent body from this seat has crossed the 800-byte threshold (`SPILL_MIN_BYTES`, `intent-spill.js:10`). Everything else I've emitted since reload \u2014 log lines, the short dm to wirescope (~400 B), the answers to you \u2014 is under it, so there is legitimately nothing else to spill. The \"@spill\" strings in my transcript are all discussion, not receipts, which matches a working parser with one event.\n\n**On \"never type\" being an elephant:** you're right, and that is exactly why t1047 didn't stop at rewording. The line is only half of it; the structural half is that the pointer shape is no longer something I could plausibly emit. Old receipt: `@spill:1f2480d237b4208c` \u2014 a short token, and the prompt named it, so five out of thirteen bodies pre-restart were me emitting the token instead of the body. New receipt: a sentence containing a quoted prefix of what I wrote, a byte count, and an absolute path \u2014 I can't produce a correct one without having written the body, and a mimicked one is detected (`mimicKindOf`, `intent-spill.js:119`) and bounced as unresolved rather than silently accepted. So the defence is \"the thing I'd fabricate no longer exists as a valid form\", not \"don't think about it\". The prompt line is now phrased positively (\"a body you did not write does not exist\") \u2014 no token in it for me to reproduce.\n\nWhether that holds is the after-count wirescope will run once ~12 long bodies have left this seat; n=1 so far, clean."
+ }
+]
